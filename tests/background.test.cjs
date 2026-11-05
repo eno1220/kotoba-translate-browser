@@ -257,3 +257,23 @@ test("progress distinguishes waiting in the shared queue from awaiting a server 
   assert.ok(b.progress.some(message => message.requestId === "second" && message.phase === "translating"));
   assert.equal(b.max(), 1);
 });
+
+test("page and selection requests use the sender domain dictionary and edits invalidate cache", async () => {
+  const entry = { domain: "", sourceLang: "en", targetLang: "ja", source: "File", target: "共通" };
+  const dictionary = [entry, { ...entry, domain: "example.org", target: "専用" }];
+  const b = background(() => completion("ファイル"), { dictionary });
+  await b.send(["File"], { domain: "https://attacker.example" });
+  assert.equal(b.calls[0].body.glossary[0].target, "専用");
+  const document = [{ text: "File" }];
+  await b.send([], { document });
+  await b.send([], { document });
+  assert.equal(b.calls.length, 2);
+  b.configure({ dictionary: [entry] });
+  await b.send([], { document });
+  assert.equal(b.calls.length, 3);
+  assert.equal(b.calls[2].body.glossary[0].target, "共通");
+  b.configure({ dictionary: [] });
+  await b.send(["File"]);
+  assert.equal(b.calls[3].body.glossary, undefined);
+  assert.equal(b.calls[3].body.use_glossary, false);
+});

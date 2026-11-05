@@ -100,3 +100,30 @@ test("fitting HTML skips per-node tokenization and split handles UTF-8 byte edge
   assert.deepEqual(K.mergeDocuments(parts), linked);
   assert.ok(parts.every(part => K.byteTokens(K.serializeDocument(part)) <= 128));
 });
+
+test("dictionary validates limits, duplicate terms and normalized exact domains", () => {
+  const entry = { domain: "", sourceLang: "en", targetLang: "ja", source: "File", target: "ファイル" };
+  assert.deepEqual(K.settings().dictionary, []);
+  assert.equal(K.dictionary([{ ...entry, domain: "EXAMPLE.COM." }])[0].domain, "example.com");
+  assert.throws(() => K.dictionary([entry, entry]), /重複/);
+  for (const invalid of [{ source: " " }, { target: "x".repeat(101) }, { source: "<|plamo:tag|>" }, { domain: "example.com/path" }, { domain: "example.com:8000" }, { targetLang: "unknown" }]) assert.throws(() => K.dictionary([{ ...entry, ...invalid }]));
+  assert.throws(() => K.dictionary(Array.from({ length: 101 }, (_, i) => ({ ...entry, source: `word${i}` }))), /100件/);
+  assert.throws(() => K.dictionary(Array.from({ length: 21 }, (_, i) => ({ ...entry, domain: `d${i}.example` }))), /20件/);
+  assert.throws(() => K.dictionary(Array.from({ length: 501 }, () => entry)), /500件/);
+  assert.throws(() => K.dictionary(Array.from({ length: 30 }, (_, i) => ({ ...entry, source: `${i}${"語".repeat(40)}`, target: "訳".repeat(40) }))), /6000/);
+});
+
+test("dictionary merges language and domain overrides into both API formats", () => {
+  const entry = { domain: "", sourceLang: "auto", targetLang: "ja", source: "File", target: "共通" };
+  const dictionary = [entry, { ...entry, sourceLang: "en", target: "英語共通" }, { ...entry, domain: "example.com", target: "専用" }, { ...entry, targetLang: "ko", target: "다른" }];
+  for (const apiFormat of ["top-level", "template"]) {
+    const s = K.settings({ dictionary, apiFormat });
+    for (const [domain, source, expected] of [["https://example.com", "en", "専用"], ["http://example.com:8080", "auto", "専用"], ["https://sub.example.com", "en", "英語共通"], ["https://other.com", "auto", "共通"]]) {
+      const body = K.body(s, "File", { domain, source, target: "ja" });
+      assert.deepEqual((body.chat_template_kwargs || body).glossary, [{ source: "File", target: expected }]);
+      if (apiFormat === "top-level") assert.equal(body.use_glossary, true);
+      assert.equal(body.messages[0].content, "File");
+    }
+    assert.equal(K.contentPreferences(s).dictionary, undefined);
+  }
+});

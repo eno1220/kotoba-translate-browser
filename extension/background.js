@@ -18,7 +18,7 @@ function pruneCache() {
 }
 setInterval(pruneCache, 60000);
 function cacheSignature(s) {
-  return JSON.stringify([K.endpoint(s), s.apiKey, s.model, s.apiFormat, s.form, s.inputTokens, s.tokenizer, s.tokenizePath, s.batchTranslation]);
+  return JSON.stringify([K.endpoint(s), s.apiKey, s.model, s.apiFormat, s.form, s.inputTokens, s.tokenizer, s.tokenizePath, s.batchTranslation, s.dictionary]);
 }
 function cacheKey(url, source, target, input) { return JSON.stringify([url, source, target, input]); }
 function cachedParagraph(s, url, source, target, document) {

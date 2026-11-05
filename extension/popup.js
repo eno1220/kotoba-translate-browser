@@ -102,3 +102,12 @@ for (const [id, key] of [["batch-translation", "batchTranslation"], ["main-conte
   } catch (e) { field.checked = !field.checked; error(e); }
   finally { field.disabled = false; }
 });
+
+$("dictionary").addEventListener("click", async () => {
+  try {
+    const tab = tabId ? await browser.tabs.get(tabId) : null;
+    const domain = /^https?:\/\//.test(tab?.url || "") ? new URL(tab.url).hostname : "";
+    await browser.tabs.create({ url: browser.runtime.getURL("dictionary.html") + (domain ? `?domain=${encodeURIComponent(domain)}` : "") });
+    window.close();
+  } catch (e) { error(e); }
+});

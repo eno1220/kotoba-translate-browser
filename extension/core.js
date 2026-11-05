@@ -2,6 +2,7 @@
 globalThis.Kotoba = (() => {
   const MAX_TOKENS = 8096;
   const CONTENT_PROTOCOL = 3;
+  const DICTIONARY_LIMITS = Object.freeze({ entries: 500, perScope: 100, domains: 20, term: 100, bytes: 6000 });
   const DEFAULTS = Object.freeze({
     endpoint: "http://127.0.0.1", port: "8000", path: "/v1/chat/completions",
     apiKey: "", model: "plamo-translate", apiFormat: "top-level",
@@ -34,7 +35,48 @@ globalThis.Kotoba = (() => {
     for (const key of FEATURES) if (typeof s[key] !== "boolean") throw new Error(`${key} の設定が不正です。`);
     languages(s.source, s.target);
     if (!["", "plain", "polite"].includes(s.form)) throw new Error("文体が不正です。");
+    s.dictionary = dictionary(s.dictionary);
     return s;
+  }
+  function dictionaryDomain(value) {
+    const url = new URL(`https://${value.trim()}`);
+    if (url.username || url.password || url.port || url.pathname !== "/" || url.search || url.hash || !url.hostname) throw new Error("ドメインはパス・ポートを含まないホスト名で指定してください。");
+    return url.hostname.toLowerCase().replace(/\.$/, "");
+  }
+  function dictionary(raw = []) {
+    const L = DICTIONARY_LIMITS;
+    if (!Array.isArray(raw) || raw.length > L.entries) throw new Error(`辞書は全体で${L.entries}件までです。`);
+    const keys = new Set(), scopes = new Map(), domains = new Set();
+    const result = raw.map(entry => {
+      if (!entry || typeof entry.domain !== "string" || typeof entry.source !== "string" || typeof entry.target !== "string") throw new Error("辞書の項目が不正です。");
+      const domain = entry.domain ? dictionaryDomain(entry.domain) : "";
+      languages(entry.sourceLang, entry.targetLang);
+      const source = entry.source.trim(), target = entry.target.trim();
+      if (!source || !target || source.length > L.term || target.length > L.term || /[\r\n\u0000-\u001f]|<\|plamo:/u.test(source + target)) throw new Error(`原語・訳語は空欄・改行・制御記号を含まない${L.term}文字以内で指定してください。`);
+      const key = JSON.stringify([domain, entry.sourceLang, entry.targetLang, source]);
+      if (keys.has(key)) throw new Error(`同じ適用範囲・言語の原語「${source}」が重複しています。`);
+      keys.add(key);
+      scopes.set(domain, (scopes.get(domain) || 0) + 1);
+      if (scopes.get(domain) > L.perScope) throw new Error(`辞書は全体共通・各ドメインそれぞれ${L.perScope}件までです。`);
+      if (domain) domains.add(domain);
+      return { domain, sourceLang: entry.sourceLang, targetLang: entry.targetLang, source, target };
+    });
+    if (domains.size > L.domains) throw new Error(`辞書のドメインは${L.domains}件までです。`);
+    for (const domain of ["", ...domains]) for (const target of new Set(result.map(e => e.targetLang))) {
+      for (const source of new Set(["auto", ...result.map(e => e.sourceLang)])) {
+        if (byteTokens(JSON.stringify(glossary(result, domain, source, target))) > L.bytes) throw new Error(`同じ言語で適用する辞書は合計${L.bytes} UTF-8バイト以内にしてください。`);
+      }
+    }
+    return result;
+  }
+  function glossary(entries = [], domain, sourceLang, targetLang) {
+    const terms = new Map();
+    for (const scope of ["", ...(domain ? [domain] : [])]) {
+      for (const language of [...new Set(["auto", sourceLang])]) {
+        for (const e of entries) if (e.domain === scope && e.sourceLang === language && e.targetLang === targetLang) terms.set(e.source, e.target);
+      }
+    }
+    return [...terms].map(([source, target]) => ({ source, target }));
   }
   function languages(source, target) {
     if (source !== "auto" && !LANGUAGES.includes(source) || !LANGUAGES.includes(target)) throw new Error("対応する言語コードを指定してください。");
@@ -52,12 +94,14 @@ globalThis.Kotoba = (() => {
     if (batch) context += " The input contains multiple independent paragraphs in kotoba-item elements. Preserve each kotoba-item tag and its id exactly once. Translate each paragraph separately within its own element; never move text or inline elements between paragraphs. Return only these HTML fragments with no text outside them.";
     if (retry) context += " The previous response did not preserve the HTML structure. Keep all tags and id attributes, including links, in the translated fragment. Do not return Markdown fences or explanations.";
     const options = { context, form: s.form, target_lang: target };
+    const terms = glossary(s.dictionary, new URL(domain).hostname.toLowerCase().replace(/\.$/, ""), source, target);
+    if (terms.length) options.glossary = terms;
     if (source !== "auto") options.source_lang = source;
     const result = { model: s.model, messages: [{ role: "user", content: text }], max_tokens: MAX_TOKENS, stream: false, temperature: 0 };
     if (s.apiFormat === "template") {
       result.chat_template_kwargs = options;
       result.stop = ["<|plamo:tag|>", "<|plamo:bos|>"];
-    } else Object.assign(result, options, { use_glossary: false });
+    } else Object.assign(result, options, { use_glossary: terms.length > 0 });
     return result;
   }
   // PLaMo's byte fallback makes UTF-8 byte length a conservative token estimate.
@@ -248,5 +292,5 @@ globalThis.Kotoba = (() => {
       }
     }
   }
-  return { MAX_TOKENS, CONTENT_PROTOCOL, DEFAULTS, FEATURES, contentPreferences, LANGUAGES, settings, languages, endpoint, body, byteTokens, split, Queue, documentText, documentLength, serializeDocument, normalizeEntities, parseDocument, splitDocument, mergeDocuments };
+  return { DICTIONARY_LIMITS, dictionaryDomain, dictionary, glossary, MAX_TOKENS, CONTENT_PROTOCOL, DEFAULTS, FEATURES, contentPreferences, LANGUAGES, settings, languages, endpoint, body, byteTokens, split, Queue, documentText, documentLength, serializeDocument, normalizeEntities, parseDocument, splitDocument, mergeDocuments };
 })();

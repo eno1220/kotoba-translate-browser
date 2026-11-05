@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="ja">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>翻訳辞書</title><link rel="stylesheet" href="ui.css"><script src="core.js" defer></script><script src="dictionary.js" defer></script></head>
+<body><main>
+  <h1>翻訳辞書</h1>
+  <p><small>同じ原語はドメイン別を優先します。ドメインは完全一致（サブドメインは別）です。保存後のリクエストからページ・選択翻訳に適用します。</small></p>
+  <form id="dictionary-form">
+    <label>適用範囲<select id="scope"><option value="">全体共通</option></select></label>
+    <div class="row"><label>ドメインを追加<input id="domain" placeholder="example.com" spellcheck="false" aria-describedby="domain-help"><small id="domain-help">URLではなくホスト名を指定</small></label><button type="button" id="add-domain" class="row-button">追加</button></div>
+    <button type="button" id="remove-scope">この範囲の辞書を全件削除</button>
+    <p id="limits"><small>全体共通・各ドメイン100件、合計500件、20ドメインまで。原語・訳語は各100文字まで。同時に適用する辞書は6000 UTF-8バイトまで。</small></p>
+    <p id="count" role="status"></p>
+    <div id="entries"></div>
+    <button type="button" id="add-entry">用語を追加</button>
+    <small>原文の「すべて」は自動判定を含む全言語に適用。同じ範囲では原文言語を指定した用語を優先します。原語は大文字・小文字を区別します。</small>
+    <div class="save-row"><button type="submit" class="primary" id="save">保存</button><button type="button" id="discard">変更を破棄</button></div>
+    <p id="status" role="status" aria-live="polite"></p>
+  </form>
+  <p><a href="options.html">翻訳の設定</a></p>
+</main></body></html>

@@ -109,6 +109,30 @@ const parserWindow = new (require("jsdom").JSDOM)("").window;
         check(!realState.running && realState.done === realState.total && realState.translated > 0 && !realState.message.includes('不正または大きすぎ'),JSON.stringify({metadata,state:realState}));
         await fetch(base+'/result',{method:'POST',body:JSON.stringify({ok:true,realPage:true,state:realState,metadata})});
         return;` : ''}
+        const dictionaryTab = await browser.tabs.create({url:browser.runtime.getURL('dictionary.html')+'?domain=127.0.0.1',active:true});
+        let dictionaryView;
+        for(let i=0;i<100;i++) {
+          dictionaryView = browser.extension.getViews().find(view => view.location.pathname === '/dictionary.html');
+          if(dictionaryView && !dictionaryView.document.querySelector('#save').disabled) break;
+          await wait(50);
+        }
+        check(dictionaryView?.document.querySelector('#scope').value === '127.0.0.1', 'dictionary did not select the current domain');
+        const dict = id => dictionaryView.document.getElementById(id);
+        const termInput = (field, value) => { field.value=value; field.dispatchEvent(new dictionaryView.Event('input',{bubbles:true})); };
+        dict('add-entry').click();
+        let termFields = dict('entries').querySelectorAll('input');
+        termInput(termFields[0], 'File'); termInput(termFields[1], 'ファイル');
+        dict('save').click();
+        for(let i=0;i<100;i++) { if(dict('status').textContent.startsWith('保存しました')) break; await wait(20); }
+        check((await browser.storage.local.get('settings')).settings.dictionary?.[0].target === 'ファイル', 'dictionary UI did not save');
+        termInput(dict('entries').querySelectorAll('input')[1], '未保存'); dict('discard').click();
+        check(dict('entries').querySelectorAll('input')[1].value === 'ファイル', 'dictionary discard failed');
+        await fetch(base+'/screenshot',{method:'POST',body:JSON.stringify({name:'dictionary',image:await browser.tabs.captureTab(dictionaryTab.id,{format:'png'})})});
+        await generate(await getSettings(), 'File', {source:'en',target:'ja',domain:base}, new AbortController().signal);
+        dict('remove-scope').click(); dict('save').click();
+        for(let i=0;i<100;i++) { if((await browser.storage.local.get('settings')).settings.dictionary?.length === 0) break; await wait(20); }
+        check((await browser.storage.local.get('settings')).settings.dictionary?.length === 0, 'dictionary scope deletion did not persist');
+        await browser.tabs.remove(dictionaryTab.id);
         const tab = await browser.tabs.create({url: base + '/fixture', active: true});
         for (let i=0; i<100; i++) { if ((await browser.tabs.get(tab.id)).status === 'complete') break; await wait(100); }
         ${process.env.KOTOBA_STALE ? 'await browser.tabs.executeScript(tab.id, {file:"stale-content.js",runAt:"document_idle"});' : ''}
@@ -253,6 +277,7 @@ const parserWindow = new (require("jsdom").JSDOM)("").window;
       return;
     }
     assert.ok(requests.length > 5);
+    assert.ok(requests.some(r => r.body.glossary?.[0]?.target === "ファイル" && r.body.use_glossary === true));
     assert.ok(requests.some(r => r.body.messages[0].content.includes('earlier posts') && r.body.messages[0].content.includes('assembly on Linux x86_64')));
     assert.ok(requests.every(r => !r.body.messages[0].content.includes('(opens in a new window)')));
     assert.ok(requests.every(r => r.body.max_tokens === 8096 && r.body.context.includes(`web page on http://127.0.0.1:${port}`) && r.authorization === "Bearer smoke-key"));

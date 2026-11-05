@@ -62,3 +62,6 @@ details.advanced fieldset { margin-top:16px; }
 @media(max-width:480px) { body:not(.popup) main { margin-top:24px; padding-inline:18px; } .row { flex-wrap:wrap; } .row > label { flex-basis:180px; } }
 @media(forced-colors:active) { .switch-row input { appearance:auto; } .switch-row input::before { display:none; } button:disabled { opacity:1; color:GrayText; } }
 @media(prefers-reduced-motion:reduce) { *,*::before { transition:none!important; } }
+.row-button { align-self:center; flex:0 0 auto; }
+.dictionary-entry { padding:8px 12px 12px; border:1px solid var(--line); border-radius:6px; margin:12px 0; }
+#dictionary-form .save-row { flex-wrap:wrap; }
