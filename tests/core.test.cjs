@@ -4,6 +4,16 @@ require("../extension/core.js");
 globalThis.DOMParser = new (require("jsdom").JSDOM)("").window.DOMParser;
 const K = globalThis.Kotoba;
 
+test("feature switches are booleans and content preferences never expose connection settings", () => {
+  for (const key of K.FEATURES) {
+    assert.equal(K.settings({ [key]: false })[key], false);
+    assert.throws(() => K.settings({ [key]: "false" }));
+  }
+  const prefs = K.contentPreferences(K.settings({ apiKey: "secret", endpoint: "http://private.example" }));
+  assert.equal(prefs.apiKey, undefined); assert.equal(prefs.endpoint, undefined);
+  assert.equal(prefs.mainContentOnly, false); assert.equal(prefs.responsiveScan, true);
+});
+
 test("request formats, Bearer-independent body and endpoint composition", () => {
   const s = K.settings();
   assert.equal(K.endpoint(s), "http://127.0.0.1:8000/v1/chat/completions");

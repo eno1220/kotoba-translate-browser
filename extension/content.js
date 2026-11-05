@@ -15,11 +15,29 @@
   let showTimer, hideTimer, hoverCandidate, hoverAnchor, pinned = false, marks;
   let requestSequence = 0;
   const progressListeners = new Map();
+  const preferences = { responsiveScan: true, prioritizeVisible: true, mainContentOnly: false, selectionButton: false,
+    keyboardShortcuts: true, copyButton: true, focusOriginal: true, pageProgress: true, announceProgress: true, hoverEnabled: true };
+  let announcer, announcementKey, launcher, launcherTimer, originalFocus;
+  function applyPreferences(value) {
+    if (preferences.focusOriginal && value.focusOriginal === false && originalFocus) clearTooltip();
+    if (typeof value.hoverEnabled === "boolean" && preferences.hoverEnabled !== value.hoverEnabled) state.hoverEnabled = value.hoverEnabled;
+    Object.assign(preferences, value);
+    if (!state.hoverEnabled) clearTooltip();
+    if (!preferences.selectionButton) clearLauncher();
+    if (!preferences.copyButton) shadow?.querySelectorAll(".copy").forEach(node => node.remove());
+    if (!preferences.pageProgress && panelKind === "page") closePanel();
+    if (announcer && !preferences.announceProgress) announcer.textContent = "";
+  }
+  async function readPreferences() {
+    const value = await browser.runtime.sendMessage({ type: "contentPreferences" });
+    if (value.error) throw new Error(value.error);
+    applyPreferences(value); return value;
+  }
 
   function ui() {
     if (host?.isConnected) return;
     host = document.createElement("div");
-    host.dataset.kotobaUi = "true";
+    host.dataset.kotobaUi = "true"; host.lang = "ja"; host.dir = "ltr";
     host.style.cssText = "all:initial!important;position:fixed!important;inset:0 auto auto 0!important;z-index:2147483647!important;width:0!important;height:0!important";
     shadow = host.attachShadow({ mode: "closed" });
     const style = document.createElement("style");
@@ -31,7 +49,7 @@
       .panel.selection { width:min(420px,calc(100vw - 24px)); }
       .tooltip { width:max-content; max-width:min(520px,calc(100vw - 24px)); max-height:min(360px,45vh); overflow:auto; white-space:pre-wrap; pointer-events:auto; z-index:2; }
       .heading { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px; }
-      h2 { margin:0; font-size:13px; font-weight:600; } p { margin:8px 0; white-space:pre-wrap; } small { color:#71717a; }
+      h2 { margin:0; font-size:13px; font-weight:600; } p { margin:8px 0; white-space:pre-wrap; } small { color:#62626c; }
       button { display:inline-flex; align-items:center; justify-content:center; min-height:30px; font:inherit; font-size:12px; font-weight:500; border:1px solid #dedee3; border-radius:5px; padding:4px 10px; background:#fff; color:#52525b; cursor:pointer; }
       button:hover { background:#f4f4f5; } button.primary { color:#fff; border-color:#087fdb; background:#087fdb; } button.primary:hover { background:#006fc5; }
       button:disabled { opacity:.45; cursor:default; } button:focus-visible,select:focus-visible,summary:focus-visible { outline:2px solid #38bdf8; outline-offset:2px; }
@@ -50,10 +68,35 @@
       details { font-size:12px; color:#71717a; } summary { cursor:pointer; } details p { color:#52525b; max-height:150px; overflow:auto; }
       .mark { position:fixed; pointer-events:none; border-radius:2px; background:#0ea5e91a; border-bottom:1px solid #0ea5e955; }
       .original { margin:0; font-size:14px; line-height:1.75; user-select:text; } .tooltip .heading { margin-bottom:6px; }
+      .launcher { padding:5px 10px; min-height:36px; color:#006fc5; }
+      .sr-only { position:absolute; width:1px; height:1px; padding:0; overflow:hidden; clip-path:inset(50%); white-space:nowrap; }
+      @media(forced-colors:active) { .box,button,select { border:1px solid ButtonText; } .mark { outline:1px solid Highlight; } }
       [hidden] { display:none!important; }
     `;
     shadow.append(style);
+    announcer = document.createElement("div"); announcer.className = "sr-only";
+    announcer.setAttribute("role", "status"); announcer.setAttribute("aria-atomic", "true"); shadow.append(announcer);
     document.documentElement.append(host);
+  }
+  function announce() {
+    if (!preferences.announceProgress) return;
+    const key = state.preparing ? "preparing" : state.running ? `running-${Math.floor(state.percent / 25)}` : `${state.finishedAt}-${state.message}-${state.failed}`;
+    if (key === announcementKey) return;
+    announcementKey = key; ui();
+    announcer.textContent = state.preparing ? "翻訳対象を解析しています" : state.running ? `ページ翻訳 ${Math.floor(state.percent / 25) * 25}%`
+      : state.failed ? `一部未翻訳。${state.message}` : state.percent === 100 ? "ページ翻訳が完了しました" : state.message;
+  }
+  function copyButton(getText) {
+    const node = button("コピー", async () => {
+      node.disabled = true;
+      try {
+        const response = await browser.runtime.sendMessage({ type: "copyText", text: getText() });
+        if (response.error) throw new Error(response.error);
+        node.textContent = "コピーしました";
+      } catch { node.textContent = "コピーできませんでした"; }
+      finally { node.disabled = false; }
+    });
+    node.className = "copy"; return node;
   }
   function button(label, action) {
     const node = document.createElement("button"); node.type = "button"; node.textContent = label; node.addEventListener("click", action); return node;
@@ -86,7 +129,8 @@
     return { node, label, percent, bar, count, elapsed };
   }
   function statusPanel() {
-    if (pageDismissed || panelKind === "selection") return;
+    announce();
+    if (!preferences.pageProgress || pageDismissed || panelKind === "selection") return;
     if (!pageUI) {
       const node = box("ページ翻訳", "page"); pageDismissed = false;
       const progress = progressView();
@@ -98,8 +142,9 @@
       pageUI = { ...progress, message, original, action };
     }
     if (state.running && !panelTimer) panelTimer = setInterval(statusPanel, 1000);
-    pageUI.label.textContent = state.running ? "翻訳中" : state.failed ? "一部未翻訳" : state.percent === 100 ? "翻訳完了" : state.total ? "停止中" : "対象なし";
+    pageUI.label.textContent = state.preparing ? "ページを解析中" : state.running ? "翻訳中" : state.failed ? "一部未翻訳" : state.percent === 100 ? "翻訳完了" : state.total ? "停止中" : "対象なし";
     pageUI.bar.value = state.percent; pageUI.percent.textContent = `${state.percent}%`;
+    if (state.preparing) { pageUI.bar.removeAttribute("value"); pageUI.percent.textContent = ""; }
     pageUI.count.textContent = `${state.done} / ${state.total} 段落`;
     pageUI.elapsed.textContent = state.startedAt ? `${Math.floor(((state.finishedAt || Date.now()) - state.startedAt) / 1000)}秒` : "";
     pageUI.message.textContent = state.failed || !state.total ? state.message : "";
@@ -111,7 +156,12 @@
   }
   function clearTooltip() {
     clearTimeout(showTimer); clearTimeout(hideTimer); showTimer = null; hideTimer = null; hoverCandidate = null;
+    const focused = tooltip?.contains(shadow.activeElement);
     tooltip?.remove(); marks?.remove(); tooltip = null; marks = null; lastHover = null; pinned = false;
+    const previousFocus = originalFocus; originalFocus = null;
+    if (focused && previousFocus?.isConnected) {
+      returningFocus = true; previousFocus.focus({ preventScroll: true }); returningFocus = false;
+    }
   }
   function currentPage() {
     if (state.url !== pageURL()) {
@@ -121,10 +171,10 @@
   }
   function stop() {
     generation++;
-    state.running = false;
+    state.running = false; state.preparing = false;
     state.finishedAt = Date.now(); state.message = "停止しました";
     browser.runtime.sendMessage({ type: "cancel" }).catch(() => {});
-    if (panel) statusPanel();
+    if (panel || state.startedAt) statusPanel();
   }
   function restore() {
     stop(); clearTooltip();
@@ -188,8 +238,8 @@
   function contiguous(roots, parent) {
     return roots.length && roots.every((node, i) => node.parentNode === parent && (!i || roots[i - 1].nextSibling === node));
   }
-  function collect() {
-    const groups = [], cache = new WeakMap();
+  async function collect(run = generation) {
+    const groups = [], cache = new WeakMap(), blockCache = new WeakMap();
     const computed = el => { if (!cache.has(el)) cache.set(el, getComputedStyle(el)); return cache.get(el); };
     const isBlock = el => /^(block|flow-root|flex|grid|list-item|table-cell|table-caption|table-row)$/.test(computed(el).display) || /^(P|H[1-6]|LI|DT|DD|TD|TH|BLOCKQUOTE|FIGCAPTION|SUMMARY|HR)$/.test(el.tagName);
     const hidden = el => {
@@ -239,28 +289,57 @@
       if (!eligible || !length) return;
       groups.push({ roots: [...roots], parent, elements, extras, document: tree, length, originalBlock, originalSnapshot: snapshot(roots) });
     }
-    function hasBlock(el) { return [...el.children].some(child => !hidden(child) && (isBlock(child) || hasBlock(child))); }
-    function walk(container) {
+    function hasBlock(el) {
+      if (!blockCache.has(el)) blockCache.set(el, [...el.children].some(child => !hidden(child) && (isBlock(child) || hasBlock(child))));
+      return blockCache.get(el);
+    }
+    let visited = 0;
+    async function walk(container) {
       let roots = [];
       const flush = () => { makeUnit(roots); roots = []; };
       const children = container.tagName === "SLOT" && container.assignedNodes().length ? container.assignedNodes({ flatten: true }) : container.childNodes;
       for (const node of children) {
+        if (preferences.responsiveScan && ++visited % 80 === 0) await new Promise(resolve => setTimeout(resolve, 0));
+        if (run !== generation || state.url !== pageURL()) throw new DOMException("キャンセルしました", "AbortError");
         if (applied.has(node)) { flush(); continue; }
         if (node.nodeType === Node.ELEMENT_NODE && (hidden(node) || excluded(node) || node.matches('.notranslate,[translate="no"]') || language(node) && sameLanguage(language(node), state.target))) {
           // Inline exclusions remain in the paragraph, but are never sent as prose.
           if (isBlock(node)) flush(); else roots.push(node);
           continue;
         }
-        if (node.nodeType === Node.ELEMENT_NODE && node.shadowRoot) { flush(); walk(node.shadowRoot); continue; }
+        if (node.nodeType === Node.ELEMENT_NODE && node.shadowRoot) { flush(); await walk(node.shadowRoot); continue; }
         if (node.nodeType === Node.ELEMENT_NODE && (node.tagName === "BR" || isBlock(node) || hasBlock(node))) {
-          flush(); if (node.tagName !== "BR") walk(node); continue;
+          flush(); if (node.tagName !== "BR") await walk(node); continue;
         }
         if (roots.length && roots[0].parentNode !== node.parentNode) flush();
         roots.push(node);
       }
       flush();
     }
-    if (document.body) walk(document.body);
+    let scopes = preferences.mainContentOnly ? [...document.querySelectorAll('main,[role="main"]')] : [];
+    if (preferences.mainContentOnly && !scopes.length) scopes = [...document.querySelectorAll("article")];
+    if (!scopes.length && document.body) scopes = [document.body];
+    scopes = scopes.filter(node => !scopes.some(other => other !== node && other.contains(node)));
+    for (const scope of scopes) {
+      let blocked = false;
+      for (let el = scope; el; el = parentElement(el)) if (hidden(el) || excluded(el) || el.matches('.notranslate,[translate="no"]')) { blocked = true; break; }
+      if (!blocked) await walk(scope);
+    }
+    if (preferences.prioritizeVisible) {
+      const distance = group => {
+        if (!group.parent.isConnected || !contiguous(group.roots, group.parent)) return Infinity;
+        const range = document.createRange(); range.setStartBefore(group.roots[0]); range.setEndAfter(group.roots.at(-1));
+        const rect = range.getBoundingClientRect?.() || group.parent.getBoundingClientRect?.();
+        return !rect || rect.bottom >= 0 && rect.top <= innerHeight ? 0 : rect.bottom < 0 ? -rect.bottom : rect.top - innerHeight;
+      };
+      const ordered = [];
+      for (const group of groups) {
+        if (preferences.responsiveScan && ++visited % 80 === 0) await new Promise(resolve => setTimeout(resolve, 0));
+        if (run !== generation) throw new DOMException("キャンセルしました", "AbortError");
+        ordered.push({ group, distance: distance(group) });
+      }
+      return ordered.sort((a, b) => a.distance - b.distance).map(item => item.group);
+    }
     return groups;
   }
   function applyDocument(unit, tree) {
@@ -287,7 +366,7 @@
     unit.appliedRoots = [...fragment.childNodes];
     unit.parent.insertBefore(fragment, next);
     unit.appliedSnapshot = snapshot(unit.appliedRoots); transactions.add(unit);
-    const group = { originalBlock: unit.originalBlock, nodes: translatedNodes };
+    const group = { originalBlock: unit.originalBlock, nodes: translatedNodes, source: state.source };
     for (const node of translatedNodes) records.set(node, { translated: node.data, group });
     return true;
   }
@@ -296,13 +375,20 @@
     if (state.running) return { ...state };
     if (appliedDirection && appliedDirection !== `${source}:${target}`) restore();
     state.source = source; state.target = target;
-    const groups = collect();
     const run = ++generation;
-    state.running = true; state.done = 0; state.total = groups.length; state.failed = 0; state.cacheRestored = false;
+    state.running = true; state.preparing = true; state.done = 0; state.total = 0; state.failed = 0; state.cacheRestored = false;
     state.percent = 0; state.startedAt = Date.now(); state.finishedAt = 0;
-    state.message = groups.length ? "" : "翻訳対象がありません";
+    state.message = "";
     if (panelKind === "selection") closePanel();
     pageDismissed = false; clearTooltip();
+    statusPanel();
+    let groups;
+    try { groups = await collect(run); }
+    catch (error) { if (run !== generation) return; throw error; }
+    if (run !== generation) return;
+    if (state.url !== pageURL()) { currentPage(); return; }
+    state.preparing = false; state.total = groups.length;
+    state.message = groups.length ? "" : "翻訳対象がありません";
     const totalChars = groups.reduce((sum, group) => sum + group.length, 0);
     let completedChars = 0;
     const activeProgress = new Map();
@@ -385,7 +471,7 @@
   }
   function scheduleHide() {
     clearTimeout(showTimer); hoverCandidate = null;
-    if (pinned || !tooltip || hideTimer) return;
+    if (pinned || !tooltip || hideTimer || tooltip.contains(shadow.activeElement)) return;
     hideTimer = setTimeout(clearTooltip, 220);
   }
   function positionNear(element, anchor) {
@@ -416,8 +502,9 @@
     const tools = document.createElement("div"); tools.className = "tools";
     const pin = button("固定", () => { pinned = !pinned; pin.setAttribute("aria-pressed", String(pinned)); });
     pin.className = "icon"; pin.setAttribute("aria-pressed", "false");
+    if (preferences.copyButton) tools.append(copyButton(() => group.originalBlock));
     tools.append(pin, closeButton(clearTooltip)); header.append(label, tools);
-    const text = document.createElement("p"); text.className = "original"; text.dir = "auto"; text.textContent = group.originalBlock;
+    const text = document.createElement("p"); text.className = "original"; text.dir = "auto"; text.lang = group.source === "auto" ? "" : group.source || ""; text.textContent = group.originalBlock;
     tooltip.append(header, text); shadow.append(tooltip);
     positionNear(tooltip, anchor);
     tooltip.addEventListener("pointerenter", () => { clearTimeout(hideTimer); hideTimer = null; clearTimeout(showTimer); });
@@ -452,14 +539,75 @@
   addEventListener("blur", clearTooltip);
   document.addEventListener("keydown", event => {
     if (event.key === "Escape") {
+      clearLauncher();
       if (tooltip || hoverCandidate) clearTooltip(); else closePanel();
     }
+    if (event.key === "F2" && preferences.focusOriginal && tooltip && originalFocus) {
+      event.preventDefault(); pinned = true; tooltip.querySelector("[aria-pressed]").setAttribute("aria-pressed", "true");
+      tooltip.tabIndex = -1; tooltip.focus({ preventScroll: true });
+    }
   });
+  let returningFocus = false;
+  document.addEventListener("focusin", event => {
+    if (returningFocus || !preferences.focusOriginal || event.composedPath().includes(host)) return;
+    const element = event.composedPath()[0];
+    if (!element?.matches?.('a,button,[tabindex]') || pinned) return;
+    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+    let node;
+    while ((node = walker.nextNode())) {
+      const record = records.get(node);
+      if (!record || node.data !== record.translated) continue;
+      showOriginal(record.group, element.getBoundingClientRect()); originalFocus = element; return;
+    }
+  });
+  document.addEventListener("focusout", event => {
+    if (event.composedPath().includes(host) || !originalFocus || pinned) return;
+    // Allow F2 to move focus into the original's dialog before deciding to hide it.
+    setTimeout(() => {
+      if (tooltip && !tooltip.contains(shadow.activeElement) && document.activeElement !== originalFocus) clearTooltip();
+    }, 0);
+  });
+
+  function clearLauncher() { clearTimeout(launcherTimer); launcher?.remove(); launcher = null; }
+  let selecting = false;
+  function scheduleLauncher() {
+    clearLauncher();
+    if (!preferences.selectionButton || selecting || panelKind === "selection") return;
+    launcherTimer = setTimeout(() => {
+      if (!preferences.selectionButton || selecting || panelKind === "selection") return;
+      const selected = getSelection();
+      if (!selected || selected.isCollapsed || !selected.rangeCount || !selected.toString().trim()) return;
+      const range = selected.getRangeAt(0);
+      for (const endpoint of [range.startContainer, range.endContainer, range.commonAncestorContainer]) {
+        for (let el = endpoint.nodeType === Node.ELEMENT_NODE ? endpoint : parentElement(endpoint); el; el = parentElement(el)) {
+          if (el === host || el.matches('input,textarea,select,[contenteditable]:not([contenteditable="false"]),[role="textbox"],[role="searchbox"],[role="combobox"]')) return;
+        }
+      }
+      const anchor = range.getBoundingClientRect?.();
+      if (!anchor || !anchor.width || anchor.bottom <= 0 || anchor.top >= innerHeight) return;
+      const text = selected.toString(); ui();
+      launcher = button("翻訳", () => {
+        clearLauncher(); selection({ text, anchor }).catch(error => box("選択範囲を翻訳").append(document.createTextNode(error.message)));
+      });
+      launcher.className = "box launcher"; launcher.setAttribute("aria-label", "選択したテキストを翻訳");
+      launcher.addEventListener("pointerdown", event => event.preventDefault());
+      shadow.append(launcher); positionNear(launcher, anchor);
+    }, 200);
+  }
+  document.addEventListener("selectionchange", scheduleLauncher);
+  document.addEventListener("pointerdown", event => { if (!event.composedPath().includes(host)) { selecting = true; clearLauncher(); } }, { passive: true });
+  document.addEventListener("pointerup", event => { selecting = false; if (!event.composedPath().includes(host)) scheduleLauncher(); }, { passive: true });
+  document.addEventListener("scroll", clearLauncher, { passive: true, capture: true });
+  addEventListener("resize", clearLauncher); addEventListener("blur", () => { selecting = false; clearLauncher(); });
 
   async function selection(message) {
     currentPage();
     const text = message.text || getSelection()?.toString();
     if (!text?.trim()) throw new Error("ページ上で翻訳したい文章を選択してください。");
+    const beforePreferences = generation;
+    await readPreferences();
+    if (beforePreferences !== generation) return;
+    clearLauncher();
     if (!state.source) state.source = message.defaults?.source || message.source || "en";
     if (!state.target) state.target = message.defaults?.target || message.target || "ja";
     if (message.source) state.source = message.source;
@@ -467,7 +615,7 @@
     if (state.running) stop();
     clearTooltip();
     const range = getSelection()?.rangeCount ? getSelection().getRangeAt(0) : null;
-    const anchor = range?.getBoundingClientRect?.();
+    const anchor = message.anchor || range?.getBoundingClientRect?.();
     const visibleAnchor = anchor?.width > 0 && anchor.bottom > 0 && anchor.top < innerHeight ? anchor : null;
     const previousFocus = document.activeElement;
     const node = box("選択範囲を翻訳");
@@ -488,8 +636,10 @@
     const progress = progressView(); progress.label.textContent = "翻訳中";
     const actions = document.createElement("div"); actions.className = "actions";
     let request = 0, requestId, busy = false, elapsedTimer;
+    const copy = copyButton(() => result.textContent); copy.disabled = true;
     const cancel = () => {
       request++; busy = false; progressListeners.delete(requestId); clearInterval(elapsedTimer);
+      copy.disabled = true;
       browser.runtime.sendMessage({ type: "cancel" }).catch(() => {});
     };
     selectionCleanup = () => { cancel(); if (previousFocus?.isConnected) previousFocus.focus({ preventScroll: true }); };
@@ -506,6 +656,8 @@
       const startedAt = Date.now();
       busy = true; source.disabled = true; target.disabled = true;
       state.source = source.value; state.target = target.value;
+      copy.disabled = true; copy.textContent = "コピー";
+      originalText.lang = source.value === "auto" ? "" : source.value; result.lang = target.value;
       result.hidden = true; result.classList.remove("error"); progress.node.hidden = false;
       progress.bar.value = 0; progress.percent.textContent = "0%"; progress.count.textContent = "";
       progress.elapsed.textContent = "0秒"; action.textContent = "停止";
@@ -519,6 +671,7 @@
         if (id !== request || !node.isConnected) return;
         result.classList.toggle("error", !!response.error);
         result.textContent = response.error || response.parts[0];
+        copy.disabled = !!response.error;
       } catch (error) { if (id === request) { result.textContent = error.message; result.classList.add("error"); } }
       finally {
         progressListeners.delete(currentId);
@@ -529,6 +682,7 @@
         }
       }
     };
+    if (preferences.copyButton) actions.append(copy);
     actions.append(action); node.append(original, progress.node, result, actions);
     if (visibleAnchor) positionNear(node, visibleAnchor);
     node.tabIndex = -1; node.focus({ preventScroll: true });
@@ -548,12 +702,16 @@
         return { ...state };
       }
       if (message.type === "status") return { ...state, translated: records.size };
+      if (message.type === "preferencesChanged") { applyPreferences(message.preferences); return { ok: true }; }
       if (message.type === "restoreCache") {
+        await readPreferences();
         // A pending cache lookup must never override a manual action or a new URL.
         if (message.url !== state.url || state.source || state.running || records.size) return { ...state };
         state.source = message.source; state.target = message.target;
         const entries = new Map(message.entries.map(entry => [entry.input, entry.document]));
-        const groups = collect();
+        const run = generation;
+        const groups = await collect(run);
+        if (run !== generation) return { ...state };
         let restored = 0, restoredChars = 0;
         for (const group of groups) {
           const tree = entries.get(JSON.stringify(group.document));
@@ -575,13 +733,13 @@
       }
       if (message.type === "start") {
         const beforePreferences = generation;
-        const prefs = await browser.runtime.sendMessage({ type: "contentPreferences" });
+        const prefs = await readPreferences();
         if (beforePreferences !== generation) return { ...state };
         if (prefs.error) throw new Error(prefs.error);
         state.batchTranslation = prefs.batchTranslation === true;
         state.concurrency = prefs.concurrency || message.concurrency || 1;
         // Don't keep the popup alive for the whole page translation.
-        translatePage(message.source, message.target).catch(error => { state.running = false; state.message = error.message; statusPanel(); });
+        translatePage(message.source, message.target).catch(error => { state.running = false; state.preparing = false; state.finishedAt = Date.now(); state.message = error.message; statusPanel(); });
         return { ...state };
       }
       if (message.type === "stop") { stop(); return { ...state }; }
@@ -590,5 +748,6 @@
       throw new Error("不明な操作です。");
     } catch (error) { return { error: error.message }; }
   });
+  readPreferences().catch(() => {});
   addEventListener("pagehide", () => browser.runtime.sendMessage({ type: "cancel" }).catch(() => {}));
 })();

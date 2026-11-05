@@ -1,4 +1,4 @@
-:root { color-scheme:light; font:13px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:#20242b; background:#fafafa; --blue:#087fdb; --blue-hover:#006fc5; --line:#e4e4e7; --muted:#71717a; }
+:root { color-scheme:light; font:13px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:#20242b; background:#fafafa; --blue:#087fdb; --blue-hover:#006fc5; --line:#e4e4e7; --muted:#62626c; }
 * { box-sizing:border-box; }
 body { margin:0; }
 main { max-width:680px; margin:40px auto; padding:0 28px 40px; }
@@ -56,4 +56,6 @@ details.advanced fieldset { margin-top:16px; }
 .save-row { display:flex; align-items:center; gap:16px; margin-top:20px; }
 .save-row #status { margin:0; }
 [hidden] { display:none!important; }
+@media(max-width:480px) { body:not(.popup) main { margin-top:24px; padding-inline:18px; } .row { flex-wrap:wrap; } .row > label { flex-basis:180px; } }
+@media(forced-colors:active) { .switch-row input { appearance:auto; } .switch-row input::before { display:none; } button:disabled { opacity:1; color:GrayText; } }
 @media(prefers-reduced-motion:reduce) { *,*::before { transition:none!important; } }

@@ -3,17 +3,20 @@ const assert = require("node:assert/strict");
 const vm = require("node:vm");
 const { readFileSync } = require("node:fs");
 function background(responder, settings = {}) {
-  let listener, settingsChanged, active = 0, maximum = 0;
+  let listener, commandListener, settingsChanged, active = 0, maximum = 0;
   let now = Date.now();
   const calls = [];
   const progress = [];
+  const clipboard = [];
   const event = { addListener() {} };
   const context = vm.createContext({
     URL, TextEncoder, AbortController, DOMException, setTimeout, clearTimeout, setInterval() {}, Date: class extends Date { static now() { return now; } }, DOMParser: new (require("jsdom").JSDOM)("").window.DOMParser,
+    navigator: { clipboard: { writeText: async text => clipboard.push(text) } },
     browser: {
       runtime: { id: "test", onMessage: { addListener: fn => listener = fn } },
       storage: { local: { get: async () => ({ settings }) }, onChanged: { addListener: fn => settingsChanged = fn } },
-      tabs: { onRemoved: event, onUpdated: event, sendMessage: async (_tab, message) => { progress.push(message); return { protocol: 3 }; } }, contextMenus: { create() {}, onClicked: event }
+      tabs: { onRemoved: event, onUpdated: event, query: async () => [], sendMessage: async (_tab, message) => { progress.push(message); return { protocol: 3 }; } },
+      commands: { onCommand: { addListener: fn => commandListener = fn } }, contextMenus: { create() {}, onClicked: event }
     },
     fetch: async (url, options) => {
       active++; maximum = Math.max(maximum, active);
@@ -24,7 +27,9 @@ function background(responder, settings = {}) {
   });
   for (const file of ["core.js", "background.js"]) vm.runInContext(readFileSync(require.resolve(`../extension/${file}`), "utf8"), context);
   return {
-    calls, progress, max: () => maximum,
+    calls, progress, clipboard, max: () => maximum,
+    command: (name, tab = { id: 1, url: "https://example.org" }) => commandListener(name, tab),
+    content: message => listener(message, { id: "test", tab: { id: 1 }, frameId: 0, url: "http://example.org" }),
     tick: milliseconds => now += milliseconds,
     configure: values => { settings = { ...settings, ...values }; settingsChanged({ settings: { newValue: settings } }, "local"); },
     control: message => listener(message, { id: "test" }),
@@ -32,6 +37,21 @@ function background(responder, settings = {}) {
   };
 }
 const completion = text => ({ choices: [{ message: { content: text }, finish_reason: "stop" }] });
+
+test("copy is allowed only when enabled and shortcuts respect their switch and restricted pages", async () => {
+  const b = background(() => assert.fail("control actions must not call the model"), { copyButton: false, keyboardShortcuts: false, apiKey: "secret" });
+  assert.ok((await b.content({ type: "copyText", text: "訳文" })).error);
+  assert.equal(b.clipboard.length, 0);
+  await b.command("translate-page"); assert.equal(b.progress.length, 0);
+  b.configure({ copyButton: true, keyboardShortcuts: true });
+  await b.content({ type: "copyText", text: "訳文" }); assert.deepEqual(b.clipboard, ["訳文"]);
+  await b.command("translate-page", { id: 1, url: "about:config" }); assert.equal(b.progress.length, 0);
+  await b.command("translate-page");
+  assert.equal(b.progress.at(-1).type, "start"); assert.equal(b.progress.at(-1).target, "ja");
+  await b.command("restore-page"); assert.equal(b.progress.at(-1).type, "restore");
+  const prefs = await b.content({ type: "contentPreferences" });
+  assert.equal(prefs.apiKey, undefined); assert.equal(prefs.keyboardShortcuts, true);
+});
 
 test("stale page scripts are rejected as a protocol mismatch without issuing any API request", async () => {
   const b = background(() => assert.fail("stale page must not dispatch a translation"));

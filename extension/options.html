@@ -15,6 +15,28 @@
       <div class="row"><label>原文<select name="source"></select></label><label>訳文<select name="target"></select></label></div>
       <label>日本語の文体<select name="form"><option value="">指定なし</option><option value="plain">常体（だ・である）</option><option value="polite">敬体（です・ます）</option></select></label>
     </fieldset>
+    <fieldset><legend>翻訳の処理</legend>
+      <label class="switch-row">長いページの解析中も操作できるようにする<input name="responsiveScan" type="checkbox" role="switch"></label>
+      <small>短い間隔でブラウザへ制御を返します。解析中にも停止できます。</small>
+      <label class="switch-row">画面内の段落を先に翻訳<input name="prioritizeVisible" type="checkbox" role="switch"></label>
+      <small>開始時に見えている段落、近くの段落の順に処理します。ページ全体が対象です。</small>
+      <label class="switch-row">本文だけを翻訳<input name="mainContentOnly" type="checkbox" role="switch"></label>
+      <small>main・role="main"、なければarticle内を対象にします。見つからないページでは全体を翻訳します。次の翻訳開始から反映します。</small>
+    </fieldset>
+    <fieldset><legend>操作と表示</legend>
+      <label class="switch-row">選択した文章の近くに翻訳ボタン<input name="selectionButton" type="checkbox" role="switch"></label>
+      <small>ボタンを押すと翻訳します。入力欄・編集可能領域では表示しません。</small>
+      <label class="switch-row">キーボードショートカット<input name="keyboardShortcuts" type="checkbox" role="switch"></label>
+      <small>Alt+Shift+Y：ページ翻訳／停止、Alt+Shift+U：選択翻訳、Alt+Shift+O：原文に戻す。Firefoxの「拡張機能のショートカットを管理」で変更できます。</small>
+      <label class="switch-row">原文・選択訳文のコピーボタン<input name="copyButton" type="checkbox" role="switch"></label>
+      <label class="switch-row">ホバーで原文を表示<input name="hoverEnabled" type="checkbox" role="switch"></label>
+      <label class="switch-row">リンクにキーボードで移動したときも原文を表示<input name="focusOriginal" type="checkbox" role="switch"></label>
+      <small>Tabで訳文中のリンクへ移動して確認。F2で原文パネルへ移動し、Escapeでリンクに戻れます。</small>
+      <label class="switch-row">ページ内に進捗パネルを表示<input name="pageProgress" type="checkbox" role="switch"></label>
+      <small>オフでもツールバーで進捗確認と停止ができます。</small>
+      <label class="switch-row">進捗の区切りをスクリーンリーダーに通知<input name="announceProgress" type="checkbox" role="switch"></label>
+      <small>開始・25%ごと・完了・停止を通知します。</small>
+    </fieldset>
     <fieldset><legend>翻訳キャッシュ</legend>
       <label>保存期間（分）<input name="cacheMinutes" type="number" min="0" max="1440" required><small>既定30分。0で無効。再訪時は一致する段落の訳文だけを復元します。</small></label>
       <p><small>原文と訳文は拡張のメモリに最大約8MiB保持します。Firefox終了・拡張の再読み込みで消えます。プライベートウィンドウでは保存しません。設定の保存時にもキャッシュを削除します。</small></p>

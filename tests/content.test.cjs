@@ -9,6 +9,10 @@ function setup(html, translator = translateTree, preferences = {}) {
   const dom = new JSDOM(html, { url: "https://example.com/article", runScripts: "outside-only", pretendToBeVisual: true });
   const w = dom.window;
   w.Range.prototype.getClientRects = () => [{ width: 100, height: 20, left: 0, top: 0, right: 100, bottom: 20 }];
+  w.Range.prototype.getBoundingClientRect = function() {
+    const node = this.commonAncestorContainer;
+    return (node.nodeType === 1 ? node : node.parentElement)?.getBoundingClientRect();
+  };
   const attachShadow = w.Element.prototype.attachShadow;
   let shadow;
   w.Element.prototype.attachShadow = function(options) { shadow = attachShadow.call(this, options); return shadow; };
@@ -18,6 +22,7 @@ function setup(html, translator = translateTree, preferences = {}) {
     return { display: css.display || "inline", visibility: css.visibility || "visible", opacity: css.opacity || "1" };
   };
   const calls = [];
+  const copied = [];
   let listener;
   w.browser = { runtime: {
     onMessage: { addListener: fn => listener = fn },
@@ -25,9 +30,11 @@ function setup(html, translator = translateTree, preferences = {}) {
       if (msg.type === "contentPreferences") return { concurrency: 1, ...preferences };
       if (msg.type === "translate") {
         calls.push(msg);
+        if (msg.parts) return { parts: msg.parts.map(text => `訳:${text}`) };
         if (msg.documents) return { documents: await Promise.all(msg.documents.map(async document => ({ document: await translator(document) }))) };
         return { document: await translator(msg.document) };
       }
+      if (msg.type === "copyText") copied.push(msg.text);
       return {};
     }
   } };
@@ -38,11 +45,11 @@ function setup(html, translator = translateTree, preferences = {}) {
     for (let i = 0; i < 100; i++) {
       const status = await message({ type: "status" });
       if (!status.running) return status;
-      await new Promise(r => setImmediate(r));
+      await new Promise(r => setTimeout(r, 1));
     }
     throw new Error("translation did not finish");
   }
-  return { dom, w, calls, message, settle, get shadow() { return shadow; } };
+  return { dom, w, calls, copied, message, settle, get shadow() { return shadow; } };
 }
 
 test("manual DOM translation preserves links and code, skips hidden/editable/target-language text", async () => {
@@ -258,4 +265,104 @@ test("late batch responses respect stop and changes to individual paragraphs", a
     assert.equal(paragraphs[1].textContent, stop ? "Second sentence." : "訳:Second sentence.");
     s.dom.window.close();
   }
+});
+
+test("main-content scope skips navigation, avoids nested scopes and can be disabled", async () => {
+  const html = '<nav><p>Navigation words.</p></nav><main><article><p>Main prose.</p></article></main>';
+  const s = setup(html, translateTree, { mainContentOnly: true });
+  await s.message({ type: "start", source: "en", target: "ja" }); await s.settle();
+  assert.equal(s.calls.length, 1); assert.equal(textOf(s.calls[0].document), "Main prose.");
+  assert.equal(s.w.document.querySelector("nav p").textContent, "Navigation words.");
+  s.dom.window.close();
+  const off = setup(html, translateTree, { mainContentOnly: false });
+  await off.message({ type: "start", source: "en", target: "ja" }); await off.settle();
+  assert.equal(off.calls.length, 2); off.dom.window.close();
+  const fallback = setup('<p>Plain page without landmarks.</p>', translateTree, { mainContentOnly: true });
+  await fallback.message({ type: "start", source: "en", target: "ja" }); await fallback.settle();
+  assert.equal(fallback.calls.length, 1); fallback.dom.window.close();
+});
+
+test("visible paragraph priority changes request order without changing restoration", async () => {
+  for (const prioritizeVisible of [true, false]) {
+    const s = setup('<p>Far away.</p><p>On screen.</p><p>Nearby.</p>', translateTree, { prioritizeVisible });
+    [...s.w.document.querySelectorAll("p")].forEach((el, index) => {
+      const top = [5000, 10, 1000][index];
+      el.getBoundingClientRect = () => ({ top, bottom: top + 20, left: 0, right: 100, width: 100, height: 20 });
+    });
+    await s.message({ type: "start", source: "en", target: "ja" }); await s.settle();
+    assert.deepEqual(s.calls.map(call => textOf(call.document)), prioritizeVisible ? ["On screen.", "Nearby.", "Far away."] : ["Far away.", "On screen.", "Nearby."]);
+    await s.message({ type: "restore" }); assert.equal(s.w.document.querySelector("p").textContent, "Far away.");
+    s.dom.window.close();
+  }
+});
+
+test("large-page parsing yields to stop before making API requests", async () => {
+  const s = setup('<p>A paragraph to parse.</p>'.repeat(250));
+  const nativeTimeout = s.w.setTimeout.bind(s.w);
+  let interrupted = false;
+  s.w.setTimeout = (fn, ms) => nativeTimeout(() => {
+    if (ms === 0 && !interrupted) { interrupted = true; s.message({ type: "stop" }); }
+    fn();
+  }, ms);
+  const start = await s.message({ type: "start", source: "en", target: "ja" });
+  assert.equal(start.preparing, true);
+  await new Promise(resolve => setTimeout(resolve, 80));
+  assert.equal(interrupted, true); assert.equal(s.calls.length, 0);
+  assert.equal((await s.message({ type: "status" })).running, false);
+  s.dom.window.close();
+});
+
+test("progress and announcements have independent switches", async () => {
+  for (const announceProgress of [true, false]) {
+    const s = setup('<p>Translate this sentence.</p>', translateTree, { pageProgress: false, announceProgress });
+    await s.message({ type: "start", source: "en", target: "ja" }); await s.settle();
+    assert.equal(s.shadow?.querySelector(".panel") || null, null);
+    assert.equal(s.shadow?.querySelector('[role="status"]')?.textContent || "", announceProgress ? "ページ翻訳が完了しました" : "");
+    s.dom.window.close();
+  }
+});
+
+test("keyboard original dialog supports F2, copy, Escape focus return and disabling", async () => {
+  const s = setup('<p>Read <a href="/docs">the docs</a> carefully.</p>');
+  await s.message({ type: "start", source: "en", target: "ja" }); await s.settle();
+  const link = s.w.document.querySelector("a"); link.focus();
+  const tooltip = s.shadow.querySelector(".tooltip");
+  assert.equal(tooltip.querySelector(".original").lang, "en");
+  s.w.document.dispatchEvent(new s.w.KeyboardEvent("keydown", { key: "F2", bubbles: true }));
+  assert.equal(s.shadow.activeElement, tooltip);
+  tooltip.querySelector(".copy").click(); await new Promise(r => setImmediate(r));
+  assert.deepEqual(s.copied, ["Read the docs carefully."]);
+  s.w.document.dispatchEvent(new s.w.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  assert.equal(s.shadow.querySelector(".tooltip"), null); assert.equal(s.w.document.activeElement, link);
+  await s.message({ type: "preferencesChanged", preferences: { focusOriginal: false, copyButton: false } });
+  link.blur(); link.focus(); assert.equal(s.shadow.querySelector(".tooltip"), null);
+  s.dom.window.close();
+});
+
+test("selection launcher requires an explicit click, avoids editors and can be disabled", async () => {
+  const s = setup('<p>Selected prose.</p><div contenteditable="true">Private draft.</div>', translateTree, { selectionButton: true });
+  const rect = { top: 20, bottom: 40, left: 10, right: 110, width: 100, height: 20 };
+  s.w.Range.prototype.getBoundingClientRect = () => rect;
+  async function select(el) {
+    const range = s.w.document.createRange(); range.selectNodeContents(el);
+    const selected = s.w.getSelection(); selected.removeAllRanges(); selected.addRange(range);
+    s.w.document.dispatchEvent(new s.w.Event("selectionchange"));
+    await new Promise(resolve => setTimeout(resolve, 240));
+  }
+  await new Promise(r => setImmediate(r));
+  await select(s.w.document.querySelector("[contenteditable]"));
+  assert.equal(s.shadow?.querySelector(".launcher") || null, null);
+  await select(s.w.document.querySelector("p"));
+  assert.equal(s.calls.length, 0);
+  const launcher = s.shadow.querySelector(".launcher"); assert.ok(launcher);
+  launcher.click(); await new Promise(r => setImmediate(r));
+  assert.equal(s.calls.length, 1); assert.equal(s.calls[0].parts[0], "Selected prose.");
+  assert.equal(s.shadow.querySelector(".result").textContent, "訳:Selected prose.");
+  assert.equal(s.shadow.querySelector(".result").lang, "ja");
+  s.shadow.querySelector(".copy").click(); await new Promise(r => setImmediate(r));
+  assert.deepEqual(s.copied, ["訳:Selected prose."]);
+  s.shadow.querySelector('[aria-label="閉じる"]').click();
+  await s.message({ type: "preferencesChanged", preferences: { selectionButton: false } });
+  await select(s.w.document.querySelector("p")); assert.equal(s.shadow.querySelector(".launcher"), null);
+  s.dom.window.close();
 });

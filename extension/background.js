@@ -43,10 +43,12 @@ function cacheParagraph(s, url, source, target, original, document) {
   cacheBytes += size;
 }
 async function restoreCachedPage(sender) {
-  if (!sender.tab || sender.frameId !== 0 || sender.tab.incognito) return {};
+  if (!sender.tab || sender.frameId !== 0) return {};
   const revision = cacheRevision;
   const s = await getSettings();
-  if (!s.cacheMinutes) return {};
+  // The optional selection launcher needs listeners even before a manual translation.
+  if (s.selectionButton) await ensureContent(sender.tab.id);
+  if (sender.tab.incognito || !s.cacheMinutes) return {};
   const url = documentURL(sender.url), signature = cacheSignature(s);
   pruneCache();
   const entries = [...translationCache.values()].filter(entry => entry.url === url && entry.signature === signature);
@@ -306,13 +308,19 @@ async function handle(message, sender) {
   }
   if (message.type === "contentPreferences" && sender.tab) {
     const s = await getSettings();
-    return { concurrency: s.concurrency, batchTranslation: s.batchTranslation };
+    return K.contentPreferences(s);
+  }
+  if (message.type === "copyText" && sender.tab) {
+    if (!(await getSettings()).copyButton) throw new Error("コピーボタンは設定で無効になっています。");
+    if (typeof message.text !== "string" || message.text.length > 2000000) throw new Error("コピーする文章が不正です。");
+    await navigator.clipboard.writeText(message.text);
+    return {};
   }
   if (sender.tab) throw new Error("許可されていない操作です。");
   if (message.type === "clearCache") { clearCache(); return {}; }
   if (message.type === "preferences") {
     const s = await getSettings();
-    return { source: s.source, target: s.target, concurrency: s.concurrency, batchTranslation: s.batchTranslation };
+    return { source: s.source, target: s.target, ...K.contentPreferences(s) };
   }
   if (message.type === "page") {
     await ensureContent(message.tabId);
@@ -325,8 +333,19 @@ browser.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && changes.settings) {
     clearCache();
     try { queue.setLimit(K.settings(changes.settings.newValue).concurrency); } catch { /* Options validate on save. */ }
+    refreshContentPreferences().catch(() => {});
   }
 });
+async function refreshContentPreferences() {
+  const s = await getSettings();
+  const tabs = await browser.tabs.query({ url: ["http://*/*", "https://*/*"] });
+  await Promise.all(tabs.map(async tab => {
+    try {
+      if (s.selectionButton) await ensureContent(tab.id);
+      await browser.tabs.sendMessage(tab.id, { type: "preferencesChanged", preferences: K.contentPreferences(s) });
+    } catch { /* Most tabs have no content script until requested. */ }
+  }));
+}
 browser.tabs.onRemoved.addListener(tabId => abortTab(tabId));
 browser.tabs.onUpdated.addListener((tabId, change, tab) => {
   // Firefox also emits updates for history.replaceState and fragment navigation.
@@ -348,5 +367,21 @@ browser.contextMenus.onClicked.addListener(async (info, tab) => {
     // Firefox's restricted pages reject injection. Keep a visible indication.
     await browser.browserAction.setBadgeText({ tabId: tab.id, text: "!" });
     await browser.browserAction.setTitle({ tabId: tab.id, title: `Kotoba: ${error.message}` });
+  }
+});
+browser.commands.onCommand.addListener(async (command, tab) => {
+  try {
+    const s = await getSettings();
+    if (!s.keyboardShortcuts || !tab?.id || !/^https?:/.test(tab.url || "")) return;
+    await ensureContent(tab.id);
+    const state = await browser.tabs.sendMessage(tab.id, { type: "status" }, { frameId: 0 });
+    const type = command === "translate-page" ? state.running ? "stop" : "start"
+      : command === "translate-selection" ? "selection" : command === "restore-page" ? "restore" : null;
+    if (type) await browser.tabs.sendMessage(tab.id, { type, source: state.source || s.source, target: state.target || s.target }, { frameId: 0 });
+  } catch (error) {
+    if (tab?.id) {
+      await browser.browserAction.setBadgeText({ tabId: tab.id, text: "!" });
+      await browser.browserAction.setTitle({ tabId: tab.id, title: `Kotoba: ${error.message}` });
+    }
   }
 });

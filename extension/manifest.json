@@ -4,7 +4,12 @@
   "version": "0.1.1",
   "description": "ローカル翻訳サーバでページと選択範囲を翻訳します。",
   "browser_specific_settings": {"gecko": {"id": "kotoba-local@eno1220.local", "strict_min_version": "128.0"}},
-  "permissions": ["activeTab", "storage", "contextMenus", "http://*/*", "https://*/*"],
+  "permissions": ["activeTab", "storage", "contextMenus", "clipboardWrite", "http://*/*", "https://*/*"],
+  "commands": {
+    "translate-page": { "suggested_key": { "default": "Alt+Shift+Y" }, "description": "ページ翻訳／停止" },
+    "translate-selection": { "suggested_key": { "default": "Alt+Shift+U" }, "description": "選択範囲を翻訳" },
+    "restore-page": { "suggested_key": { "default": "Alt+Shift+O" }, "description": "原文に戻す" }
+  },
   "background": {"scripts": ["core.js", "background.js"], "persistent": true},
   "content_scripts": [{"matches": ["http://*/*", "https://*/*"], "js": ["cache-restore.js"], "run_at": "document_idle"}],
   "browser_action": {"default_title": "Kotoba 翻訳", "default_popup": "popup.html"},

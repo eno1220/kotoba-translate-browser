@@ -6,8 +6,16 @@ globalThis.Kotoba = (() => {
     endpoint: "http://127.0.0.1", port: "8000", path: "/v1/chat/completions",
     apiKey: "", model: "plamo-translate", apiFormat: "top-level",
     batchTranslation: true, concurrency: 1, inputTokens: 3000, timeoutSeconds: 180,
-    tokenizer: "bytes", tokenizePath: "/tokenize", source: "en", target: "ja", form: "", cacheMinutes: 30
+    tokenizer: "bytes", tokenizePath: "/tokenize", source: "en", target: "ja", form: "", cacheMinutes: 30,
+    responsiveScan: true, prioritizeVisible: true, mainContentOnly: false,
+    selectionButton: false, keyboardShortcuts: true, copyButton: true,
+    focusOriginal: true, pageProgress: true, announceProgress: true, hoverEnabled: true
   });
+  const FEATURES = ["batchTranslation", "responsiveScan", "prioritizeVisible", "mainContentOnly", "selectionButton", "keyboardShortcuts", "copyButton", "focusOriginal", "pageProgress", "announceProgress", "hoverEnabled"];
+  // Only this allowlist may be sent to content scripts; never spread connection settings.
+  function contentPreferences(s) {
+    return Object.fromEntries(["concurrency", ...FEATURES].map(key => [key, s[key]]));
+  }
   const LANGUAGES = "ja en zh-hans zh-hant ko ar az be bg bn ca ceb de es et eu fa fr gu he hi hr hu hy id it jv ka kk km lt lv ml mr ms my ne nl pa pl ru si sk sl sr sw ta te th tl ur uz vi".split(" ");
   function settings(raw = {}) {
     const s = { ...DEFAULTS, ...raw };
@@ -23,7 +31,7 @@ globalThis.Kotoba = (() => {
     }
     if (!["top-level", "template"].includes(s.apiFormat) || !["bytes", "llama", "vllm"].includes(s.tokenizer)) throw new Error("API形式またはtokenizer設定が不正です。");
     if (!s.model.trim() || /[\r\n]/.test(s.apiKey)) throw new Error("モデル名またはAPIキーを確認してください。");
-    if (typeof s.batchTranslation !== "boolean") throw new Error("まとめて翻訳の設定が不正です。");
+    for (const key of FEATURES) if (typeof s[key] !== "boolean") throw new Error(`${key} の設定が不正です。`);
     languages(s.source, s.target);
     if (!["", "plain", "polite"].includes(s.form)) throw new Error("文体が不正です。");
     return s;
@@ -184,5 +192,5 @@ globalThis.Kotoba = (() => {
       }
     }
   }
-  return { MAX_TOKENS, CONTENT_PROTOCOL, DEFAULTS, LANGUAGES, settings, languages, endpoint, body, byteTokens, split, Queue, documentText, documentLength, serializeDocument, parseDocument, splitDocument, mergeDocuments };
+  return { MAX_TOKENS, CONTENT_PROTOCOL, DEFAULTS, FEATURES, contentPreferences, LANGUAGES, settings, languages, endpoint, body, byteTokens, split, Queue, documentText, documentLength, serializeDocument, parseDocument, splitDocument, mergeDocuments };
 })();

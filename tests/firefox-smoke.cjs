@@ -159,6 +159,8 @@ const parserWindow = new (require("jsdom").JSDOM)("").window;
         for (let i=0; i<30; i++) { if(await inspect('!!document.querySelector("[data-kotoba-ui]").shadowRoot.querySelector(".tooltip")')) break; await wait(100); }
         const hover = await inspect('({text:document.querySelector("[data-kotoba-ui]").shadowRoot.querySelector(".tooltip .original")?.textContent,collapsed:getSelection()?.isCollapsed,visibility:document.visibilityState,focus:document.hasFocus()})');
         check(hover.text === 'Translation example', 'original hover missing: '+JSON.stringify(hover));
+        const keyboardOriginal = await inspect('(() => { document.querySelector("#link").blur(); document.querySelector("#link").focus(); document.querySelector("#link").dispatchEvent(new FocusEvent("focusin",{bubbles:true,composed:true})); const root = document.querySelector("[data-kotoba-ui]").shadowRoot; const tip = root.querySelector(".tooltip"); document.dispatchEvent(new KeyboardEvent("keydown",{key:"F2",bubbles:true})); const focused = root.activeElement === tip; document.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true})); return {text:tip?.querySelector(".original").textContent,focused,returned:document.activeElement.id === "link",closed:!root.querySelector(".tooltip")}; })()');
+        check(keyboardOriginal.text === 'Read the documentation carefully.' && keyboardOriginal.focused && keyboardOriginal.returned && keyboardOriginal.closed, 'keyboard original dialog failed: '+JSON.stringify(keyboardOriginal));
         await fetch(base + '/screenshot', {method:'POST',body:JSON.stringify({name:'page',image:await browser.tabs.captureTab(tab.id,{format:'png'})})});
         await send({type:'restore'});
         check(await inspect('document.querySelector("#paragraph").textContent') === 'Read the documentation carefully.', 'restore failed');
@@ -171,14 +173,31 @@ const parserWindow = new (require("jsdom").JSDOM)("").window;
         const options = await browser.tabs.create({url:browser.runtime.getURL('options.html'),active:true});
         await wait(200);
         await fetch(base + '/screenshot', {method:'POST',body:JSON.stringify({name:'options',image:await browser.tabs.captureTab(options.id,{format:'png'})})});
-        browser.extension.getViews().find(view => view.location.pathname === "/options.html").document.querySelector("#settings").requestSubmit();
+        const optionsForm = browser.extension.getViews().find(view => view.location.pathname === "/options.html").document.querySelector("#settings");
+        for (const key of ['responsiveScan','pageProgress','announceProgress','copyButton','focusOriginal']) optionsForm.elements.namedItem(key).checked = false;
+        optionsForm.elements.namedItem('selectionButton').checked = true;
+        optionsForm.requestSubmit();
         await wait(100);
-        check((await browser.storage.local.get('settings')).settings.batchTranslation === false, 'options reset batch setting');
+        const saved = (await browser.storage.local.get('settings')).settings;
+        check(saved.batchTranslation === false, 'options reset batch setting');
+        check(saved.selectionButton === true && ['responsiveScan','pageProgress','announceProgress','copyButton','focusOriginal'].every(key => saved[key] === false), 'options did not save boolean switches');
         await browser.tabs.remove(options.id);
+        await inspect('document.querySelector("[data-kotoba-ui]").shadowRoot.querySelector(".panel [aria-label=閉じる]")?.click(); const quickRange = document.createRange(); quickRange.selectNodeContents(document.querySelector("#paragraph")); getSelection().removeAllRanges(); getSelection().addRange(quickRange); document.dispatchEvent(new Event("selectionchange"));');
+        await wait(300);
+        const beforeQuick = await (await fetch(base+'/request-count')).json();
+        check(await inspect('!!document.querySelector("[data-kotoba-ui]").shadowRoot.querySelector(".launcher")'), 'selection launcher missing');
+        await inspect('document.querySelector("[data-kotoba-ui]").shadowRoot.querySelector(".launcher").click()');
+        for(let i=0;i<100;i++) { if(await inspect('!!document.querySelector("[data-kotoba-ui]").shadowRoot.querySelector(".result")?.textContent')) break; await wait(50); }
+        check((await (await fetch(base+'/request-count')).json()) > beforeQuick && await inspect('document.querySelector("[data-kotoba-ui]").shadowRoot.querySelector(".result").textContent.startsWith("訳:")'), 'selection launcher did not translate on click');
+        check(await inspect('!document.querySelector("[data-kotoba-ui]").shadowRoot.querySelector(".copy")'), 'copy switch ignored');
+        await browser.storage.local.set({ settings: { ...saved, selectionButton:false } });
+        await wait(100);
+        await inspect('document.querySelector("[data-kotoba-ui]").shadowRoot.querySelector(".panel [aria-label=閉じる]")?.click(); getSelection().removeAllRanges();');
         // Fill the cache after the settings changes above, then exercise both
         // history navigation and a fresh document (without Firefox's bfcache).
         await send({type:'start',source:'en',target:'ja'});
         for (let i=0; i<300; i++) { if (!(await send({type:'status'})).running) break; await wait(100); }
+        check(await inspect('!document.querySelector("[data-kotoba-ui]").shadowRoot.querySelector(".panel") && !document.querySelector("[data-kotoba-ui]").shadowRoot.querySelector("[role=status]").textContent'), 'progress display switches ignored');
         check(translationCache.size > 0, 'page cache stayed empty');
         const beforeRevisit = await (await fetch(base+'/request-count')).json();
         const navigate = action => new Promise((resolve, reject) => {

@@ -12,14 +12,20 @@ for (const key of ["source", "target"]) {
 async function load() {
   const { settings } = await browser.storage.local.get("settings");
   for (const [key, value] of Object.entries({ ...Kotoba.DEFAULTS, ...settings })) {
-    const field = form.elements.namedItem(key); if (field) field.value = value;
+    const field = form.elements.namedItem(key);
+    if (field) { if (field.type === "checkbox") field.checked = value; else field.value = value; }
   }
 }
 form.addEventListener("submit", async event => {
   event.preventDefault();
   try {
     const { settings: saved = {} } = await browser.storage.local.get("settings");
-    const settings = Kotoba.settings({ ...saved, ...Object.fromEntries(new FormData(form)) });
+    const values = Object.fromEntries(new FormData(form));
+    for (const key of Kotoba.FEATURES) {
+      const field = form.elements.namedItem(key);
+      if (field) values[key] = field.checked;
+    }
+    const settings = Kotoba.settings({ ...saved, ...values });
     await browser.storage.local.set({ settings });
     await browser.runtime.sendMessage({ type: "clearCache" });
     status.classList.remove("error"); status.textContent = "保存しました";

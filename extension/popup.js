@@ -28,10 +28,11 @@ function render(state) {
   running = state.running;
   $("status").classList.remove("error");
   $("status").textContent = state.cacheRestored ? "保存した訳文を復元しました" : state.running || state.total && !state.failed ? "" : state.message || "";
-  $("progress-section").hidden = !state.total;
+  $("progress-section").hidden = !state.total && !state.preparing;
   const percent = state.percent || 0;
   $("progress").value = percent; $("percent").textContent = `${percent}%`;
-  $("progress-label").textContent = state.running ? "翻訳中" : state.failed ? "一部未翻訳" : percent === 100 ? "翻訳完了" : "停止中";
+  if (state.preparing) { $("progress").removeAttribute("value"); $("percent").textContent = ""; }
+  $("progress-label").textContent = state.preparing ? "ページを解析中" : state.running ? "翻訳中" : state.failed ? "一部未翻訳" : percent === 100 ? "翻訳完了" : "停止中";
   $("counts").textContent = `${state.done} / ${state.total} 段落`;
   $("elapsed").textContent = state.startedAt ? `${Math.floor(((state.finishedAt || Date.now()) - state.startedAt) / 1000)}秒` : "";
   $("hover").checked = state.hoverEnabled !== false;
@@ -51,6 +52,7 @@ async function init() {
     const prefs = await browser.runtime.sendMessage({ type: "preferences" });
     if (prefs.error) throw new Error(prefs.error);
     $("batch-translation").checked = prefs.batchTranslation;
+    $("main-content-only").checked = prefs.mainContentOnly;
     $("source").value = prefs.source; $("target").value = prefs.target;
     if (!/^https?:\/\//.test(tab.url || "")) throw new Error("通常のWebページで開いてください。Firefoxの内部ページやPDFでは利用できません。");
     const state = await page("status");
@@ -85,12 +87,12 @@ $("reload").addEventListener("click", async () => {
 addEventListener("unload", () => clearInterval(timer));
 init();
 
-$("batch-translation").addEventListener("change", async () => {
-  const field = $("batch-translation");
+for (const [id, key] of [["batch-translation", "batchTranslation"], ["main-content-only", "mainContentOnly"]]) $(id).addEventListener("change", async () => {
+  const field = $(id);
   field.disabled = true;
   try {
     const { settings = {} } = await browser.storage.local.get("settings");
-    await browser.storage.local.set({ settings: { ...settings, batchTranslation: field.checked } });
+    await browser.storage.local.set({ settings: { ...settings, [key]: field.checked } });
   } catch (e) { field.checked = !field.checked; error(e); }
   finally { field.disabled = false; }
 });
