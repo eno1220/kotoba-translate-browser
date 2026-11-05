@@ -18,7 +18,8 @@ async function load() {
 form.addEventListener("submit", async event => {
   event.preventDefault();
   try {
-    const settings = Kotoba.settings(Object.fromEntries(new FormData(form)));
+    const { settings: saved = {} } = await browser.storage.local.get("settings");
+    const settings = Kotoba.settings({ ...saved, ...Object.fromEntries(new FormData(form)) });
     await browser.storage.local.set({ settings });
     status.classList.remove("error"); status.textContent = "保存しました";
   } catch (error) { status.classList.add("error"); status.textContent = error.message; }

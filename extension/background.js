@@ -116,14 +116,72 @@ async function translateDocument(s, document, page, signal, advance, limit = s.i
     error.code = "structure"; throw error;
   }
 }
+// Each marker scopes inline IDs to its own paragraph, so IDs can repeat across items.
+function serializeBatch(documents) {
+  return documents.map((document, i) => `<kotoba-item id="b${i}">${K.serializeDocument(document)}</kotoba-item>`).join("\n");
+}
+function parseBatch(text, documents) {
+  const parsed = new DOMParser().parseFromString(`<batch>${text}</batch>`, "application/xml");
+  if (parsed.querySelector("parsererror")) throw new Error("Invalid batch XML");
+  const result = new Array(documents.length);
+  for (const node of parsed.documentElement.childNodes) {
+    if (node.nodeType === 3 && !node.data.trim()) continue;
+    const id = node.nodeType === 1 && node.getAttribute("id");
+    if (node.nodeName !== "kotoba-item" || !/^b\d+$/.test(id) || node.attributes.length !== 1) throw new Error("Invalid batch marker");
+    const index = Number(id.slice(1));
+    if (id !== `b${index}` || index >= documents.length || result[index]) throw new Error("Duplicate or unknown batch marker");
+    result[index] = { document: K.parseDocument(node.innerHTML, documents[index]) };
+  }
+  if (result.filter(Boolean).length !== documents.length) throw new Error("Missing batch marker");
+  return result;
+}
+async function translateDocuments(s, documents, page, signal, advance) {
+  const count = counter(s, signal), results = [];
+  async function flush(batch) {
+    if (signal.aborted) throw new DOMException("キャンセルしました。", "AbortError");
+    if (batch.length > 1) {
+      const output = await generate(s, serializeBatch(batch), { ...page, html: true, batch: true }, signal);
+      if (!output.truncated) {
+        let accepted;
+        try { accepted = parseBatch(output.text, batch); } catch { /* Retry whole paragraphs below. */ }
+        if (accepted) {
+          results.push(...accepted);
+          advance(batch.reduce((sum, document) => sum + K.documentLength(document), 0));
+          return;
+        }
+      }
+    }
+    for (const document of batch) {
+      try { results.push({ document: await translateDocument(s, document, page, signal, advance) }); }
+      catch (error) {
+        if (error.code !== "structure") throw error;
+        results.push({ error: error.message, errorCode: error.code });
+      }
+    }
+  }
+  let batch = [];
+  for (const document of documents) {
+    if (batch.length && (!s.batchTranslation || await count(serializeBatch([...batch, document])) > s.inputTokens)) {
+      await flush(batch); batch = [];
+    }
+    batch.push(document);
+  }
+  if (batch.length) await flush(batch);
+  return results;
+}
 async function translate(message, sender) {
   if (!sender.tab) throw new Error("翻訳対象が不正です。");
   if (message.protocol !== K.CONTENT_PROTOCOL) throw staleContent();
   const document = message.document;
-  if (document !== undefined) {
-    if (!Array.isArray(document) || !document.length) throw new Error("ページ翻訳の本文データが不正です。");
-    if (K.serializeDocument(document).length > 2000000) throw new Error("翻訳対象の段落が200万文字を超えています。");
-    K.parseDocument(K.serializeDocument(document), document);
+  const documents = message.documents;
+  if (documents !== undefined && (!Array.isArray(documents) || !documents.length || documents.length > 16)) throw new Error("翻訳の段落数が不正です。");
+  const inputs = documents || (document !== undefined ? [document] : null);
+  if (inputs) {
+    for (const document of inputs) {
+      if (!Array.isArray(document) || !document.length) throw new Error("ページ翻訳の本文データが不正です。");
+      if (K.serializeDocument(document).length > 2000000) throw new Error("翻訳対象の段落が200万文字を超えています。");
+      K.parseDocument(K.serializeDocument(document), document);
+    }
   } else {
     if (!Array.isArray(message.parts) || message.parts.length !== 1 || typeof message.parts[0] !== "string") throw new Error("選択翻訳の本文データが不正です。");
     if (message.parts[0].length > 2000000) throw new Error("選択範囲が200万文字を超えています。");
@@ -134,7 +192,7 @@ async function translate(message, sender) {
   const job = { tabId: sender.tab.id, frameId: sender.frameId, pageURL: documentURL(sender.tab.url || sender.url), controller: new AbortController() };
   const id = Symbol(); jobs.set(id, job);
   let completed = 0;
-  const total = document ? K.documentLength(document) : message.parts[0].length;
+  const total = inputs ? inputs.reduce((sum, document) => sum + K.documentLength(document), 0) : message.parts[0].length;
   const advance = amount => {
     completed += amount;
     if (typeof message.requestId === "string" && message.requestId.length < 100 && !job.controller.signal.aborted) {
@@ -144,6 +202,7 @@ async function translate(message, sender) {
   try {
     const s = await getSettings();
     const page = { source: message.source, target: message.target, domain: pageURL.origin };
+    if (documents) return { documents: await translateDocuments(s, documents, page, job.controller.signal, advance) };
     if (document) return { document: await translateDocument(s, document, page, job.controller.signal, advance) };
     return { parts: [await translatePlain(s, message.parts[0], page, job.controller.signal, counter(s, job.controller.signal), s.inputTokens, 0, advance)] };
   } finally { jobs.delete(id); }
@@ -171,12 +230,12 @@ async function handle(message, sender) {
   }
   if (message.type === "contentPreferences" && sender.tab) {
     const s = await getSettings();
-    return { concurrency: s.concurrency };
+    return { concurrency: s.concurrency, batchTranslation: s.batchTranslation };
   }
   if (sender.tab) throw new Error("許可されていない操作です。");
   if (message.type === "preferences") {
     const s = await getSettings();
-    return { source: s.source, target: s.target, concurrency: s.concurrency };
+    return { source: s.source, target: s.target, concurrency: s.concurrency, batchTranslation: s.batchTranslation };
   }
   if (message.type === "page") {
     await ensureContent(message.tabId);

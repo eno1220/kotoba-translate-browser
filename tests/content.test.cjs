@@ -5,7 +5,7 @@ const { JSDOM } = require("jsdom");
 const source = readFileSync(require.resolve("../extension/content.js"), "utf8");
 const textOf = nodes => nodes.map(node => node.text !== undefined ? node.text : textOf(node.children)).join("");
 const translateTree = nodes => nodes.map(node => node.protected ? node : node.text !== undefined ? { text: node.text.trim() ? `訳:${node.text}` : node.text } : { ...node, children: translateTree(node.children) });
-function setup(html, translator = translateTree) {
+function setup(html, translator = translateTree, preferences = {}) {
   const dom = new JSDOM(html, { url: "https://example.com/article", runScripts: "outside-only", pretendToBeVisual: true });
   const w = dom.window;
   w.Range.prototype.getClientRects = () => [{ width: 100, height: 20, left: 0, top: 0, right: 100, bottom: 20 }];
@@ -22,8 +22,12 @@ function setup(html, translator = translateTree) {
   w.browser = { runtime: {
     onMessage: { addListener: fn => listener = fn },
     sendMessage: async msg => {
-      if (msg.type === "contentPreferences") return { concurrency: 1 };
-      if (msg.type === "translate") { calls.push(msg); return { document: await translator(msg.document) }; }
+      if (msg.type === "contentPreferences") return { concurrency: 1, ...preferences };
+      if (msg.type === "translate") {
+        calls.push(msg);
+        if (msg.documents) return { documents: await Promise.all(msg.documents.map(async document => ({ document: await translator(document) }))) };
+        return { document: await translator(msg.document) };
+      }
       return {};
     }
   } };
@@ -189,4 +193,47 @@ test("original hover waits, stays stable across inline nodes, and supports pinni
   move(); await new Promise(r => setTimeout(r, 310));
   assert.equal(s.shadow.querySelector(".tooltip"), null);
   s.dom.window.close();
+});
+
+
+test("batch mode applies each result to its paragraph, preserves links and restores originals", async () => {
+  const html = '<p>First <a href="/one">link</a>.</p><p>Second <a href="/two">link</a>.</p>';
+  const s = setup(html, translateTree, { batchTranslation: true });
+  const links = [...s.w.document.querySelectorAll("a")];
+  await s.message({ type: "start", source: "en", target: "ja" });
+  const state = await s.settle();
+  assert.equal(s.calls.length, 1);
+  assert.equal(s.calls[0].documents.length, 2);
+  assert.equal(state.done, 2);
+  assert.equal(state.percent, 100);
+  assert.match(s.w.document.querySelectorAll("p")[1].textContent, /訳:Second/);
+  assert.deepEqual([...s.w.document.querySelectorAll("a")], links);
+  await s.message({ type: "restore" });
+  assert.equal(s.w.document.body.innerHTML, html);
+  s.dom.window.close();
+
+  const off = setup(html, translateTree, { batchTranslation: false });
+  await off.message({ type: "start", source: "en", target: "ja" });
+  await off.settle();
+  assert.equal(off.calls.length, 2);
+  assert.ok(off.calls.every(call => call.document && !call.documents));
+  off.dom.window.close();
+});
+
+
+test("late batch responses respect stop and changes to individual paragraphs", async () => {
+  for (const stop of [true, false]) {
+    const releases = [];
+    const s = setup('<p>First sentence.</p><p>Second sentence.</p>', tree => new Promise(resolve => releases.push(() => resolve(translateTree(tree)))), { batchTranslation: true });
+    await s.message({ type: "start", source: "en", target: "ja" });
+    await new Promise(r => setImmediate(r));
+    if (stop) await s.message({ type: "stop" });
+    else s.w.document.querySelector("p").textContent = "Updated by site.";
+    releases.forEach(release => release());
+    await new Promise(r => setImmediate(r));
+    const paragraphs = s.w.document.querySelectorAll("p");
+    assert.equal(paragraphs[0].textContent, stop ? "First sentence." : "Updated by site.");
+    assert.equal(paragraphs[1].textContent, stop ? "Second sentence." : "訳:Second sentence.");
+    s.dom.window.close();
+  }
 });

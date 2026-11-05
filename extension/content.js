@@ -1,6 +1,6 @@
 /* global browser */
 (() => {
-  const PROTOCOL = 2;
+  const PROTOCOL = 3;
   if (globalThis.__kotobaLoaded) return;
   globalThis.__kotobaLoaded = true;
   const SKIP = new Set("SCRIPT STYLE NOSCRIPT TEMPLATE PRE CODE KBD SAMP VAR TEXTAREA INPUT SELECT OPTION BUTTON SVG MATH CANVAS VIDEO AUDIO IFRAME OBJECT EMBED".split(" "));
@@ -315,25 +315,32 @@
     let cursor = 0;
     async function worker() {
       while (run === generation && cursor < groups.length) {
-        const group = groups[cursor++];
+        const batch = groups.slice(cursor, cursor + (state.batchTranslation ? 16 : 1));
+        cursor += batch.length;
         const requestId = `page-${run}-${++requestSequence}`;
-        const length = group.length;
+        const length = batch.reduce((sum, group) => sum + group.length, 0);
         progressListeners.set(requestId, progress => {
           if (run !== generation) return;
           activeProgress.set(requestId, Math.max(activeProgress.get(requestId) || 0, Math.min(length, progress.completed)));
           updateProgress();
         });
         try {
-          const response = await browser.runtime.sendMessage({ type: "translate", protocol: PROTOCOL, requestId, document: group.document, source, target });
+          const response = await browser.runtime.sendMessage({ type: "translate", protocol: PROTOCOL, requestId, ...(batch.length > 1 ? { documents: batch.map(group => group.document) } : { document: batch[0].document }), source, target });
           if (state.url !== pageURL()) { currentPage(); return; }
           if (run !== generation) return;
-          if (response.error && response.errorCode === "structure") {
-            state.failed++; state.message = response.error;
-          } else {
-            if (response.error) throw new Error(response.error);
-            if (!response.document) throw new Error("翻訳結果が不正です。");
-            if (applyDocument(group, response.document)) appliedDirection = `${source}:${target}`;
-            else { state.failed++; state.message = "更新された段落は適用していません"; }
+          if (response.error && (batch.length > 1 || response.errorCode !== "structure")) throw new Error(response.error);
+          const responses = batch.length > 1 ? response.documents : [response];
+          if (!responses || responses.length !== batch.length) throw new Error("翻訳結果が不正です。");
+          for (const [index, group] of batch.entries()) {
+            const response = responses[index];
+            if (response.error && response.errorCode === "structure") {
+              state.failed++; state.message = response.error;
+            } else {
+              if (response.error) throw new Error(response.error);
+              if (!response.document) throw new Error("翻訳結果が不正です。");
+              if (applyDocument(group, response.document)) appliedDirection = `${source}:${target}`;
+              else { state.failed++; state.message = "更新された段落は適用していません"; }
+            }
           }
         } catch (error) {
           if (run !== generation) return;
@@ -344,7 +351,7 @@
           statusPanel(); return;
         } finally { progressListeners.delete(requestId); }
         activeProgress.delete(requestId); completedChars += length;
-        state.done++; updateProgress();
+        state.done += batch.length; updateProgress();
       }
     }
     await Promise.all(Array.from({ length: Math.min(state.concurrency, Math.max(1, groups.length)) }, worker));
@@ -550,6 +557,8 @@
         const beforePreferences = generation;
         const prefs = await browser.runtime.sendMessage({ type: "contentPreferences" });
         if (beforePreferences !== generation) return { ...state };
+        if (prefs.error) throw new Error(prefs.error);
+        state.batchTranslation = prefs.batchTranslation === true;
         state.concurrency = prefs.concurrency || message.concurrency || 1;
         // Don't keep the popup alive for the whole page translation.
         translatePage(message.source, message.target).catch(error => { state.running = false; state.message = error.message; statusPanel(); });

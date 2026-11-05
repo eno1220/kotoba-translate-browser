@@ -1,11 +1,11 @@
 /* Shared pure logic; also loaded directly by the small Node test suite. */
 globalThis.Kotoba = (() => {
   const MAX_TOKENS = 8096;
-  const CONTENT_PROTOCOL = 2;
+  const CONTENT_PROTOCOL = 3;
   const DEFAULTS = Object.freeze({
     endpoint: "http://127.0.0.1", port: "8000", path: "/v1/chat/completions",
     apiKey: "", model: "plamo-translate", apiFormat: "top-level",
-    concurrency: 1, inputTokens: 3000, timeoutSeconds: 180,
+    batchTranslation: true, concurrency: 1, inputTokens: 3000, timeoutSeconds: 180,
     tokenizer: "bytes", tokenizePath: "/tokenize", source: "en", target: "ja", form: ""
   });
   const LANGUAGES = "ja en zh-hans zh-hant ko ar az be bg bn ca ceb de es et eu fa fr gu he hi hr hu hy id it jv ka kk km lt lv ml mr ms my ne nl pa pl ru si sk sl sr sw ta te th tl ur uz vi".split(" ");
@@ -23,6 +23,7 @@ globalThis.Kotoba = (() => {
     }
     if (!["top-level", "template"].includes(s.apiFormat) || !["bytes", "llama", "vllm"].includes(s.tokenizer)) throw new Error("API形式またはtokenizer設定が不正です。");
     if (!s.model.trim() || /[\r\n]/.test(s.apiKey)) throw new Error("モデル名またはAPIキーを確認してください。");
+    if (typeof s.batchTranslation !== "boolean") throw new Error("まとめて翻訳の設定が不正です。");
     languages(s.source, s.target);
     if (!["", "plain", "polite"].includes(s.form)) throw new Error("文体が不正です。");
     return s;
@@ -36,10 +37,11 @@ globalThis.Kotoba = (() => {
     u.pathname = u.pathname.replace(/\/$/, "") + path;
     return u.href;
   }
-  function body(s, text, { source, target, domain, html = false, retry = false }) {
+  function body(s, text, { source, target, domain, html = false, retry = false, batch = false }) {
     languages(source, target);
     let context = `This text is from a web page on ${domain}. Translate it as part of the website, preserving the meaning and natural flow of complete sentences.`;
-    if (html) context += " The input is an HTML fragment of one paragraph. Translate the whole paragraph together. Preserve every HTML tag and id exactly once, keep link labels with their links, and do not translate code or elements marked translate=\"no\". You may reorder sibling inline elements and place translated prose outside tags to produce natural grammar. Return only the translated HTML fragment.";
+    if (html) context += (batch ? " The input is an HTML fragment containing independent paragraphs. Translate each whole paragraph together." : " The input is an HTML fragment of one paragraph. Translate the whole paragraph together.") + " Preserve every HTML tag and id exactly once, keep link labels with their links, and do not translate code or elements marked translate=\"no\". You may reorder sibling inline elements and place translated prose outside tags to produce natural grammar. Return only the translated HTML fragment.";
+    if (batch) context += " The input contains multiple independent paragraphs in kotoba-item elements. Preserve each kotoba-item tag and its id exactly once. Translate each paragraph separately within its own element; never move text or inline elements between paragraphs. Return only these HTML fragments with no text outside them.";
     if (retry) context += " The previous response did not preserve the HTML structure. Keep all tags and id attributes, including links, in the translated fragment. Do not return Markdown fences or explanations.";
     const options = { context, form: s.form, target_lang: target };
     if (source !== "auto") options.source_lang = source;

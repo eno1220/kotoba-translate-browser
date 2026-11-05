@@ -50,6 +50,7 @@ async function init() {
     const [tab] = await browser.tabs.query({ active: true, currentWindow: true }); tabId = tab.id;
     const prefs = await browser.runtime.sendMessage({ type: "preferences" });
     if (prefs.error) throw new Error(prefs.error);
+    $("batch-translation").checked = prefs.batchTranslation;
     $("source").value = prefs.source; $("target").value = prefs.target;
     if (!/^https?:\/\//.test(tab.url || "")) throw new Error("通常のWebページで開いてください。Firefoxの内部ページやPDFでは利用できません。");
     const state = await page("status");
@@ -83,3 +84,13 @@ $("reload").addEventListener("click", async () => {
 });
 addEventListener("unload", () => clearInterval(timer));
 init();
+
+$("batch-translation").addEventListener("change", async () => {
+  const field = $("batch-translation");
+  field.disabled = true;
+  try {
+    const { settings = {} } = await browser.storage.local.get("settings");
+    await browser.storage.local.set({ settings: { ...settings, batchTranslation: field.checked } });
+  } catch (e) { field.checked = !field.checked; error(e); }
+  finally { field.disabled = false; }
+});

@@ -24,7 +24,7 @@ function background(responder, settings = {}) {
   for (const file of ["core.js", "background.js"]) vm.runInContext(readFileSync(require.resolve(`../extension/${file}`), "utf8"), context);
   return {
     calls, progress, max: () => maximum,
-    send: (parts, overrides = {}, tabId = 1) => listener({ type: "translate", protocol: 2, parts, source: "en", target: "ja", ...overrides }, { id: "test", tab: { id: tabId }, frameId: 0, url: "https://example.org/private?q=secret" })
+    send: (parts, overrides = {}, tabId = 1) => listener({ type: "translate", protocol: 3, parts, source: "en", target: "ja", ...overrides }, { id: "test", tab: { id: tabId }, frameId: 0, url: "https://example.org/private?q=secret" })
   };
 }
 const completion = text => ({ choices: [{ message: { content: text }, finish_reason: "stop" }] });
@@ -89,4 +89,56 @@ test("broken inline structure retries the complete paragraph and never translate
   assert.equal(b.calls.length, 2);
   assert.equal(b.calls[0].body.messages[0].content, b.calls[1].body.messages[0].content);
   assert.ok(b.calls[1].body.context.includes("previous response"));
+});
+
+
+const batchDocuments = [
+  [{ text: "First " }, { tag: "a", id: "k0", children: [{ text: "link" }] }],
+  [{ text: "Second " }, { tag: "a", id: "k0", children: [{ text: "link" }] }]
+];
+test("batch markers map reordered results back with paragraph-local link IDs and accurate progress", async () => {
+  const b = background(({ body }) => {
+    assert.ok(body.context.includes("multiple independent paragraphs"));
+    return completion('<kotoba-item id="b1">二番目<a id="k0">リンク</a></kotoba-item>\n<kotoba-item id="b0">最初<a id="k0">リンク</a></kotoba-item>');
+  });
+  const response = await b.send([], { documents: batchDocuments, requestId: "batch" });
+  assert.equal(b.calls.length, 1);
+  assert.equal(response.documents[0].document[0].text, "最初");
+  assert.equal(response.documents[1].document[0].text, "二番目");
+  assert.equal(b.progress.at(-1).completed, b.progress.at(-1).total);
+  assert.equal(b.progress.at(-1).total, 21);
+});
+
+test("invalid or truncated batches fall back to whole paragraphs and retain structure errors", async () => {
+  for (const bad of [
+    '<kotoba-item id="b0">missing second</kotoba-item>',
+    '<kotoba-item id="b0">duplicate</kotoba-item><kotoba-item id="b0">duplicate</kotoba-item>',
+    '<kotoba-item id="b0">lost link</kotoba-item><kotoba-item id="b1">lost link</kotoba-item>',
+    'unmarked output', null
+  ]) {
+    const b = background(({ body }) => {
+      const input = body.messages[0].content;
+      if (input.includes("kotoba-item")) return bad === null ? { choices: [{ finish_reason: "length" }] } : completion(bad);
+      assert.ok(input.includes('<a id="k0">link</a>'));
+      return completion(input.includes("First") ? input.replace("First", "最初") : "broken structure");
+    });
+    const result = await b.send([], { documents: batchDocuments });
+    assert.equal(b.calls.length, 4);
+    assert.equal(result.documents[0].document[0].text, "最初 ");
+    assert.equal(result.documents[1].errorCode, "structure");
+  }
+});
+
+test("batch packing includes marker overhead in the token budget and disabling sends separate requests", async () => {
+  const documents = Array.from({ length: 5 }, () => [{ text: "Short sentence." }]);
+  for (const batchTranslation of [true, false]) {
+    const b = background(({ body }) => {
+      const input = body.messages[0].content;
+      assert.ok(Buffer.byteLength(input) <= 128);
+      return completion(input);
+    }, { inputTokens: 128, batchTranslation });
+    const result = await b.send([], { documents });
+    assert.equal(result.documents.length, 5);
+    assert.equal(b.calls.length, batchTranslation ? 3 : 5);
+  }
 });
