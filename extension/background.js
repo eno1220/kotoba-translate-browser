@@ -179,7 +179,7 @@ function serializeBatch(documents) {
   return documents.map((document, i) => `<kotoba-item id="b${i}">${K.serializeDocument(document)}</kotoba-item>`).join("\n");
 }
 function parseBatch(text, documents) {
-  const parsed = new DOMParser().parseFromString(`<batch>${text}</batch>`, "application/xml");
+  const parsed = new DOMParser().parseFromString(`<batch>${K.normalizeEntities(text)}</batch>`, "application/xml");
   if (parsed.querySelector("parsererror")) throw new Error("Invalid batch XML");
   const result = new Array(documents.length);
   for (const node of parsed.documentElement.childNodes) {

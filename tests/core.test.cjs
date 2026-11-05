@@ -73,3 +73,30 @@ test("global queue is serial by default and removes cancelled waiters", async ()
   release(); await Promise.all([first, last]);
   assert.equal(maximum, 1);
 });
+
+
+test("HTML entities decode as text while unknown entities and markup stay invalid", () => {
+  const source = [{ text: " Read " }, { tag: "a", id: "k0", children: [{ text: "docs" }] }, { text: " carefully. " }];
+  const result = K.parseDocument('読む &copy; &mdash; <a id="k0">資料&nbsp;&eacute;</a> &lt;img&gt;', source);
+  assert.equal(K.documentText(result), " 読む © — 資料\u00a0é <img> ");
+  assert.throws(() => K.parseDocument('<a id="k0">&unknown;</a>', source));
+  assert.throws(() => K.parseDocument('<a id="k0" onclick="bad()">資料</a>', source));
+  assert.deepEqual(K.parseDocument(K.serializeDocument(result), source), result);
+});
+
+test("fitting HTML skips per-node tokenization and split handles UTF-8 byte edges", async () => {
+  const tree = Array.from({ length: 100 }, (_, i) => ({ tag: "span", id: `k${i}`, children: [{ text: "word" }] }));
+  let calls = 0;
+  assert.deepEqual(await K.splitDocument(tree, 10000, text => { calls++; return K.byteTokens(text); }), [tree]);
+  assert.equal(calls, 1);
+  const text = "Aé字🧑‍💻 & < > ".repeat(100);
+  for (const limit of [4, 17, 128]) {
+    const parts = await K.split(text, limit);
+    assert.equal(parts.join(""), text);
+    assert.ok(parts.every(part => K.byteTokens(part) <= limit));
+  }
+  const linked = [{ tag: "a", id: "k0", children: [{ text }] }];
+  const parts = await K.splitDocument(linked, 128);
+  assert.deepEqual(K.mergeDocuments(parts), linked);
+  assert.ok(parts.every(part => K.byteTokens(K.serializeDocument(part)) <= 128));
+});

@@ -27,6 +27,8 @@ const parserWindow = new (require("jsdom").JSDOM)("").window;
         <input id="input" value="private draft"><p id="injection">Potentially unsafe model response.</p>
         <p>Call <code id="inline-code">request()</code> to load the document.</p>
         <p id="inline-sentence"><span>If you have read my </span><a id="posts" href="/posts"><u><span>earlier posts</span></u></a><span> about </span><a id="assembly" href="/assembly"><u><span>assembly on Linux x86_64</span></u>⁠<span class="sr-only">(opens in a new window)</span></a><span>, you may know my interest in low-level programming.</span></p>
+        <p id="modern">Read<br><x-label>the latest news</x-label> 🧑‍💻.</p>
+        <x-article id="component"><p slot="body">Slotted article.</p></x-article>
         <p>${"A long source sentence with enough words for chunking. ".repeat(30)}</p>
       </body></html>`); return;
     }
@@ -125,6 +127,7 @@ const parserWindow = new (require("jsdom").JSDOM)("").window;
         const inspect = async code => (await browser.tabs.executeScript(tab.id, {code}))[0];
         check((await send({type:'status'})).translated === 0, 'translated automatically');
         await inspect('window.testClicks = 0; document.querySelector("#link").addEventListener("click", e => {e.preventDefault();window.testClicks++})');
+        await inspect('window.modernOriginal = document.querySelector("#modern").innerHTML; window.modernText = document.querySelector("#modern x-label").firstChild; window.articleRoot = document.querySelector("#component").attachShadow({mode:"open"}); window.articleRoot.innerHTML = "<section><slot name=body></slot><p>Shadow prose.</p></section>";');
         await send({type:'start',source:'en',target:'ja'});
         ${process.env.KOTOBA_HISTORY ? 'await browser.tabs.executeScript(tab.id,{code:"history.replaceState({test:true}, document.title, location.href)"});' : ''}
         const preview = await browser.tabs.create({url:browser.runtime.getURL('popup.html')+'?previewTab='+tab.id,active:true});
@@ -152,6 +155,8 @@ const parserWindow = new (require("jsdom").JSDOM)("").window;
         check(data.paragraph.includes('訳:') && data.href === '/docs' && data.clicks === 1, 'link structure or listener lost');
         check(data.code === 'const code = 123;' && data.skip === 'Keep this brand' && data.hidden === 'Hidden prose' && data.japanese === 'これは日本語です。' && data.input === 'private draft', 'excluded content changed');
         check(data.inlineCode === 'request()', 'inline code changed');
+        check(await inspect('document.querySelector("#modern x-label").firstChild === window.modernText && window.modernText.data.startsWith("訳:") && !!document.querySelector("#modern br") && document.querySelector("#modern").textContent.includes("🧑‍💻")'), 'modern inline DOM identity or joiner lost');
+        check(await inspect('document.querySelector("[slot=body]").textContent.startsWith("訳:") && window.articleRoot.querySelector("p").textContent.startsWith("訳:")'), 'slotted or shadow content not translated');
         const order = await inspect('({first:document.querySelector("#inline-sentence a").id,last:document.querySelectorAll("#inline-sentence a")[1].id,note:document.querySelector(".sr-only").textContent})');
         check(order.first === 'assembly' && order.last === 'posts' && order.note === '(opens in a new window)', 'link order or screen-reader note changed incorrectly');
         check(data.injection.startsWith('<img') && data.images === 0 && !data.compromised, 'model HTML executed');
@@ -164,6 +169,7 @@ const parserWindow = new (require("jsdom").JSDOM)("").window;
         await fetch(base + '/screenshot', {method:'POST',body:JSON.stringify({name:'page',image:await browser.tabs.captureTab(tab.id,{format:'png'})})});
         await send({type:'restore'});
         check(await inspect('document.querySelector("#paragraph").textContent') === 'Read the documentation carefully.', 'restore failed');
+        check(await inspect('document.querySelector("#modern").innerHTML === window.modernOriginal && document.querySelector("[slot=body]").textContent === "Slotted article." && window.articleRoot.querySelector("p").textContent === "Shadow prose."'), 'modern DOM restore failed');
         check(await inspect('document.querySelector("#inline-sentence a").id') === 'posts', 'original link order was not restored');
         await inspect('const r = document.createRange(); r.selectNodeContents(document.querySelector("#paragraph")); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);');
         await send({type:'selection',source:'en',target:'ja'});

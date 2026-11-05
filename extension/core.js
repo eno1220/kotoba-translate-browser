@@ -61,7 +61,8 @@ globalThis.Kotoba = (() => {
     return result;
   }
   // PLaMo's byte fallback makes UTF-8 byte length a conservative token estimate.
-  const byteTokens = text => new TextEncoder().encode(text).length;
+  const encoder = new TextEncoder();
+  const byteTokens = text => encoder.encode(text).length;
   const escape = text => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   const INLINE_TAGS = new Set(["a", "span", "strong", "em", "b", "i", "u", "s", "del", "sub", "sup", "mark", "small", "abbr", "q", "cite", "code", "kbd", "samp", "var"]);
   function documentText(nodes) { return nodes.map(node => node.text !== undefined ? node.text : documentText(node.children)).join(""); }
@@ -73,6 +74,19 @@ globalThis.Kotoba = (() => {
       return `<${node.tag} id="${node.id}"${node.protected ? ' translate="no"' : ""}>${serializeDocument(node.children)}</${node.tag}>`;
     }).join("");
   }
+  // Decode only named HTML entities. Keep strict XML validation for tags and IDs;
+  // the HTML parser never receives model-provided markup or creates live DOM.
+  function normalizeEntities(text) {
+    const entities = new Map();
+    return text.replace(/&[a-zA-Z][a-zA-Z0-9]+;/g, entity => {
+      if (/^&(amp|lt|gt|quot|apos);$/.test(entity)) return entity;
+      if (!entities.has(entity)) {
+        const decoded = new DOMParser().parseFromString(entity, "text/html").body.textContent;
+        entities.set(entity, decoded === entity ? entity : Array.from(decoded, char => `&#${char.codePointAt(0)};`).join(""));
+      }
+      return entities.get(entity);
+    });
+  }
   function parseDocument(text, source) {
     const expected = new Map();
     function index(nodes, parent = null) {
@@ -83,7 +97,7 @@ globalThis.Kotoba = (() => {
     }
     index(source);
     const cleaned = text.trim().replace(/^```(?:html|xml)?\s*\n([\s\S]*?)\n```$/i, "$1");
-    const parsed = new DOMParser().parseFromString(`<kotoba-root>${cleaned.replace(/&nbsp;/g, "&#160;")}</kotoba-root>`, "application/xml");
+    const parsed = new DOMParser().parseFromString(`<kotoba-root>${normalizeEntities(cleaned)}</kotoba-root>`, "application/xml");
     if (parsed.querySelector("parsererror")) throw new Error("翻訳結果のHTMLを解釈できません。");
     const seen = new Set();
     function read(parentNode, parentId = null) {
@@ -101,6 +115,17 @@ globalThis.Kotoba = (() => {
     }
     const result = read(parsed.documentElement);
     if (seen.size !== expected.size || !documentText(result).trim()) throw new Error("翻訳結果のリンク・書式が不足しています。");
+    // Generation may trim the fragment, but DOM runs still need their edge spaces.
+    const leading = source[0]?.text?.match(/^\s*/u)[0] || "";
+    const trailing = source.at(-1)?.text?.match(/\s*$/u)[0] || "";
+    if (leading) {
+      if (result[0]?.text !== undefined) result[0].text = leading + result[0].text.replace(/^\s*/u, "");
+      else result.unshift({ text: leading });
+    }
+    if (trailing) {
+      if (result.at(-1)?.text !== undefined) result.at(-1).text = result.at(-1).text.replace(/\s*$/u, "") + trailing;
+      else result.push({ text: trailing });
+    }
     return result;
   }
   // Split by readable text, never by the number or position of DOM text nodes.
@@ -109,13 +134,16 @@ globalThis.Kotoba = (() => {
     const chunks = [];
     let current = [];
     const fits = async value => await count(serializeDocument(value)) <= limit;
+    if (!nodes.length) return [];
+    if (await fits(nodes)) return [nodes];
     async function pieces(node, wrappers = []) {
       const wrap = children => wrappers.reduceRight((value, wrapper) => [{ ...wrapper, children: value }], children);
       if (await fits(wrap([node]))) return [wrap([node])];
       if (node.text !== undefined) {
         const overhead = await count(serializeDocument(wrap([{ text: "" }])));
-        const pieces = await split(node.text, Math.max(1, limit - overhead - 16), async text => (await count(serializeDocument(wrap([{ text }])))) - overhead);
-        return pieces.map(text => wrap([{ text }]));
+        const parts = count === byteTokens ? splitBytes(node.text, limit - overhead, true)
+          : await split(node.text, Math.max(1, limit - overhead - 16), async text => (await count(serializeDocument(wrap([{ text }])))) - overhead);
+        return parts.map(text => wrap([{ text }]));
       }
       if (node.protected) throw new Error("保護対象が入力上限を超えています。入力上限を増やしてください。");
       const result = [];
@@ -141,7 +169,39 @@ globalThis.Kotoba = (() => {
     return result;
   }
   // Keep every code point and whitespace; prefer paragraphs, sentences, then words.
+  function preferredCut(prefix) {
+    for (const re of [/\n\s*\n/g, /[.!?。！？][\s\u3000]+|[。！？]/g, /\s+/g]) {
+      let cut = 0;
+      for (const match of prefix.matchAll(re)) {
+        const end = match.index + match[0].length;
+        if (end >= prefix.length / 2) cut = end;
+      }
+      if (cut) return cut;
+    }
+    return prefix.length;
+  }
+  function splitBytes(text, limit, html = false) {
+    const output = [];
+    // Scan each UTF-16 code point once per chunk instead of repeatedly encoding
+    // the entire remaining article and allocating Array.from(rest).
+    let start = 0;
+    while (start < text.length) {
+      let end = start, bytes = 0;
+      while (end < text.length) {
+        const point = text.codePointAt(end);
+        const size = html && point === 38 ? 5 : html && (point === 60 || point === 62) ? 4
+          : point <= 0x7f ? 1 : point <= 0x7ff ? 2 : point <= 0xffff ? 3 : 4;
+        if (bytes + size > limit) break;
+        bytes += size; end += point > 0xffff ? 2 : 1;
+      }
+      if (end === start) throw new Error("1文字が入力トークン上限を超えています。");
+      const cut = end === text.length ? end : start + preferredCut(text.slice(start, end));
+      output.push(text.slice(start, cut)); start = cut;
+    }
+    return output;
+  }
   async function split(text, limit, count = byteTokens) {
+    if (count === byteTokens) return splitBytes(text, limit);
     const output = [];
     let rest = text;
     while (rest) {
@@ -155,11 +215,7 @@ globalThis.Kotoba = (() => {
       }
       if (!best) throw new Error("1文字が入力トークン上限を超えています。");
       const prefix = points.slice(0, best).join("");
-      let cut = prefix.length;
-      for (const re of [/\n\s*\n/g, /[.!?。！？][\s\u3000]+|[。！？]/g, /\s+/g]) {
-        const boundaries = [...prefix.matchAll(re)].map(m => m.index + m[0].length).filter(n => n >= prefix.length / 2);
-        if (boundaries.length) { cut = boundaries.at(-1); break; }
-      }
+      let cut = preferredCut(prefix);
       // Token counts need not be monotonic when a subword is cut in half.
       if (await count(rest.slice(0, cut)) > limit) cut = prefix.length;
       output.push(rest.slice(0, cut));
@@ -192,5 +248,5 @@ globalThis.Kotoba = (() => {
       }
     }
   }
-  return { MAX_TOKENS, CONTENT_PROTOCOL, DEFAULTS, FEATURES, contentPreferences, LANGUAGES, settings, languages, endpoint, body, byteTokens, split, Queue, documentText, documentLength, serializeDocument, parseDocument, splitDocument, mergeDocuments };
+  return { MAX_TOKENS, CONTENT_PROTOCOL, DEFAULTS, FEATURES, contentPreferences, LANGUAGES, settings, languages, endpoint, body, byteTokens, split, Queue, documentText, documentLength, serializeDocument, normalizeEntities, parseDocument, splitDocument, mergeDocuments };
 })();

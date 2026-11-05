@@ -19,7 +19,7 @@ function setup(html, translator = translateTree, preferences = {}) {
   const nativeStyle = w.getComputedStyle.bind(w);
   w.getComputedStyle = el => {
     const css = nativeStyle(el);
-    return { display: css.display || "inline", visibility: css.visibility || "visible", opacity: css.opacity || "1" };
+    return { display: css.display || "inline", visibility: css.visibility || "visible", opacity: css.opacity || "1", position: css.position, width: css.width, height: css.height, overflow: css.overflow, clipPath: css.clipPath, contentVisibility: css.contentVisibility };
   };
   const calls = [];
   const copied = [];
@@ -364,5 +364,102 @@ test("selection launcher requires an explicit click, avoids editors and can be d
   s.shadow.querySelector('[aria-label="閉じる"]').click();
   await s.message({ type: "preferencesChanged", preferences: { selectionButton: false } });
   await select(s.w.document.querySelector("p")); assert.equal(s.shadow.querySelector(".launcher"), null);
+  s.dom.window.close();
+});
+
+
+test("line breaks, inline widgets and opaque descendants stay in one paragraph", async () => {
+  const html = '<p>Read<br><x-label>the <b>latest</b> news</x-label> <img src="/icon.png" alt="icon"> and <span translate="no"><span style="display:block">Brand widget</span><span class="sr-only">Private note</span></span> carefully.</p>';
+  // A protected block descendant must not split the surrounding sentence.
+  const s = setup(html);
+  const p = s.w.document.querySelector("p"), original = p.innerHTML;
+  const [br, widget, img] = [p.querySelector("br"), p.querySelector("x-label"), p.querySelector("img")];
+  await s.message({ type: "start", source: "en", target: "ja" }); await s.settle();
+  assert.equal(s.calls.length, 1);
+  assert.match(textOf(s.calls[0].document), /the latest news/);
+  assert.ok(!JSON.stringify(s.calls[0].document).includes("Private note"));
+  assert.ok(s.calls[0].document.filter(item => item.protected).length >= 2);
+  assert.equal(p.querySelector("br"), br); assert.equal(p.querySelector("img"), img);
+  assert.equal(p.querySelector("x-label"), widget);
+  await s.message({ type: "restore" }); assert.equal(p.innerHTML, original);
+  s.dom.window.close();
+});
+
+test("unchanged inline order patches original text nodes without child-list mutations", async () => {
+  const s = setup('<p><span>First </span><span>sentence</span> with <a href="/docs">a link</a>.</p>', tree => {
+    // Real parser output coalesces adjacent text from presentation-only spans.
+    const merged = [];
+    for (const item of translateTree(tree)) {
+      if (item.text !== undefined && merged.at(-1)?.text !== undefined) merged.at(-1).text += item.text;
+      else merged.push(item);
+    }
+    return merged;
+  });
+  const p = s.w.document.querySelector("p"), original = p.innerHTML;
+  const nodes = [...p.querySelectorAll("span,a")].map(el => el.firstChild);
+  const mutations = [];
+  const observer = new s.w.MutationObserver(items => mutations.push(...items));
+  observer.observe(p, { subtree: true, childList: true, characterData: true });
+  await s.message({ type: "start", source: "en", target: "ja" }); await s.settle();
+  assert.ok(p.textContent.includes("訳:"));
+  assert.deepEqual([...p.querySelectorAll("span,a")].map(el => el.firstChild), nodes);
+  await s.message({ type: "restore" });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(p.innerHTML, original);
+  assert.ok(mutations.some(item => item.type === "characterData"));
+  assert.ok(mutations.every(item => item.type !== "childList"));
+  observer.disconnect(); s.dom.window.close();
+});
+
+test("open shadow roots translate assigned slots once and leave undistributed light DOM alone", async () => {
+  const s = setup('<x-article><p slot="body">Slotted <a href="/docs">article</a>.</p><p>Undistributed text.</p></x-article>');
+  const host = s.w.document.querySelector("x-article");
+  const root = host.attachShadow({ mode: "open" });
+  root.innerHTML = '<section><slot name="body"></slot><p>Shadow prose.</p></section>';
+  const original = host.innerHTML, shadowOriginal = root.innerHTML;
+  await s.message({ type: "start", source: "en", target: "ja" }); await s.settle();
+  assert.deepEqual(s.calls.map(call => textOf(call.document)), ["Slotted article.", "Shadow prose."]);
+  assert.equal(host.lastChild.textContent, "Undistributed text.");
+  await s.message({ type: "start", source: "en", target: "ja" }); await s.settle();
+  assert.equal(s.calls.length, 2);
+  await s.message({ type: "restore" });
+  assert.equal(host.innerHTML, original); assert.equal(root.innerHTML, shadowOriginal);
+  s.dom.window.close();
+});
+
+test("source extraction retains joiners, bidi marks and emoji sequences", async () => {
+  const text = "Read 🧑‍💻 and می‌خواهم and \u200eEnglish\u200f.";
+  const s = setup(`<p>${text}</p>`);
+  await s.message({ type: "start", source: "auto", target: "ja" }); await s.settle();
+  assert.equal(textOf(s.calls[0].document), text);
+  await s.message({ type: "restore" }); assert.equal(s.w.document.querySelector("p").textContent, text);
+  s.dom.window.close();
+});
+
+test("pending translations reject link and ancestor language changes", async () => {
+  for (const mutate of [s => s.w.document.querySelector("a").href = "/new", s => s.w.document.querySelector("p").lang = "ja", s => s.w.document.querySelector("p").style.display = "none"]) {
+    let release;
+    const s = setup('<p>Read <a href="/old">this article</a>.</p>', tree => new Promise(resolve => { release = () => resolve(translateTree(tree)); }));
+    await s.message({ type: "start", source: "en", target: "ja" });
+    for (let i = 0; i < 100 && !release; i++) await new Promise(resolve => setImmediate(resolve));
+    mutate(s); release();
+    assert.equal((await s.settle()).failed, 1);
+    assert.equal(s.w.document.querySelector("p").textContent, "Read this article.");
+    s.dom.window.close();
+  }
+});
+
+test("restoration preserves live updates inside protected widgets after link reordering", async () => {
+  const s = setup('<p>Read <a href="/one">one</a> and <a href="/two">two</a> <button><span>Old state</span></button>.</p>', tree => {
+    const links = tree.filter(item => item.tag === "a"), widget = tree.find(item => item.protected);
+    return [{ text: "読む " }, links[1], { text: " と " }, links[0], widget, { text: "。" }];
+  });
+  const p = s.w.document.querySelector("p"), button = p.querySelector("button");
+  await s.message({ type: "start", source: "en", target: "ja" }); await s.settle();
+  button.firstChild.textContent = "New live state";
+  await s.message({ type: "restore" });
+  assert.equal(p.querySelector("button"), button);
+  assert.equal(p.textContent, "Read one and two New live state.");
+  assert.equal(p.querySelector("a").getAttribute("href"), "/one");
   s.dom.window.close();
 });

@@ -123,12 +123,12 @@ const batchDocuments = [
 test("batch markers map reordered results back with paragraph-local link IDs and accurate progress", async () => {
   const b = background(({ body }) => {
     assert.ok(body.context.includes("multiple independent paragraphs"));
-    return completion('<kotoba-item id="b1">二番目<a id="k0">リンク</a></kotoba-item>\n<kotoba-item id="b0">最初<a id="k0">リンク</a></kotoba-item>');
+    return completion('<kotoba-item id="b1">二番目&copy;<a id="k0">リンク</a></kotoba-item>\n<kotoba-item id="b0">最初<a id="k0">リンク</a></kotoba-item>');
   });
   const response = await b.send([], { documents: batchDocuments, requestId: "batch" });
   assert.equal(b.calls.length, 1);
   assert.equal(response.documents[0].document[0].text, "最初");
-  assert.equal(response.documents[1].document[0].text, "二番目");
+  assert.equal(response.documents[1].document[0].text, "二番目©");
   assert.equal(b.progress.at(-1).completed, b.progress.at(-1).total);
   assert.equal(b.progress.at(-1).total, 21);
 });

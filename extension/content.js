@@ -5,6 +5,8 @@
   globalThis.__kotobaLoaded = true;
   const SKIP = new Set("SCRIPT STYLE NOSCRIPT TEMPLATE PRE CODE KBD SAMP VAR TEXTAREA INPUT SELECT OPTION BUTTON SVG MATH CANVAS VIDEO AUDIO IFRAME OBJECT EMBED".split(" "));
   const INLINE_CODE = new Set(["CODE", "KBD", "SAMP", "VAR"]);
+  const INLINE_TAGS = new Set("a span strong em b i u s del sub sup mark small abbr q cite code kbd samp var".split(" "));
+  const OPAQUE = new Set("BR WBR IMG HR".split(" "));
   const records = new Map();
   const transactions = new Set();
   const pageURL = () => { const url = new URL(location.href); url.hash = ""; return url.href; };
@@ -180,11 +182,15 @@
     stop(); clearTooltip();
     for (const unit of transactions) {
       if (!snapshotMatches(unit.appliedSnapshot) || !contiguous(unit.appliedRoots, unit.parent)) continue;
+      if (unit.inPlace) {
+        for (const item of unit.originalSnapshot) if (item.data !== undefined) item.node.data = item.data;
+        continue;
+      }
       const next = unit.appliedRoots.at(-1).nextSibling;
       for (const node of unit.appliedRoots) node.remove();
       for (const item of [...unit.originalSnapshot].reverse()) {
         if (item.children) item.node.replaceChildren(...item.children);
-        else item.node.data = item.data;
+        else if (item.data !== undefined) item.node.data = item.data;
       }
       const fragment = document.createDocumentFragment(); fragment.append(...unit.roots);
       unit.parent.insertBefore(fragment, next);
@@ -208,110 +214,153 @@
     }
     return a.split("-")[0] === b.split("-")[0];
   }
-  function prose(text, element) {
+  function prose(text, element, lang = language(element)) {
     const value = text.trim();
     if (!/\p{L}/u.test(value)) return false;
     if (/^(?:(?:https?:\/\/|www\.)\S+|[^\s@]+@[^\s@]+\.[^\s@]+|(?:\/|\.\/|\.\.\/)[\w./@%+~#?=&:-]+)$/u.test(value)) return false;
-    const lang = language(element);
     if (lang && sameLanguage(lang, state.target)) return false;
     // Avoid re-translating unlabelled Japanese/Korean prose into the same language.
     if (state.target === "ja" && /[\p{Script=Hiragana}\p{Script=Katakana}]/u.test(value) && !/[a-zA-Z]{4}/.test(value)) return false;
     if (state.target === "ko" && /\p{Script=Hangul}/u.test(value) && !/[a-zA-Z]{4}/.test(value)) return false;
     return true;
   }
-  function snapshot(roots) {
+  function snapshot(roots, opaque = new Set()) {
     const result = [];
     function visit(node) {
       if (node.nodeType === Node.TEXT_NODE) result.push({ node, data: node.data });
       else if (node.nodeType === Node.ELEMENT_NODE) {
-        result.push({ node, children: [...node.childNodes] });
+        // Protected subtrees stay live and are never rewritten, even on restore.
+        if (opaque.has(node)) { result.push({ node }); return; }
+        result.push({ node, children: [...node.childNodes], attributes: [...node.attributes].map(attr => [attr.name, attr.value]) });
         for (const child of node.childNodes) visit(child);
       }
     }
     roots.forEach(visit); return result;
   }
+  function attributesMatch(node, attributes) {
+    return attributes.length === node.attributes.length && attributes.every(([name, value]) => node.getAttribute(name) === value);
+  }
   function snapshotMatches(items) {
     return items.every(item => item.node.isConnected && (item.children
       ? item.children.length === item.node.childNodes.length && item.children.every((child, i) => child === item.node.childNodes[i])
-      : item.node.data === item.data));
+      : item.data === undefined || item.node.data === item.data) && (!item.attributes || attributesMatch(item.node, item.attributes)));
   }
   function contiguous(roots, parent) {
     return roots.length && roots.every((node, i) => node.parentNode === parent && (!i || roots[i - 1].nextSibling === node));
   }
   async function collect(run = generation) {
-    const groups = [], cache = new WeakMap(), blockCache = new WeakMap();
+    const groups = [], cache = new WeakMap(), blockCache = new WeakMap(), omissionCache = new WeakMap(), languageCache = new WeakMap();
+    const getLanguage = element => {
+      const path = [];
+      let el = element;
+      while (el && !languageCache.has(el) && !el.hasAttribute("lang")) { path.push(el); el = parentElement(el); }
+      const lang = el ? languageCache.get(el) ?? el.getAttribute("lang").toLowerCase() : "";
+      if (el) languageCache.set(el, lang);
+      for (const item of path) languageCache.set(item, lang);
+      return lang;
+    };
     const computed = el => { if (!cache.has(el)) cache.set(el, getComputedStyle(el)); return cache.get(el); };
-    const isBlock = el => /^(block|flow-root|flex|grid|list-item|table-cell|table-caption|table-row)$/.test(computed(el).display) || /^(P|H[1-6]|LI|DT|DD|TD|TH|BLOCKQUOTE|FIGCAPTION|SUMMARY|HR)$/.test(el.tagName);
+    const isBlock = el => /^(block|flow-root|flex|grid|list-item|table(?:-.+)?)(?:\s|$)/.test(computed(el).display) || /^(P|H[1-6]|LI|DT|DD|TD|TH|BLOCKQUOTE|FIGCAPTION|SUMMARY|HR)$/.test(el.tagName);
     const hidden = el => {
       const css = computed(el);
-      return el === host || el.matches('[data-kotoba-ui],[hidden],[inert],[aria-hidden="true"],.sr-only,.visually-hidden,.screen-reader-text') || css.display === "none" || css.visibility && css.visibility !== "visible" || css.opacity === "0" ||
+      return el === host || el.matches('[data-kotoba-ui],[hidden],[inert],[aria-hidden="true"],.sr-only,.visually-hidden,.screen-reader-text') || css.display === "none" || css.contentVisibility === "hidden" || css.visibility && css.visibility !== "visible" || css.opacity === "0" ||
         (/absolute|fixed/.test(css.position) && parseFloat(css.width) <= 1 && parseFloat(css.height) <= 1 && (css.overflow === "hidden" || css.clipPath?.includes("inset(50%")));
     };
     const excluded = el => SKIP.has(el.tagName) && !INLINE_CODE.has(el.tagName) || el.matches('[contenteditable]:not([contenteditable="false"]),[role="textbox"],[role="searchbox"],[role="combobox"]');
+    const protectedElement = el => INLINE_CODE.has(el.tagName) || el.matches('.notranslate,[translate="no"]') || getLanguage(el) && sameLanguage(getLanguage(el), state.target);
+    const omitted = el => {
+      if (!omissionCache.has(el)) omissionCache.set(el, hidden(el) || excluded(el) || protectedElement(el));
+      return omissionCache.get(el);
+    };
     const applied = new Set([...transactions].flatMap(unit => unit.appliedRoots));
     function makeUnit(roots) {
       if (!roots.length) return;
       const parent = roots[0].parentNode;
       if (!contiguous(roots, parent)) return;
-      const elements = new Map(), extras = new Map();
+      const elements = new Map(), extras = new Map(), textBindings = new Map(), opaque = new Set();
       let eligible = false, id = 0, length = 0, originalBlock = "";
-      const extra = (node, owner) => { if (!extras.has(owner)) extras.set(owner, []); extras.get(owner).push(node); return []; };
+      const extra = (node, owner) => { if (node.nodeType === Node.ELEMENT_NODE) opaque.add(node); if (!extras.has(owner)) extras.set(owner, []); extras.get(owner).push(node); return []; };
+      function protectedText(node) {
+        if (node.nodeType === Node.TEXT_NODE) return node.data;
+        if (node.nodeType !== Node.ELEMENT_NODE || hidden(node) || excluded(node)) return "";
+        return [...node.childNodes].map(protectedText).join("");
+      }
       function build(node, owner = null) {
         if (node.nodeType === Node.TEXT_NODE) {
-          const text = node.data.replace(/[\u200b-\u200f\u2060\ufeff]/g, "");
+          const text = node.data.replace(/[\u200b\u2060\ufeff]/g, "");
           if (!text) return extra(node, owner);
           length += text.length; originalBlock += text;
-          if (/\p{L}/u.test(text) && prose(text, parentElement(node))) eligible = true;
-          return [{ text }];
+          if (/\p{L}/u.test(text) && prose(text, parentElement(node), getLanguage(parentElement(node)))) eligible = true;
+          const item = { text }; textBindings.set(item, node);
+          return [item];
         }
         if (node.nodeType !== Node.ELEMENT_NODE) return extra(node, owner);
         if (hidden(node)) return extra(node, owner);
-        if (excluded(node)) {
+        if (excluded(node) || OPAQUE.has(node.tagName)) {
+          opaque.add(node);
+          if (node.tagName === "BR") originalBlock += "\n";
           const key = `k${id++}`; elements.set(key, node);
           return [{ id: key, tag: "span", protected: true, children: [] }];
         }
-        const lang = language(node);
-        const protect = INLINE_CODE.has(node.tagName) || node.matches('.notranslate,[translate="no"]') || lang && sameLanguage(lang, state.target);
+        const protect = protectedElement(node);
         // Attribute-free spans are DOM scaffolding, not linguistic boundaries.
         if (node.tagName === "SPAN" && !node.attributes.length && !protect) return [...node.childNodes].flatMap(child => build(child, owner));
         const key = `k${id++}`;
-        const tag = protect && !INLINE_CODE.has(node.tagName) ? "span" : node.tagName.toLowerCase();
-        if (!["a","span","strong","em","b","i","u","s","del","sub","sup","mark","small","abbr","q","cite","code","kbd","samp","var"].includes(tag)) {
-          elements.set(key, node);
-          return [{ id: key, tag: "span", protected: true, children: [] }];
-        }
+        // Serialize unfamiliar inline wrappers as spans; retain their actual DOM identity.
+        const name = node.tagName.toLowerCase();
+        const tag = INLINE_TAGS.has(name) && (!protect || INLINE_CODE.has(node.tagName)) ? name : "span";
+        if (protect) opaque.add(node);
         elements.set(key, node);
-        if (protect) originalBlock += node.textContent;
-        const children = protect ? [{ text: node.textContent }] : [...node.childNodes].flatMap(child => build(child, key));
+        const text = protect ? protectedText(node) : "";
+        if (protect) originalBlock += text;
+        const children = protect ? [{ text }] : [...node.childNodes].flatMap(child => build(child, key));
         return [{ id: key, tag, children, ...(protect ? { protected: true } : {}) }];
       }
       const tree = roots.flatMap(node => build(node));
       if (!eligible || !length) return;
-      groups.push({ roots: [...roots], parent, elements, extras, document: tree, length, originalBlock, originalSnapshot: snapshot(roots) });
-    }
-    function hasBlock(el) {
-      if (!blockCache.has(el)) blockCache.set(el, [...el.children].some(child => !hidden(child) && (isBlock(child) || hasBlock(child))));
-      return blockCache.get(el);
+      const context = parentElement(roots[0]);
+      groups.push({ roots: [...roots], parent, elements, extras, document: tree, length, originalBlock, textBindings, opaque,
+        originalSnapshot: snapshot(roots, opaque), context, contextLanguage: getLanguage(context),
+        contextAttributes: [...context.attributes].map(attr => [attr.name, attr.value]) });
     }
     let visited = 0;
+    function checkpoint() {
+      if (run !== generation || state.url !== pageURL()) throw new DOMException("キャンセルしました", "AbortError");
+      if (preferences.responsiveScan && ++visited % 80 === 0) return new Promise(resolve => setTimeout(resolve, 0));
+    }
+    // Post-order indexing avoids recursive look-ahead into huge SPA subtrees.
+    async function indexBlocks(root) {
+      const stack = [[root, false]];
+      while (stack.length) {
+        const pause = checkpoint(); if (pause) await pause;
+        const [el, ready] = stack.pop();
+        if (ready) {
+          blockCache.set(el, [...el.children].some(child => !omitted(child) && (isBlock(child) || child.shadowRoot || child.tagName === "SLOT" || blockCache.get(child))));
+        } else {
+          stack.push([el, true]);
+          for (const child of el.children) if (!omitted(child)) stack.push([child, false]);
+        }
+      }
+    }
     async function walk(container) {
       let roots = [];
       const flush = () => { makeUnit(roots); roots = []; };
-      const children = container.tagName === "SLOT" && container.assignedNodes().length ? container.assignedNodes({ flatten: true }) : container.childNodes;
+      if (!blockCache.has(container)) await indexBlocks(container);
+      const assigned = container.tagName === "SLOT" ? container.assignedNodes({ flatten: true }) : [];
+      const children = assigned.length ? assigned : [...container.childNodes];
       for (const node of children) {
-        if (preferences.responsiveScan && ++visited % 80 === 0) await new Promise(resolve => setTimeout(resolve, 0));
-        if (run !== generation || state.url !== pageURL()) throw new DOMException("キャンセルしました", "AbortError");
+        const pause = checkpoint(); if (pause) await pause;
         if (applied.has(node)) { flush(); continue; }
-        if (node.nodeType === Node.ELEMENT_NODE && (hidden(node) || excluded(node) || node.matches('.notranslate,[translate="no"]') || language(node) && sameLanguage(language(node), state.target))) {
+        if (node.nodeType === Node.ELEMENT_NODE && omitted(node)) {
           // Inline exclusions remain in the paragraph, but are never sent as prose.
           if (isBlock(node)) flush(); else roots.push(node);
           continue;
         }
         if (node.nodeType === Node.ELEMENT_NODE && node.shadowRoot) { flush(); await walk(node.shadowRoot); continue; }
-        if (node.nodeType === Node.ELEMENT_NODE && (node.tagName === "BR" || isBlock(node) || hasBlock(node))) {
-          flush(); if (node.tagName !== "BR") await walk(node); continue;
+        if (node.nodeType === Node.ELEMENT_NODE && (node.tagName === "SLOT" || isBlock(node) || blockCache.get(node))) {
+          flush(); await walk(node); continue;
         }
-        if (roots.length && roots[0].parentNode !== node.parentNode) flush();
+        if (roots.length && (roots[0].parentNode !== node.parentNode || roots.at(-1).nextSibling !== node)) flush();
         roots.push(node);
       }
       flush();
@@ -322,7 +371,7 @@
     scopes = scopes.filter(node => !scopes.some(other => other !== node && other.contains(node)));
     for (const scope of scopes) {
       let blocked = false;
-      for (let el = scope; el; el = parentElement(el)) if (hidden(el) || excluded(el) || el.matches('.notranslate,[translate="no"]')) { blocked = true; break; }
+      for (let el = scope; el; el = parentElement(el)) if (omitted(el)) { blocked = true; break; }
       if (!blocked) await walk(scope);
     }
     if (preferences.prioritizeVisible) {
@@ -343,9 +392,31 @@
     return groups;
   }
   function applyDocument(unit, tree) {
-    if (!snapshotMatches(unit.originalSnapshot) || !contiguous(unit.roots, unit.parent)) return false;
-    const next = unit.roots.at(-1).nextSibling;
-    for (const node of unit.roots) node.remove();
+    if (!snapshotMatches(unit.originalSnapshot) || !contiguous(unit.roots, unit.parent) || !attributesMatch(unit.context, unit.contextAttributes) || language(unit.context) !== unit.contextLanguage) return false;
+    for (let el = unit.context; el; el = parentElement(el)) {
+      if (el.matches('[hidden],[inert],[aria-hidden="true"],[translate="no"],.notranslate,[contenteditable]:not([contenteditable="false"]),[role="textbox"],[role="searchbox"],[role="combobox"]')) return false;
+    }
+    // When inline order is unchanged, update Text.data only. Frameworks keep their
+    // text-node references, focus stays put, and no child-list mutations are needed.
+    const edits = [];
+    function plan(source, target) {
+      let i = 0, j = 0;
+      while (i < source.length && j < target.length) {
+        if (source[i].text !== undefined && target[j].text !== undefined) {
+          const bindings = [];
+          let text = "";
+          while (i < source.length && source[i].text !== undefined) bindings.push(unit.textBindings.get(source[i++]));
+          while (j < target.length && target[j].text !== undefined) text += target[j++].text;
+          if (bindings.some(node => !node)) return false;
+          bindings.forEach((node, index) => edits.push([node, index ? "" : text]));
+        } else {
+          const before = source[i++], after = target[j++];
+          if (!before.id || before.id !== after.id || before.tag !== after.tag || !!before.protected !== !!after.protected) return false;
+          if (!before.protected && !plan(before.children, after.children)) return false;
+        }
+      }
+      return i === source.length && j === target.length;
+    }
     const translatedNodes = [];
     function render(nodes, owner = null) {
       const fragment = document.createDocumentFragment();
@@ -362,10 +433,18 @@
       fragment.append(...(unit.extras.get(owner) || []));
       return fragment;
     }
-    const fragment = render(tree);
-    unit.appliedRoots = [...fragment.childNodes];
-    unit.parent.insertBefore(fragment, next);
-    unit.appliedSnapshot = snapshot(unit.appliedRoots); transactions.add(unit);
+    unit.inPlace = plan(unit.document, tree);
+    if (unit.inPlace) {
+      for (const [node, text] of edits) { if (node.data !== text) node.data = text; translatedNodes.push(node); }
+      unit.appliedRoots = unit.roots;
+    } else {
+      const next = unit.roots.at(-1).nextSibling;
+      for (const node of unit.roots) node.remove();
+      const fragment = render(tree);
+      unit.appliedRoots = [...fragment.childNodes];
+      unit.parent.insertBefore(fragment, next);
+    }
+    unit.appliedSnapshot = snapshot(unit.appliedRoots, unit.opaque); transactions.add(unit);
     const group = { originalBlock: unit.originalBlock, nodes: translatedNodes, source: state.source };
     for (const node of translatedNodes) records.set(node, { translated: node.data, group });
     return true;
