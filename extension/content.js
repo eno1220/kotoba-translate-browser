@@ -141,7 +141,7 @@
     }
     transactions.clear();
     records.clear(); appliedDirection = null; state.done = 0; state.total = 0; state.failed = 0; state.percent = 0; state.startedAt = 0; state.finishedAt = 0;
-    state.message = "原文に戻しました";
+    state.cacheRestored = false; state.message = "原文に戻しました";
     if (panelKind === "page") closePanel();
   }
   function parentElement(node) { return node.parentElement || node.getRootNode()?.host || null; }
@@ -298,7 +298,7 @@
     state.source = source; state.target = target;
     const groups = collect();
     const run = ++generation;
-    state.running = true; state.done = 0; state.total = groups.length; state.failed = 0;
+    state.running = true; state.done = 0; state.total = groups.length; state.failed = 0; state.cacheRestored = false;
     state.percent = 0; state.startedAt = Date.now(); state.finishedAt = 0;
     state.message = groups.length ? "" : "翻訳対象がありません";
     if (panelKind === "selection") closePanel();
@@ -548,6 +548,26 @@
         return { ...state };
       }
       if (message.type === "status") return { ...state, translated: records.size };
+      if (message.type === "restoreCache") {
+        // A pending cache lookup must never override a manual action or a new URL.
+        if (message.url !== state.url || state.source || state.running || records.size) return { ...state };
+        state.source = message.source; state.target = message.target;
+        const entries = new Map(message.entries.map(entry => [entry.input, entry.document]));
+        const groups = collect();
+        let restored = 0, restoredChars = 0;
+        for (const group of groups) {
+          const tree = entries.get(JSON.stringify(group.document));
+          if (tree && applyDocument(group, tree)) { restored++; restoredChars += group.length; }
+        }
+        if (restored) {
+          appliedDirection = `${state.source}:${state.target}`;
+          state.done = restored; state.total = groups.length;
+          state.percent = Math.floor(restoredChars / groups.reduce((sum, group) => sum + group.length, 0) * 100);
+          state.cacheRestored = true;
+          state.message = "保存した訳文を復元しました";
+        } else { state.source = null; state.target = null; }
+        return { ...state };
+      }
       if (message.type === "configure") {
         if ((state.source && state.source !== message.source || state.target && state.target !== message.target) && records.size) restore();
         state.source = message.source; state.target = message.target;

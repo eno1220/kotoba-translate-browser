@@ -15,6 +15,11 @@
       <div class="row"><label>原文<select name="source"></select></label><label>訳文<select name="target"></select></label></div>
       <label>日本語の文体<select name="form"><option value="">指定なし</option><option value="plain">常体（だ・である）</option><option value="polite">敬体（です・ます）</option></select></label>
     </fieldset>
+    <fieldset><legend>翻訳キャッシュ</legend>
+      <label>保存期間（分）<input name="cacheMinutes" type="number" min="0" max="1440" required><small>既定30分。0で無効。再訪時は一致する段落の訳文だけを復元します。</small></label>
+      <p><small>原文と訳文は拡張のメモリに最大約8MiB保持します。Firefox終了・拡張の再読み込みで消えます。プライベートウィンドウでは保存しません。設定の保存時にもキャッシュを削除します。</small></p>
+      <button type="button" id="clear-cache">キャッシュを削除</button>
+    </fieldset>
     <details class="advanced"><summary>詳細設定</summary>
       <div class="row"><label>同時リクエスト<input name="concurrency" type="number" min="1" max="8" required><small>全タブ共通</small></label><label>タイムアウト（秒）<input name="timeoutSeconds" type="number" min="10" max="1800" required></label></div>
       <label>入力上限（トークン）<input name="inputTokens" type="number" min="128" max="3900" required><small>出力上限：8096トークン</small></label>

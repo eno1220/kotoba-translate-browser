@@ -16,6 +16,8 @@ const parserWindow = new (require("jsdom").JSDOM)("").window;
   const events = [];
   let active = 0, maximum = 0;
   const server = http.createServer(async (req, res) => {
+    if (req.url === "/request-count") { res.end(JSON.stringify(requests.length)); return; }
+    if (req.url === "/away") { res.setHeader("Content-Type", "text/html"); res.end('<!doctype html><title>Linked page</title><p>Another page.</p>'); return; }
     if (req.url === "/fixture") {
       res.setHeader("Content-Type", "text/html; charset=utf-8");
       res.end(`<!doctype html><html lang="en"><title>Kotoba smoke</title><body>
@@ -173,6 +175,31 @@ const parserWindow = new (require("jsdom").JSDOM)("").window;
         await wait(100);
         check((await browser.storage.local.get('settings')).settings.batchTranslation === false, 'options reset batch setting');
         await browser.tabs.remove(options.id);
+        // Fill the cache after the settings changes above, then exercise both
+        // history navigation and a fresh document (without Firefox's bfcache).
+        await send({type:'start',source:'en',target:'ja'});
+        for (let i=0; i<300; i++) { if (!(await send({type:'status'})).running) break; await wait(100); }
+        check(translationCache.size > 0, 'page cache stayed empty');
+        const beforeRevisit = await (await fetch(base+'/request-count')).json();
+        const navigate = action => new Promise((resolve, reject) => {
+          const updated = (id, change) => { if (id === tab.id && change.status === 'complete') { browser.tabs.onUpdated.removeListener(updated); resolve(); } };
+          browser.tabs.onUpdated.addListener(updated);
+          action().catch(error => { browser.tabs.onUpdated.removeListener(updated); reject(error); });
+        });
+        await navigate(() => inspect('const next = document.createElement("a"); next.href="/away"; document.body.append(next); next.click();'));
+        await navigate(() => browser.tabs.goBack(tab.id));
+        await navigate(() => browser.tabs.reload(tab.id));
+        let cachedState;
+        for (let i=0; i<100; i++) {
+          try { cachedState = await send({type:'status'}); if (cachedState.translated > 0) break; } catch {}
+          await wait(50);
+        }
+        check(cachedState?.translated > 0 && cachedState.source === 'en' && cachedState.target === 'ja', 'revisit did not restore cache');
+        check((await (await fetch(base+'/request-count')).json()) === beforeRevisit, 'revisit started an API request');
+        check((await inspect('document.querySelector("#paragraph").textContent')).includes('訳:'), 'cached paragraph missing');
+        check((await inspect('document.querySelector("#link").getAttribute("href")')) === '/docs', 'cached link lost');
+        await send({type:'restore'});
+        check((await inspect('document.querySelector("#paragraph").textContent')) === 'Read the documentation carefully.', 'cached original restore failed');
         await fetch(base + '/result', { method:'POST', body: JSON.stringify({ok:true,state,data}) });
       } catch(error) { await fetch(base + '/result', { method:'POST', body: JSON.stringify({ok:false,error:[error.message,error.stack].join(String.fromCharCode(10))}) }); }
     })();

@@ -21,7 +21,15 @@ form.addEventListener("submit", async event => {
     const { settings: saved = {} } = await browser.storage.local.get("settings");
     const settings = Kotoba.settings({ ...saved, ...Object.fromEntries(new FormData(form)) });
     await browser.storage.local.set({ settings });
+    await browser.runtime.sendMessage({ type: "clearCache" });
     status.classList.remove("error"); status.textContent = "保存しました";
   } catch (error) { status.classList.add("error"); status.textContent = error.message; }
 });
 load().catch(error => { status.textContent = error.message; });
+document.getElementById("clear-cache").addEventListener("click", async () => {
+  try {
+    const result = await browser.runtime.sendMessage({ type: "clearCache" });
+    if (result.error) throw new Error(result.error);
+    status.classList.remove("error"); status.textContent = "キャッシュを削除しました";
+  } catch (error) { status.classList.add("error"); status.textContent = error.message; }
+});

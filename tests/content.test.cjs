@@ -69,6 +69,28 @@ test("manual DOM translation preserves links and code, skips hidden/editable/tar
   s.dom.window.close();
 });
 
+test("cached revisit restores only identical paragraphs and preserves live links, hover originals and manual choices", async () => {
+  const s = setup('<p id="same">Read <a href="/docs">the docs</a> carefully.</p><p id="changed">Updated sentence.</p>');
+  const original = [{ text: "Read " }, { id: "k0", tag: "a", children: [{ text: "the docs" }] }, { text: " carefully." }];
+  const link = s.w.document.querySelector("a"); let clicks = 0;
+  link.addEventListener("click", event => { event.preventDefault(); clicks++; });
+  const cached = { type: "restoreCache", url: "https://example.com/article", source: "en", target: "ja", entries: [
+    { input: JSON.stringify(original), document: translateTree(original) },
+    { input: JSON.stringify([{ text: "Old sentence." }]), document: [{ text: "古い訳文" }] }
+  ] };
+  await s.message(cached);
+  assert.ok(s.w.document.querySelector("#same").textContent.startsWith("訳:"));
+  assert.equal(s.w.document.querySelector("#changed").textContent, "Updated sentence.");
+  assert.equal(s.calls.length, 0);
+  assert.equal(s.w.document.querySelector("a"), link); link.click(); assert.equal(clicks, 1);
+  assert.equal((await s.message({ type: "status" })).target, "ja");
+  await s.message({ type: "restore" });
+  assert.equal(s.w.document.querySelector("#same").textContent, "Read the docs carefully.");
+  await s.message(cached);
+  assert.equal(s.w.document.querySelector("#same").textContent, "Read the docs carefully.");
+  s.dom.window.close();
+});
+
 test("re-execution translates new content only, restore preserves site's own changes", async () => {
   const s = setup('<p id="first">First sentence.</p>');
   await s.message({ type: "start", source: "en", target: "ja" }); await s.settle();

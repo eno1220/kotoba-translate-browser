@@ -27,7 +27,7 @@ async function page(action) {
 function render(state) {
   running = state.running;
   $("status").classList.remove("error");
-  $("status").textContent = state.running || state.total && !state.failed ? "" : state.message || "";
+  $("status").textContent = state.cacheRestored ? "保存した訳文を復元しました" : state.running || state.total && !state.failed ? "" : state.message || "";
   $("progress-section").hidden = !state.total;
   const percent = state.percent || 0;
   $("progress").value = percent; $("percent").textContent = `${percent}%`;

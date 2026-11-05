@@ -4,6 +4,62 @@ const queue = new K.Queue(1); // Shared by every tab and by /tokenize requests.
 const jobs = new Map();
 function documentURL(value) { const url = new URL(value); url.hash = ""; return url.href; }
 
+// Session-only, bounded paragraph cache. Never store credentials or page text on disk.
+const translationCache = new Map();
+const CACHE_BYTES = 8 * 1024 * 1024, CACHE_ENTRIES = 2000;
+let cacheBytes = 0, cacheRevision = 0;
+function clearCache() { translationCache.clear(); cacheBytes = 0; cacheRevision++; }
+function removeCached(key) {
+  cacheBytes -= translationCache.get(key).size; translationCache.delete(key);
+}
+function pruneCache() {
+  const now = Date.now();
+  for (const [key, entry] of translationCache) if (entry.expiresAt <= now) removeCached(key);
+}
+setInterval(pruneCache, 60000);
+function cacheSignature(s) {
+  return JSON.stringify([K.endpoint(s), s.apiKey, s.model, s.apiFormat, s.form, s.inputTokens, s.tokenizer, s.tokenizePath, s.batchTranslation]);
+}
+function cacheKey(url, source, target, input) { return JSON.stringify([url, source, target, input]); }
+function cachedParagraph(s, url, source, target, document) {
+  pruneCache();
+  const input = JSON.stringify(document), key = cacheKey(url, source, target, input);
+  const entry = translationCache.get(key);
+  if (!entry || entry.signature !== cacheSignature(s)) return null;
+  // Validate cached output against the current paragraph as well as the original response.
+  const result = K.parseDocument(K.serializeDocument(entry.document), document);
+  translationCache.delete(key); translationCache.set(key, entry);
+  return result;
+}
+function cacheParagraph(s, url, source, target, original, document) {
+  const input = JSON.stringify(original), key = cacheKey(url, source, target, input);
+  const signature = cacheSignature(s);
+  const size = 2 * (key.length + input.length + JSON.stringify(document).length + signature.length + url.length + source.length + target.length);
+  if (size > CACHE_BYTES) return;
+  pruneCache();
+  if (translationCache.has(key)) removeCached(key);
+  while (cacheBytes + size > CACHE_BYTES || translationCache.size >= CACHE_ENTRIES) removeCached(translationCache.keys().next().value);
+  translationCache.set(key, { url, source, target, input, document, signature, expiresAt: Date.now() + s.cacheMinutes * 60000, size });
+  cacheBytes += size;
+}
+async function restoreCachedPage(sender) {
+  if (!sender.tab || sender.frameId !== 0 || sender.tab.incognito) return {};
+  const revision = cacheRevision;
+  const s = await getSettings();
+  if (!s.cacheMinutes) return {};
+  const url = documentURL(sender.url), signature = cacheSignature(s);
+  pruneCache();
+  const entries = [...translationCache.values()].filter(entry => entry.url === url && entry.signature === signature);
+  const last = entries.at(-1);
+  if (!last) return {};
+  await ensureContent(sender.tab.id);
+  if (revision !== cacheRevision) return {};
+  return browser.tabs.sendMessage(sender.tab.id, {
+    type: "restoreCache", url, source: last.source, target: last.target,
+    entries: entries.filter(entry => entry.source === last.source && entry.target === last.target).map(({ input, document }) => ({ input, document }))
+  }, { frameId: 0 });
+}
+
 async function getSettings() {
   const { settings } = await browser.storage.local.get("settings");
   const value = K.settings(settings);
@@ -200,10 +256,29 @@ async function translate(message, sender) {
     }
   };
   try {
+    const revision = cacheRevision;
     const s = await getSettings();
     const page = { source: message.source, target: message.target, domain: pageURL.origin };
-    if (documents) return { documents: await translateDocuments(s, documents, page, job.controller.signal, advance) };
-    if (document) return { document: await translateDocument(s, document, page, job.controller.signal, advance) };
+    if (inputs) {
+      const useCache = s.cacheMinutes > 0 && !sender.tab.incognito;
+      const url = documentURL(sender.url);
+      const results = inputs.map(input => {
+        const hit = useCache && cachedParagraph(s, url, page.source, page.target, input);
+        if (hit) advance(K.documentLength(input));
+        return hit ? { document: hit } : null;
+      });
+      const missing = inputs.filter((_, index) => !results[index]);
+      if (missing.length) {
+        const fresh = documents ? await translateDocuments(s, missing, page, job.controller.signal, advance) : [{ document: await translateDocument(s, document, page, job.controller.signal, advance) }];
+        if (job.controller.signal.aborted) throw new DOMException("キャンセルしました。", "AbortError");
+        let cursor = 0;
+        for (let i = 0; i < inputs.length; i++) if (!results[i]) {
+          results[i] = fresh[cursor++];
+          if (useCache && revision === cacheRevision && results[i].document) cacheParagraph(s, url, page.source, page.target, inputs[i], results[i].document);
+        }
+      }
+      return documents ? { documents: results } : results[0];
+    }
     return { parts: [await translatePlain(s, message.parts[0], page, job.controller.signal, counter(s, job.controller.signal), s.inputTokens, 0, advance)] };
   } finally { jobs.delete(id); }
 }
@@ -224,6 +299,7 @@ async function ensureContent(tabId, frameId = 0) {
 async function handle(message, sender) {
   if (sender.id !== browser.runtime.id) throw new Error("不正な送信元です。");
   if (message.type === "translate") return translate(message, sender);
+  if (message.type === "restoreCachedPage") return restoreCachedPage(sender);
   if (message.type === "cancel") {
     if (sender.tab) abortTab(sender.tab.id, sender.frameId);
     return {};
@@ -233,6 +309,7 @@ async function handle(message, sender) {
     return { concurrency: s.concurrency, batchTranslation: s.batchTranslation };
   }
   if (sender.tab) throw new Error("許可されていない操作です。");
+  if (message.type === "clearCache") { clearCache(); return {}; }
   if (message.type === "preferences") {
     const s = await getSettings();
     return { source: s.source, target: s.target, concurrency: s.concurrency, batchTranslation: s.batchTranslation };
@@ -246,16 +323,19 @@ async function handle(message, sender) {
 browser.runtime.onMessage.addListener((message, sender) => handle(message, sender).catch(error => ({ error: error.message, errorCode: error.code })));
 browser.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && changes.settings) {
+    clearCache();
     try { queue.setLimit(K.settings(changes.settings.newValue).concurrency); } catch { /* Options validate on save. */ }
   }
 });
 browser.tabs.onRemoved.addListener(tabId => abortTab(tabId));
-browser.tabs.onUpdated.addListener((tabId, change) => {
+browser.tabs.onUpdated.addListener((tabId, change, tab) => {
   // Firefox also emits updates for history.replaceState and fragment navigation.
   // Full document unloads cancel through content.js's pagehide handler.
   if (!change.url) return;
   const next = documentURL(change.url);
   for (const job of jobs.values()) if (job.tabId === tabId && job.pageURL !== next) job.controller.abort();
+  // Also handles same-document back/forward navigation on sites using History API.
+  if (tab && /^https?:/.test(change.url)) restoreCachedPage({ tab, url: change.url, frameId: 0 }).catch(() => {});
 });
 browser.contextMenus.create({ id: "kotoba-selection", title: "選択したテキストを翻訳", contexts: ["selection"], documentUrlPatterns: ["http://*/*", "https://*/*"] });
 browser.contextMenus.onClicked.addListener(async (info, tab) => {

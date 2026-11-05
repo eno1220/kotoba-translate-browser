@@ -6,7 +6,7 @@ globalThis.Kotoba = (() => {
     endpoint: "http://127.0.0.1", port: "8000", path: "/v1/chat/completions",
     apiKey: "", model: "plamo-translate", apiFormat: "top-level",
     batchTranslation: true, concurrency: 1, inputTokens: 3000, timeoutSeconds: 180,
-    tokenizer: "bytes", tokenizePath: "/tokenize", source: "en", target: "ja", form: ""
+    tokenizer: "bytes", tokenizePath: "/tokenize", source: "en", target: "ja", form: "", cacheMinutes: 30
   });
   const LANGUAGES = "ja en zh-hans zh-hant ko ar az be bg bn ca ceb de es et eu fa fr gu he hi hr hu hy id it jv ka kk km lt lv ml mr ms my ne nl pa pl ru si sk sl sr sw ta te th tl ur uz vi".split(" ");
   function settings(raw = {}) {
@@ -17,7 +17,7 @@ globalThis.Kotoba = (() => {
     for (const name of ["path", "tokenizePath"]) {
       if (!s[name].startsWith("/") || s[name].startsWith("//") || /[?#]/.test(s[name])) throw new Error("APIパスは / から始まるパスを指定してください。");
     }
-    for (const [key, min, max] of [["concurrency", 1, 8], ["inputTokens", 128, 3900], ["timeoutSeconds", 10, 1800]]) {
+    for (const [key, min, max] of [["concurrency", 1, 8], ["inputTokens", 128, 3900], ["timeoutSeconds", 10, 1800], ["cacheMinutes", 0, 1440]]) {
       s[key] = Number(s[key]);
       if (!Number.isInteger(s[key]) || s[key] < min || s[key] > max) throw new Error(`${key} は ${min}〜${max} の整数で指定してください。`);
     }
