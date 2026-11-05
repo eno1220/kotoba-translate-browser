@@ -1,6 +1,7 @@
 /* Shared pure logic; also loaded directly by the small Node test suite. */
 globalThis.Kotoba = (() => {
   const MAX_TOKENS = 8096;
+  const CONTENT_PROTOCOL = 2;
   const DEFAULTS = Object.freeze({
     endpoint: "http://127.0.0.1", port: "8000", path: "/v1/chat/completions",
     apiKey: "", model: "plamo-translate", apiFormat: "top-level",
@@ -181,5 +182,5 @@ globalThis.Kotoba = (() => {
       }
     }
   }
-  return { MAX_TOKENS, DEFAULTS, LANGUAGES, settings, languages, endpoint, body, byteTokens, split, Queue, documentText, documentLength, serializeDocument, parseDocument, splitDocument, mergeDocuments };
+  return { MAX_TOKENS, CONTENT_PROTOCOL, DEFAULTS, LANGUAGES, settings, languages, endpoint, body, byteTokens, split, Queue, documentText, documentLength, serializeDocument, parseDocument, splitDocument, mergeDocuments };
 })();

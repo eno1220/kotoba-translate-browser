@@ -6,12 +6,14 @@ const path = require("node:path");
 const os = require("node:os");
 const { spawn } = require("node:child_process");
 const assert = require("node:assert/strict");
+const parserWindow = new (require("jsdom").JSDOM)("").window;
 
 (async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "kotoba-firefox-"));
   let resolveResult;
   const result = new Promise(resolve => resolveResult = resolve);
   const requests = [];
+  const events = [];
   let active = 0, maximum = 0;
   const server = http.createServer(async (req, res) => {
     if (req.url === "/fixture") {
@@ -34,12 +36,23 @@ const assert = require("node:assert/strict");
       await fs.writeFile(`/tmp/kotoba-${body.name}.png`, Buffer.from(body.image.split(",")[1], "base64"));
       res.end("ok"); return;
     }
-    if (req.url === "/result") { resolveResult(body); res.end("ok"); return; }
+    if (req.url === "/event") { events.push(body); res.end("ok"); return; }
+    if (req.url === "/result") { resolveResult({ ...body, events }); res.end("ok"); return; }
     if (req.url !== "/v1/chat/completions") { res.writeHead(404); res.end(); return; }
     active++; maximum = Math.max(maximum, active);
     requests.push({ body, authorization: req.headers.authorization });
     const input = body.messages[0].content;
     let content = "訳:" + input;
+    if (body.context?.includes("HTML fragment")) {
+      const document = new parserWindow.DOMParser().parseFromString(`<mock-root>${input}</mock-root>`, "application/xml");
+      function translate(node) {
+        if (node.nodeType === 1 && node.getAttribute("translate") === "no") return;
+        if (node.nodeType === 3 && node.data.trim()) node.data = "訳:" + node.data;
+        for (const child of node.childNodes) translate(child);
+      }
+      translate(document.documentElement);
+      content = document.documentElement.innerHTML;
+    }
     if (input.includes("earlier posts") && input.includes("assembly on Linux x86_64")) content = '以前の<a id="k2"><u id="k3">Linux x86_64のアセンブリ言語</u></a>に関する<a id="k0"><u id="k1">投稿</u></a>を読んだ方は、私が低レベルプログラミングに関心を持っていることをご存じでしょう。';
     if (input.includes("Potentially unsafe")) content = '<img src=x onerror="window.compromised=true">';
     await new Promise(r => setTimeout(r, 40));
@@ -51,14 +64,25 @@ const assert = require("node:assert/strict");
   const port = server.address().port;
   const source = path.join(directory, "extension");
   await fs.cp(path.resolve("extension"), source, { recursive: true });
+  if (process.env.KOTOBA_PAGE_URL) {
+    const file = path.join(source, "background.js");
+    const value = await fs.readFile(file, "utf8");
+    await fs.writeFile(file, value.replace('function abortTab(tabId, frameId) {', 'function abortTab(tabId, frameId) { fetch("http://127.0.0.1:'+port+'/event",{method:"POST",body:JSON.stringify({kind:"abort",tabId,frameId,jobs:jobs.size,stack:new Error().stack})}).catch(()=>{});'));
+  }
+  if (process.env.KOTOBA_STALE) await fs.copyFile(path.resolve("tests/fixtures/stale-content.js"), path.join(source, "stale-content.js"));
   const manifest = JSON.parse(await fs.readFile(path.join(source, "manifest.json"), "utf8"));
   manifest.permissions.push("<all_urls>"); // captureTab for visual QA in this temporary build only.
   manifest.background.scripts.push("smoke.js");
   await fs.writeFile(path.join(source, "manifest.json"), JSON.stringify(manifest));
   // Preview the real popup in a tab while targeting the fixture tab.
   const popupSource = await fs.readFile(path.join(source, "popup.js"), "utf8");
-  await fs.writeFile(path.join(source, "popup.js"), 'async function sendPreview(message) { const bg = await browser.runtime.getBackgroundPage(); try { return await bg.handle(message, {id:browser.runtime.id}); } catch(error) { return {error:error.message}; } }\n' + popupSource.replaceAll('browser.runtime.sendMessage(', 'sendPreview(').replace('const [tab] = await browser.tabs.query({ active: true, currentWindow: true });', 'const tab = await browser.tabs.get(Number(new URL(location.href).searchParams.get("previewTab")));'));
-  const contentSource = await fs.readFile(path.join(source, "content.js"), "utf8");
+  await fs.writeFile(path.join(source, "popup.js"), 'async function sendPreview(message) { const bg = await browser.runtime.getBackgroundPage(); try { return await bg.handle(message, {id:browser.runtime.id}); } catch(error) { return {error:error.message,errorCode:error.code}; } }\n' + popupSource.replaceAll('browser.runtime.sendMessage(', 'sendPreview(').replace('const [tab] = await browser.tabs.query({ active: true, currentWindow: true });', 'const tab = await browser.tabs.get(Number(new URL(location.href).searchParams.get("previewTab")));'));
+  let contentSource = await fs.readFile(path.join(source, "content.js"), "utf8");
+  if (process.env.KOTOBA_PAGE_URL) {
+    const report = reason => 'fetch("http://127.0.0.1:'+port+'/event",{method:"POST",body:JSON.stringify({kind:"skip",reason:"'+reason+'",article:!!group.parent.closest?.("article"),length:group.length})}).catch(()=>{});';
+    contentSource = contentSource.replace('state.failed++; state.message = response.error;', report('structure')+'state.failed++; state.message = response.error;')
+      .replace('state.failed++; state.message = "更新された段落は適用していません";', report('site_update')+'state.failed++; state.message = "更新された段落は適用していません";');
+  }
   // Expose only the test build's shadow root to assert the visible UI.
   await fs.writeFile(path.join(source, "content.js"), contentSource.replace('attachShadow({ mode: "closed" })', 'attachShadow({ mode: "open" })'));
   await fs.writeFile(path.join(source, "smoke.js"), `
@@ -67,15 +91,38 @@ const assert = require("node:assert/strict");
       const check = (value, message) => { if (!value) throw new Error(message); };
       const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
       try {
-        await browser.storage.local.set({ settings: { ...Kotoba.DEFAULTS, port: '${port}', apiKey: 'smoke-key', inputTokens: 400 } });
+        await browser.storage.local.set({ settings: { ...Kotoba.DEFAULTS, port: '${port}', apiKey: 'smoke-key', inputTokens: ${process.env.KOTOBA_PAGE_URL ? 3000 : 400} } });
+        ${process.env.KOTOBA_PAGE_URL ? `
+        browser.tabs.onUpdated.addListener((tabId,change) => { if(change.status || change.url) fetch(base+'/event',{method:'POST',body:JSON.stringify({kind:'tab',tabId,change})}).catch(()=>{}); });
+        const realTab = await browser.tabs.create({url:${JSON.stringify(process.env.KOTOBA_PAGE_URL)},active:true});
+        for (let i=0; i<300; i++) { if((await browser.tabs.get(realTab.id)).status === 'complete') break; await wait(100); }
+        const metadata = (await browser.tabs.executeScript(realTab.id,{code:'({title:document.title,url:location.href,lang:document.documentElement.lang,length:document.body?.innerText.length,article:!!document.querySelector("article")})'}))[0];
+        check(metadata.length > 10000, 'page could not be loaded: '+JSON.stringify(metadata));
+        await ensureContent(realTab.id);
+        await browser.tabs.sendMessage(realTab.id,{type:'start',source:'en',target:'ja'});
+        let realState;
+        for(let i=0;i<1200;i++) { realState=await browser.tabs.sendMessage(realTab.id,{type:'status'}); if(!realState.running) break; await wait(50); }
+        check(!realState.running && realState.done === realState.total && realState.translated > 0 && !realState.message.includes('不正または大きすぎ'),JSON.stringify({metadata,state:realState}));
+        await fetch(base+'/result',{method:'POST',body:JSON.stringify({ok:true,realPage:true,state:realState,metadata})});
+        return;` : ''}
         const tab = await browser.tabs.create({url: base + '/fixture', active: true});
         for (let i=0; i<100; i++) { if ((await browser.tabs.get(tab.id)).status === 'complete') break; await wait(100); }
+        ${process.env.KOTOBA_STALE ? 'await browser.tabs.executeScript(tab.id, {file:"stale-content.js",runAt:"document_idle"});' : ''}
+        ${process.env.KOTOBA_STALE ? `let staleError;
+        try { await ensureContent(tab.id); } catch(error) { staleError = error; }
+        check(staleError?.code === 'stale_content', 'stale content was silently reused');
+        await new Promise((resolve, reject) => {
+          const updated = (id, change) => { if (id === tab.id && change.status === 'complete') { browser.tabs.onUpdated.removeListener(updated); resolve(); } };
+          browser.tabs.onUpdated.addListener(updated);
+          browser.tabs.reload(tab.id).catch(error => { browser.tabs.onUpdated.removeListener(updated); reject(error); });
+        });` : ''}
         await ensureContent(tab.id);
         const send = msg => browser.tabs.sendMessage(tab.id, msg);
         const inspect = async code => (await browser.tabs.executeScript(tab.id, {code}))[0];
         check((await send({type:'status'})).translated === 0, 'translated automatically');
         await inspect('window.testClicks = 0; document.querySelector("#link").addEventListener("click", e => {e.preventDefault();window.testClicks++})');
         await send({type:'start',source:'en',target:'ja'});
+        ${process.env.KOTOBA_HISTORY ? 'await browser.tabs.executeScript(tab.id,{code:"history.replaceState({test:true}, document.title, location.href)"});' : ''}
         const preview = await browser.tabs.create({url:browser.runtime.getURL('popup.html')+'?previewTab='+tab.id,active:true});
         await wait(250);
         await fetch(base + '/screenshot', {method:'POST',body:JSON.stringify({name:'popup',image:await browser.tabs.captureTab(preview.id,{format:'png'})})});
@@ -120,15 +167,21 @@ const assert = require("node:assert/strict");
       } catch(error) { await fetch(base + '/result', { method:'POST', body: JSON.stringify({ok:false,error:[error.message,error.stack].join(String.fromCharCode(10))}) }); }
     })();
   `);
-  const child = spawn(process.execPath, [path.resolve("node_modules/web-ext/bin/web-ext.js"), "run", "--source-dir", source, "--firefox", process.env.FIREFOX || "/Applications/Firefox.app/Contents/MacOS/firefox", "--args=-headless", "--no-reload", "--no-input", "--no-config-discovery"], { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, NO_UPDATE_NOTIFIER: "1" } });
+  const child = spawn(process.execPath, [path.resolve("node_modules/web-ext/bin/web-ext.js"), "run", "--source-dir", source, "--firefox", process.env.FIREFOX || "/Applications/Firefox.app/Contents/MacOS/firefox", "--args=-headless", "--pref=intl.accept_languages=en-US,en", "--no-reload", "--no-input", "--no-config-discovery"], { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, NO_UPDATE_NOTIFIER: "1" } });
   let logs = "";
   child.stdout.on("data", chunk => logs += chunk);
   child.stderr.on("data", chunk => logs += chunk);
   let timeout;
   try {
     const response = await Promise.race([result, new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error("Firefox smoke timed out\n" + logs)), 45000); })]);
-    assert.ok(response.ok, response.error);
+    assert.ok(response.ok, response.error + (process.env.KOTOBA_PAGE_URL ? JSON.stringify(response.events) : ""));
     assert.equal(maximum, 1);
+    if (response.realPage) {
+      assert.ok(requests.length > 0);
+      assert.ok(requests.every(r => r.body.context.includes(new URL(process.env.KOTOBA_PAGE_URL).origin)));
+      console.log(JSON.stringify({realPage:response.metadata,state:response.state,requests:requests.length,concurrency:maximum,events:response.events.filter(event=>event.kind === "tab" || event.kind === "skip" || event.jobs > 0)}));
+      return;
+    }
     assert.ok(requests.length > 5);
     assert.ok(requests.some(r => r.body.messages[0].content.includes('earlier posts') && r.body.messages[0].content.includes('assembly on Linux x86_64')));
     assert.ok(requests.every(r => !r.body.messages[0].content.includes('(opens in a new window)')));

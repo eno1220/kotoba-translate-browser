@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 const { readFileSync } = require("node:fs");
 const { JSDOM } = require("jsdom");
 const source = readFileSync(require.resolve("../extension/content.js"), "utf8");
-const core = readFileSync(require.resolve("../extension/core.js"), "utf8");
+const textOf = nodes => nodes.map(node => node.text !== undefined ? node.text : textOf(node.children)).join("");
 const translateTree = nodes => nodes.map(node => node.protected ? node : node.text !== undefined ? { text: node.text.trim() ? `訳:${node.text}` : node.text } : { ...node, children: translateTree(node.children) });
 function setup(html, translator = translateTree) {
   const dom = new JSDOM(html, { url: "https://example.com/article", runScripts: "outside-only", pretendToBeVisual: true });
@@ -27,7 +27,8 @@ function setup(html, translator = translateTree) {
       return {};
     }
   } };
-  w.eval(core); w.eval(source);
+  // Content runs independently; executeScript globals need not be shared.
+  w.eval(source);
   const message = msg => listener(msg);
   async function settle() {
     for (let i = 0; i < 100; i++) {
@@ -52,7 +53,8 @@ test("manual DOM translation preserves links and code, skips hidden/editable/tar
   a.addEventListener("click", event => { event.preventDefault(); clicks++; });
   await s.message({ type: "start", source: "en", target: "ja" }); await s.settle();
   assert.equal(s.calls.length, 1);
-  assert.equal(s.w.Kotoba.documentText(s.calls[0].document), "Read the docs carefully.");
+  assert.equal(s.w.Kotoba, undefined);
+  assert.equal(textOf(s.calls[0].document), "Read the docs carefully.");
   assert.equal(s.calls[0].document[1].tag, "a");
   assert.equal(s.w.document.querySelector("a"), a);
   assert.equal(a.getAttribute("href"), "/docs"); a.click(); assert.equal(clicks, 1);
@@ -81,7 +83,7 @@ test("inline code stays attached and unchanged while its surrounding sentence is
   const s = setup('<p>Call <code><span>request()</span></code> to load the document.</p>');
   const code = s.w.document.querySelector("code");
   await s.message({ type: "start", source: "en", target: "ja" }); await s.settle();
-  assert.equal(s.w.Kotoba.documentText(s.calls[0].document), "Call request() to load the document.");
+  assert.equal(textOf(s.calls[0].document), "Call request() to load the document.");
   assert.equal(s.calls[0].document[1].protected, true);
   assert.equal(s.w.document.querySelector("code"), code);
   assert.equal(code.textContent, "request()");
@@ -95,8 +97,8 @@ test("nested links and screen-reader notes remain one complete paragraph with pu
   const original = s.w.document.querySelector("p").innerHTML;
   await s.message({ type: "start", source: "en", target: "ja" }); await s.settle();
   assert.equal(s.calls.length, 1);
-  assert.equal(s.w.Kotoba.documentText(s.calls[0].document), "As models improve, the July Hugging Face incident and other model misalignment examples show that models can evade containment.");
-  assert.ok(!s.w.Kotoba.serializeDocument(s.calls[0].document).includes("opens in a new window"));
+  assert.equal(textOf(s.calls[0].document), "As models improve, the July Hugging Face incident and other model misalignment examples show that models can evade containment.");
+  assert.ok(!JSON.stringify(s.calls[0].document).includes("opens in a new window"));
   assert.equal(s.w.document.querySelector(".sr-only").textContent, "(opens in a new window)");
   await s.message({ type: "restore" });
   assert.equal(s.w.document.querySelector("p").innerHTML, original);
@@ -110,7 +112,7 @@ test("CVE lists, commas and parentheses do not split a paragraph into independen
   const s = setup(html);
   await s.message({ type: "start", source: "en", target: "ja" }); await s.settle();
   assert.equal(s.calls.length, 1);
-  const text = s.w.Kotoba.documentText(s.calls[0].document);
+  const text = textOf(s.calls[0].document);
   assert.ok(text.includes("Kata Containers (CVE-2026-24834, privilege isolation, filesystem isolation), gVisor"));
   assert.ok(text.endsWith("CVE-2026-74753, CVE-2026-80521, CVE-2026-80841. We disclosed additional vulnerabilities."));
   assert.equal(s.w.document.querySelectorAll("a").length, 9);

@@ -24,10 +24,18 @@ function background(responder, settings = {}) {
   for (const file of ["core.js", "background.js"]) vm.runInContext(readFileSync(require.resolve(`../extension/${file}`), "utf8"), context);
   return {
     calls, progress, max: () => maximum,
-    send: (parts, overrides = {}, tabId = 1) => listener({ type: "translate", parts, source: "en", target: "ja", ...overrides }, { id: "test", tab: { id: tabId }, frameId: 0, url: "https://example.org/private?q=secret" })
+    send: (parts, overrides = {}, tabId = 1) => listener({ type: "translate", protocol: 2, parts, source: "en", target: "ja", ...overrides }, { id: "test", tab: { id: tabId }, frameId: 0, url: "https://example.org/private?q=secret" })
   };
 }
 const completion = text => ({ choices: [{ message: { content: text }, finish_reason: "stop" }] });
+
+test("stale page scripts are rejected as a protocol mismatch without issuing any API request", async () => {
+  const b = background(() => assert.fail("stale page must not dispatch a translation"));
+  const result = await b.send(["Read ", "the documentation", " carefully."], { protocol: undefined });
+  assert.equal(result.errorCode, "stale_content");
+  assert.ok(result.error.includes("ページを再読み込み"));
+  assert.equal(b.calls.length, 0);
+});
 
 test("background sends correct body, domain-only context and Bearer authentication", async () => {
   const b = background(() => completion("こんにちは"), { apiKey: "my-key" });

@@ -2,6 +2,7 @@
 const K = Kotoba;
 const queue = new K.Queue(1); // Shared by every tab and by /tokenize requests.
 const jobs = new Map();
+function documentURL(value) { const url = new URL(value); url.hash = ""; return url.href; }
 
 async function getSettings() {
   const { settings } = await browser.storage.local.get("settings");
@@ -117,15 +118,20 @@ async function translateDocument(s, document, page, signal, advance, limit = s.i
 }
 async function translate(message, sender) {
   if (!sender.tab) throw new Error("翻訳対象が不正です。");
+  if (message.protocol !== K.CONTENT_PROTOCOL) throw staleContent();
   const document = message.document;
-  if (document) {
-    if (!Array.isArray(document) || K.serializeDocument(document).length > 2000000) throw new Error("翻訳対象が大きすぎます。");
+  if (document !== undefined) {
+    if (!Array.isArray(document) || !document.length) throw new Error("ページ翻訳の本文データが不正です。");
+    if (K.serializeDocument(document).length > 2000000) throw new Error("翻訳対象の段落が200万文字を超えています。");
     K.parseDocument(K.serializeDocument(document), document);
-  } else if (!Array.isArray(message.parts) || message.parts.length !== 1 || typeof message.parts[0] !== "string" || message.parts[0].length > 2000000) throw new Error("翻訳対象が不正または大きすぎます。");
+  } else {
+    if (!Array.isArray(message.parts) || message.parts.length !== 1 || typeof message.parts[0] !== "string") throw new Error("選択翻訳の本文データが不正です。");
+    if (message.parts[0].length > 2000000) throw new Error("選択範囲が200万文字を超えています。");
+  }
   const pageURL = new URL(sender.url);
   if (!/^https?:$/.test(pageURL.protocol)) throw new Error("このページでは翻訳できません。");
   K.languages(message.source, message.target);
-  const job = { tabId: sender.tab.id, frameId: sender.frameId, controller: new AbortController() };
+  const job = { tabId: sender.tab.id, frameId: sender.frameId, pageURL: documentURL(sender.tab.url || sender.url), controller: new AbortController() };
   const id = Symbol(); jobs.set(id, job);
   let completed = 0;
   const total = document ? K.documentLength(document) : message.parts[0].length;
@@ -142,12 +148,19 @@ async function translate(message, sender) {
     return { parts: [await translatePlain(s, message.parts[0], page, job.controller.signal, counter(s, job.controller.signal), s.inputTokens, 0, advance)] };
   } finally { jobs.delete(id); }
 }
+function staleContent() {
+  const error = new Error("ページに古い翻訳スクリプトが残っています。ページを再読み込みしてください。");
+  error.code = "stale_content";
+  return error;
+}
 async function ensureContent(tabId, frameId = 0) {
-  try { await browser.tabs.sendMessage(tabId, { type: "ping" }, { frameId }); }
+  let response;
+  try { response = await browser.tabs.sendMessage(tabId, { type: "ping" }, { frameId }); }
   catch {
-    await browser.tabs.executeScript(tabId, { file: "core.js", frameId, runAt: "document_idle" });
     await browser.tabs.executeScript(tabId, { file: "content.js", frameId, runAt: "document_idle" });
+    response = await browser.tabs.sendMessage(tabId, { type: "ping" }, { frameId });
   }
+  if (response?.protocol !== K.CONTENT_PROTOCOL) throw staleContent();
 }
 async function handle(message, sender) {
   if (sender.id !== browser.runtime.id) throw new Error("不正な送信元です。");
@@ -178,7 +191,13 @@ browser.storage.onChanged.addListener((changes, area) => {
   }
 });
 browser.tabs.onRemoved.addListener(tabId => abortTab(tabId));
-browser.tabs.onUpdated.addListener((tabId, change) => { if (change.status === "loading" || change.url) abortTab(tabId); });
+browser.tabs.onUpdated.addListener((tabId, change) => {
+  // Firefox also emits updates for history.replaceState and fragment navigation.
+  // Full document unloads cancel through content.js's pagehide handler.
+  if (!change.url) return;
+  const next = documentURL(change.url);
+  for (const job of jobs.values()) if (job.tabId === tabId && job.pageURL !== next) job.controller.abort();
+});
 browser.contextMenus.create({ id: "kotoba-selection", title: "選択したテキストを翻訳", contexts: ["selection"], documentUrlPatterns: ["http://*/*", "https://*/*"] });
 browser.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId !== "kotoba-selection") return;

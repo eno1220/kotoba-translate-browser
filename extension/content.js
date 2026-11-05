@@ -1,13 +1,14 @@
 /* global browser */
 (() => {
+  const PROTOCOL = 2;
   if (globalThis.__kotobaLoaded) return;
   globalThis.__kotobaLoaded = true;
   const SKIP = new Set("SCRIPT STYLE NOSCRIPT TEMPLATE PRE CODE KBD SAMP VAR TEXTAREA INPUT SELECT OPTION BUTTON SVG MATH CANVAS VIDEO AUDIO IFRAME OBJECT EMBED".split(" "));
   const INLINE_CODE = new Set(["CODE", "KBD", "SAMP", "VAR"]);
   const records = new Map();
   const transactions = new Set();
-  const K = globalThis.Kotoba;
-  let state = { url: location.href, source: null, target: null, running: false, done: 0, total: 0, failed: 0, message: "", concurrency: 1, percent: 0, startedAt: 0, finishedAt: 0, hoverEnabled: true };
+  const pageURL = () => { const url = new URL(location.href); url.hash = ""; return url.href; };
+  let state = { url: pageURL(), source: null, target: null, running: false, done: 0, total: 0, failed: 0, message: "", concurrency: 1, percent: 0, startedAt: 0, finishedAt: 0, hoverEnabled: true };
   let generation = 0, panel, tooltip, host, shadow, lastHover;
   let appliedDirection = null;
   let panelKind, pageUI, pageDismissed = false, panelTimer, selectionCleanup;
@@ -113,9 +114,9 @@
     tooltip?.remove(); marks?.remove(); tooltip = null; marks = null; lastHover = null; pinned = false;
   }
   function currentPage() {
-    if (state.url !== location.href) {
+    if (state.url !== pageURL()) {
       stop(); restore();
-      state = { ...state, url: location.href, source: null, target: null, done: 0, total: 0, failed: 0, message: "", percent: 0, startedAt: 0, finishedAt: 0 };
+      state = { ...state, url: pageURL(), source: null, target: null, done: 0, total: 0, failed: 0, message: "", percent: 0, startedAt: 0, finishedAt: 0 };
     }
   }
   function stop() {
@@ -203,12 +204,13 @@
       const parent = roots[0].parentNode;
       if (!contiguous(roots, parent)) return;
       const elements = new Map(), extras = new Map();
-      let eligible = false, id = 0;
+      let eligible = false, id = 0, length = 0, originalBlock = "";
       const extra = (node, owner) => { if (!extras.has(owner)) extras.set(owner, []); extras.get(owner).push(node); return []; };
       function build(node, owner = null) {
         if (node.nodeType === Node.TEXT_NODE) {
           const text = node.data.replace(/[\u200b-\u200f\u2060\ufeff]/g, "");
           if (!text) return extra(node, owner);
+          length += text.length; originalBlock += text;
           if (/\p{L}/u.test(text) && prose(text, parentElement(node))) eligible = true;
           return [{ text }];
         }
@@ -229,12 +231,13 @@
           return [{ id: key, tag: "span", protected: true, children: [] }];
         }
         elements.set(key, node);
+        if (protect) originalBlock += node.textContent;
         const children = protect ? [{ text: node.textContent }] : [...node.childNodes].flatMap(child => build(child, key));
         return [{ id: key, tag, children, ...(protect ? { protected: true } : {}) }];
       }
       const tree = roots.flatMap(node => build(node));
-      if (!eligible || !K.documentLength(tree)) return;
-      groups.push({ roots: [...roots], parent, elements, extras, document: tree, length: K.documentLength(tree), originalBlock: K.documentText(tree), originalSnapshot: snapshot(roots) });
+      if (!eligible || !length) return;
+      groups.push({ roots: [...roots], parent, elements, extras, document: tree, length, originalBlock, originalSnapshot: snapshot(roots) });
     }
     function hasBlock(el) { return [...el.children].some(child => !hidden(child) && (isBlock(child) || hasBlock(child))); }
     function walk(container) {
@@ -321,8 +324,8 @@
           updateProgress();
         });
         try {
-          const response = await browser.runtime.sendMessage({ type: "translate", requestId, document: group.document, source, target });
-          if (state.url !== location.href) { currentPage(); return; }
+          const response = await browser.runtime.sendMessage({ type: "translate", protocol: PROTOCOL, requestId, document: group.document, source, target });
+          if (state.url !== pageURL()) { currentPage(); return; }
           if (run !== generation) return;
           if (response.error && response.errorCode === "structure") {
             state.failed++; state.message = response.error;
@@ -505,7 +508,7 @@
         progress.bar.value = percent; progress.percent.textContent = `${percent}%`;
       });
       try {
-        const response = await browser.runtime.sendMessage({ type: "translate", requestId: currentId, parts: [text], source: source.value, target: target.value });
+        const response = await browser.runtime.sendMessage({ type: "translate", protocol: PROTOCOL, requestId: currentId, parts: [text], source: source.value, target: target.value });
         if (id !== request || !node.isConnected) return;
         result.classList.toggle("error", !!response.error);
         result.textContent = response.error || response.parts[0];
@@ -527,7 +530,7 @@
   browser.runtime.onMessage.addListener(async message => {
     currentPage();
     try {
-      if (message.type === "ping") return { ok: true };
+      if (message.type === "ping") return { ok: true, protocol: PROTOCOL };
       if (message.type === "translationProgress") {
         if (Number.isFinite(message.completed) && message.completed >= 0 && Number.isFinite(message.total) && message.total > 0) progressListeners.get(message.requestId)?.(message);
         return { ok: true };

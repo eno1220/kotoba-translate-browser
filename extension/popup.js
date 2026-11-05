@@ -9,11 +9,19 @@ for (const id of ["source", "target"]) {
   }
 }
 let tabId, timer, ready = false;
-function error(message) { $("status").textContent = message; $("status").classList.add("error"); }
+function error(value) {
+  $("status").textContent = value.message || String(value); $("status").classList.add("error");
+  const stale = value.code === "stale_content";
+  $("reload").hidden = !stale;
+  if (stale) {
+    ready = false; $("progress-section").hidden = true;
+    for (const id of ["start", "selection", "restore"]) $(id).disabled = true;
+  }
+}
 let running = false, busy = false;
 async function page(action) {
   const result = await browser.runtime.sendMessage({ type: "page", tabId, action, source: $("source").value, target: $("target").value, hoverEnabled: $("hover").checked });
-  if (result.error) throw new Error(result.error);
+  if (result.error) { const e = new Error(result.error); e.code = result.errorCode; throw e; }
   return result;
 }
 function render(state) {
@@ -35,7 +43,7 @@ function render(state) {
   $("swap").disabled = state.running || $("source").value === "auto";
 }
 async function refresh() {
-  try { const state = await page("status"); render(state); } catch (e) { error(e.message); }
+  try { const state = await page("status"); render(state); } catch (e) { error(e); }
 }
 async function init() {
   try {
@@ -47,7 +55,7 @@ async function init() {
     const state = await page("status");
     $("source").value = state.source || prefs.source; $("target").value = state.target || prefs.target;
     ready = true; render(state); timer = setInterval(refresh, 700);
-  } catch (e) { error(`このページでは開始できません。${e.message}`); }
+  } catch (e) { error(e); }
 }
 for (const action of ["start", "restore", "selection"]) {
   $(action).addEventListener("click", async () => {
@@ -56,19 +64,22 @@ for (const action of ["start", "restore", "selection"]) {
       await page(action === "start" && running ? "stop" : action);
       busy = false;
       if (action === "selection") window.close(); else await refresh();
-    } catch (e) { busy = false; error(e.message); $(action).disabled = false; }
+    } catch (e) { busy = false; error(e); $(action).disabled = !ready; }
   });
 }
 for (const id of ["source", "target"]) $(id).addEventListener("change", async () => {
-  try { await page("configure"); await refresh(); } catch (e) { error(e.message); }
+  try { await page("configure"); await refresh(); } catch (e) { error(e); }
 });
 $("options").addEventListener("click", () => browser.runtime.openOptionsPage());
 $("swap").addEventListener("click", async () => {
   [$("source").value, $("target").value] = [$("target").value, $("source").value];
-  try { await page("configure"); await refresh(); } catch (e) { error(e.message); }
+  try { await page("configure"); await refresh(); } catch (e) { error(e); }
 });
 $("hover").addEventListener("change", async () => {
-  try { await page("hover"); } catch (e) { error(e.message); }
+  try { await page("hover"); } catch (e) { error(e); }
+});
+$("reload").addEventListener("click", async () => {
+  try { await browser.tabs.reload(tabId); window.close(); } catch (e) { error(e); }
 });
 addEventListener("unload", () => clearInterval(timer));
 init();
