@@ -1,0 +1,12 @@
+{
+  "manifest_version": 2,
+  "name": "Kotoba",
+  "version": "0.1.0",
+  "description": "ローカル翻訳サーバでページと選択範囲を翻訳します。",
+  "browser_specific_settings": {"gecko": {"id": "kotoba-local@eno1220.local", "strict_min_version": "128.0"}},
+  "permissions": ["activeTab", "storage", "contextMenus", "http://*/*", "https://*/*"],
+  "background": {"scripts": ["core.js", "background.js"], "persistent": true},
+  "browser_action": {"default_title": "Kotoba 翻訳", "default_popup": "popup.html"},
+  "options_ui": {"page": "options.html", "open_in_tab": true},
+  "content_security_policy": "script-src 'self'; object-src 'none'"
+}

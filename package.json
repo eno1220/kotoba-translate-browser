@@ -1,0 +1,14 @@
+{
+  "name": "kotoba-translate-browser",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Personal Firefox extension for local PLaMo translation",
+  "scripts": {
+    "test": "node --test tests/*.test.cjs",
+    "test:firefox": "node tests/firefox-smoke.cjs",
+    "lint": "web-ext lint --source-dir extension",
+    "start": "web-ext run --source-dir extension --firefox /Applications/Firefox.app/Contents/MacOS/firefox",
+    "build": "web-ext build --source-dir extension --artifacts-dir artifacts --overwrite-dest"
+  },
+  "devDependencies": { "web-ext": "^8.9.0", "jsdom": "^26.1.0" }
+}
