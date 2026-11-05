@@ -22,6 +22,7 @@ const assert = require("node:assert/strict");
         <p hidden id="hidden">Hidden prose</p><p lang="ja" id="japanese">これは日本語です。</p>
         <input id="input" value="private draft"><p id="injection">Potentially unsafe model response.</p>
         <p>Call <code id="inline-code">request()</code> to load the document.</p>
+        <p id="inline-sentence"><span>If you have read my </span><a id="posts" href="/posts"><u><span>earlier posts</span></u></a><span> about </span><a id="assembly" href="/assembly"><u><span>assembly on Linux x86_64</span></u>⁠<span class="sr-only">(opens in a new window)</span></a><span>, you may know my interest in low-level programming.</span></p>
         <p>${"A long source sentence with enough words for chunking. ".repeat(30)}</p>
       </body></html>`); return;
     }
@@ -38,7 +39,8 @@ const assert = require("node:assert/strict");
     active++; maximum = Math.max(maximum, active);
     requests.push({ body, authorization: req.headers.authorization });
     const input = body.messages[0].content;
-    let content = input.startsWith("<t0>") ? input.replace(/(<t\d+>)([\s\S]*?)(<\/t\d+>)/g, "$1訳:$2$3") : "訳:" + input;
+    let content = "訳:" + input;
+    if (input.includes("earlier posts") && input.includes("assembly on Linux x86_64")) content = '以前の<a id="k2"><u id="k3">Linux x86_64のアセンブリ言語</u></a>に関する<a id="k0"><u id="k1">投稿</u></a>を読んだ方は、私が低レベルプログラミングに関心を持っていることをご存じでしょう。';
     if (input.includes("Potentially unsafe")) content = '<img src=x onerror="window.compromised=true">';
     await new Promise(r => setTimeout(r, 40));
     res.setHeader("Content-Type", "application/json");
@@ -65,7 +67,7 @@ const assert = require("node:assert/strict");
       const check = (value, message) => { if (!value) throw new Error(message); };
       const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
       try {
-        await browser.storage.local.set({ settings: { ...Kotoba.DEFAULTS, port: '${port}', apiKey: 'smoke-key', inputTokens: 128 } });
+        await browser.storage.local.set({ settings: { ...Kotoba.DEFAULTS, port: '${port}', apiKey: 'smoke-key', inputTokens: 400 } });
         const tab = await browser.tabs.create({url: base + '/fixture', active: true});
         for (let i=0; i<100; i++) { if ((await browser.tabs.get(tab.id)).status === 'complete') break; await wait(100); }
         await ensureContent(tab.id);
@@ -94,6 +96,8 @@ const assert = require("node:assert/strict");
         check(data.paragraph.includes('訳:') && data.href === '/docs' && data.clicks === 1, 'link structure or listener lost');
         check(data.code === 'const code = 123;' && data.skip === 'Keep this brand' && data.hidden === 'Hidden prose' && data.japanese === 'これは日本語です。' && data.input === 'private draft', 'excluded content changed');
         check(data.inlineCode === 'request()', 'inline code changed');
+        const order = await inspect('({first:document.querySelector("#inline-sentence a").id,last:document.querySelectorAll("#inline-sentence a")[1].id,note:document.querySelector(".sr-only").textContent})');
+        check(order.first === 'assembly' && order.last === 'posts' && order.note === '(opens in a new window)', 'link order or screen-reader note changed incorrectly');
         check(data.injection.startsWith('<img') && data.images === 0 && !data.compromised, 'model HTML executed');
         await inspect('getSelection().removeAllRanges(); const hoverRange = document.createRange(); hoverRange.selectNodeContents(document.querySelector("h1").firstChild); const rect = hoverRange.getBoundingClientRect(); document.dispatchEvent(new PointerEvent("pointermove", {clientX:rect.left+10,clientY:rect.top+rect.height/2,pointerType:"mouse",bubbles:true}));');
         for (let i=0; i<30; i++) { if(await inspect('!!document.querySelector("[data-kotoba-ui]").shadowRoot.querySelector(".tooltip")')) break; await wait(100); }
@@ -102,6 +106,7 @@ const assert = require("node:assert/strict");
         await fetch(base + '/screenshot', {method:'POST',body:JSON.stringify({name:'page',image:await browser.tabs.captureTab(tab.id,{format:'png'})})});
         await send({type:'restore'});
         check(await inspect('document.querySelector("#paragraph").textContent') === 'Read the documentation carefully.', 'restore failed');
+        check(await inspect('document.querySelector("#inline-sentence a").id') === 'posts', 'original link order was not restored');
         await inspect('const r = document.createRange(); r.selectNodeContents(document.querySelector("#paragraph")); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);');
         await send({type:'selection',source:'en',target:'ja'});
         await wait(250);
@@ -125,7 +130,9 @@ const assert = require("node:assert/strict");
     assert.ok(response.ok, response.error);
     assert.equal(maximum, 1);
     assert.ok(requests.length > 5);
-    assert.ok(requests.every(r => r.body.max_tokens === 8096 && r.body.context === `http://127.0.0.1:${port}` && r.authorization === "Bearer smoke-key"));
+    assert.ok(requests.some(r => r.body.messages[0].content.includes('earlier posts') && r.body.messages[0].content.includes('assembly on Linux x86_64')));
+    assert.ok(requests.every(r => !r.body.messages[0].content.includes('(opens in a new window)')));
+    assert.ok(requests.every(r => r.body.max_tokens === 8096 && r.body.context.includes(`web page on http://127.0.0.1:${port}`) && r.authorization === "Bearer smoke-key"));
     console.log(`Firefox smoke passed: ${response.state.total} blocks, ${requests.length} API requests, peak concurrency ${maximum}.`);
   } finally {
     clearTimeout(timeout); child.kill("SIGTERM");

@@ -74,42 +74,61 @@ async function translatePlain(s, text, page, signal, count, limit = s.inputToken
   // insert a separator for languages whose words are separated by spaces.
   return result.map((part, i) => i && !["ja", "zh-hans", "zh-hant", "th", "km", "my"].includes(page.target) && !/\s$/.test(result[i - 1]) && !/^\s|^[,.;:!?、。]/.test(part) ? " " + part : part).join("");
 }
-async function translateParts(s, parts, page, signal, protectedParts = [], advance = () => {}) {
-  if (parts.every((_, i) => protectedParts[i])) return parts;
+async function translateDocument(s, document, page, signal, advance, limit = s.inputTokens, depth = 0) {
   const count = counter(s, signal);
-  if (parts.length === 1) return [await translatePlain(s, parts[0], page, signal, count, s.inputTokens, 0, advance)];
-  const source = K.serialize(parts, protectedParts);
-  if (await count(source) <= s.inputTokens) {
-    const translated = await generate(s, source, page, signal);
-    if (!translated.truncated) {
-      try {
-        const parsed = K.parse(translated.text, parts.length, protectedParts);
-        if (parsed.some((text, i) => protectedParts[i] && text !== parts[i])) throw new Error("保護したコードが変化しました。");
-        advance(parts.reduce((sum, text, i) => sum + (protectedParts[i] ? 0 : text.length), 0));
-        return parsed.map((text, i) => protectedParts[i] ? parts[i] : parts[i].match(/^\s*/u)[0] + text.trim() + parts[i].match(/\s*$/u)[0]);
-      } catch { /* The model did not preserve markers: translate leaves safely. */ }
+  const chunks = await K.splitDocument(document, limit, count);
+  const translated = [];
+  for (const chunk of chunks) {
+    if (!K.documentLength(chunk) || !/\p{L}/u.test(K.documentText(chunk))) {
+      translated.push(chunk); advance(K.documentLength(chunk)); continue;
     }
+    if (chunk.every(node => node.text !== undefined)) {
+      const text = await translatePlain(s, K.documentText(chunk), page, signal, count, limit, depth, advance);
+      translated.push([{ text }]);
+      continue;
+    }
+    let accepted = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const output = await generate(s, K.serializeDocument(chunk), { ...page, html: true, retry: attempt > 0 }, signal);
+      if (output.truncated) {
+        if (depth >= 5) break;
+        accepted = await translateDocument(s, chunk, page, signal, advance, Math.max(64, Math.floor(limit / 2)), depth + 1);
+        break;
+      }
+      try { accepted = K.parseDocument(output.text, chunk); }
+      catch { continue; }
+      advance(K.documentLength(chunk));
+      break;
+    }
+    if (!accepted) {
+      const error = new Error("リンク・書式を保持できなかった段落は原文のままにしています。再試行してください。");
+      error.code = "structure";
+      throw error;
+    }
+    translated.push(accepted);
   }
-  // Split at DOM boundaries, keeping adjacent inline text together when it fits.
-  // A single oversized leaf is split at sentence/word/code-point boundaries.
-  if (parts.length > 1) {
-    const middle = Math.ceil(parts.length / 2);
-    return [
-      ...await translateParts(s, parts.slice(0, middle), page, signal, protectedParts.slice(0, middle), advance),
-      ...await translateParts(s, parts.slice(middle), page, signal, protectedParts.slice(middle), advance)
-    ];
+  const merged = K.mergeDocuments(translated);
+  // Repeated wrappers from long-text chunks must form one coherent DOM tree.
+  try { return K.parseDocument(K.serializeDocument(merged), document); }
+  catch {
+    const error = new Error("翻訳結果のリンク構造が一致しないため、原文を保持しました。");
+    error.code = "structure"; throw error;
   }
 }
 async function translate(message, sender) {
-  if (!sender.tab || !Array.isArray(message.parts) || !message.parts.length || message.parts.length > 1000 || message.parts.some(x => typeof x !== "string") || message.parts.join("").length > 2000000) throw new Error("翻訳対象が不正または大きすぎます。");
-  if (message.protectedParts && (!Array.isArray(message.protectedParts) || message.protectedParts.length !== message.parts.length || message.protectedParts.some(x => typeof x !== "boolean"))) throw new Error("保護対象が不正です。");
+  if (!sender.tab) throw new Error("翻訳対象が不正です。");
+  const document = message.document;
+  if (document) {
+    if (!Array.isArray(document) || K.serializeDocument(document).length > 2000000) throw new Error("翻訳対象が大きすぎます。");
+    K.parseDocument(K.serializeDocument(document), document);
+  } else if (!Array.isArray(message.parts) || message.parts.length !== 1 || typeof message.parts[0] !== "string" || message.parts[0].length > 2000000) throw new Error("翻訳対象が不正または大きすぎます。");
   const pageURL = new URL(sender.url);
   if (!/^https?:$/.test(pageURL.protocol)) throw new Error("このページでは翻訳できません。");
   K.languages(message.source, message.target);
   const job = { tabId: sender.tab.id, frameId: sender.frameId, controller: new AbortController() };
   const id = Symbol(); jobs.set(id, job);
   let completed = 0;
-  const total = message.parts.reduce((sum, text, i) => sum + (message.protectedParts?.[i] ? 0 : text.length), 0);
+  const total = document ? K.documentLength(document) : message.parts[0].length;
   const advance = amount => {
     completed += amount;
     if (typeof message.requestId === "string" && message.requestId.length < 100 && !job.controller.signal.aborted) {
@@ -118,13 +137,15 @@ async function translate(message, sender) {
   };
   try {
     const s = await getSettings();
-    const parts = await translateParts(s, message.parts, { source: message.source, target: message.target, domain: pageURL.origin }, job.controller.signal, message.protectedParts, advance);
-    return { parts };
+    const page = { source: message.source, target: message.target, domain: pageURL.origin };
+    if (document) return { document: await translateDocument(s, document, page, job.controller.signal, advance) };
+    return { parts: [await translatePlain(s, message.parts[0], page, job.controller.signal, counter(s, job.controller.signal), s.inputTokens, 0, advance)] };
   } finally { jobs.delete(id); }
 }
 async function ensureContent(tabId, frameId = 0) {
   try { await browser.tabs.sendMessage(tabId, { type: "ping" }, { frameId }); }
   catch {
+    await browser.tabs.executeScript(tabId, { file: "core.js", frameId, runAt: "document_idle" });
     await browser.tabs.executeScript(tabId, { file: "content.js", frameId, runAt: "document_idle" });
   }
 }
@@ -150,7 +171,7 @@ async function handle(message, sender) {
   }
   throw new Error("不明な操作です。");
 }
-browser.runtime.onMessage.addListener((message, sender) => handle(message, sender).catch(error => ({ error: error.message })));
+browser.runtime.onMessage.addListener((message, sender) => handle(message, sender).catch(error => ({ error: error.message, errorCode: error.code })));
 browser.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && changes.settings) {
     try { queue.setLimit(K.settings(changes.settings.newValue).concurrency); } catch { /* Options validate on save. */ }

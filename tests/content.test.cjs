@@ -3,7 +3,9 @@ const assert = require("node:assert/strict");
 const { readFileSync } = require("node:fs");
 const { JSDOM } = require("jsdom");
 const source = readFileSync(require.resolve("../extension/content.js"), "utf8");
-function setup(html, translator = parts => parts.map(t => `訳:${t}`)) {
+const core = readFileSync(require.resolve("../extension/core.js"), "utf8");
+const translateTree = nodes => nodes.map(node => node.protected ? node : node.text !== undefined ? { text: node.text.trim() ? `訳:${node.text}` : node.text } : { ...node, children: translateTree(node.children) });
+function setup(html, translator = translateTree) {
   const dom = new JSDOM(html, { url: "https://example.com/article", runScripts: "outside-only", pretendToBeVisual: true });
   const w = dom.window;
   w.Range.prototype.getClientRects = () => [{ width: 100, height: 20, left: 0, top: 0, right: 100, bottom: 20 }];
@@ -21,11 +23,11 @@ function setup(html, translator = parts => parts.map(t => `訳:${t}`)) {
     onMessage: { addListener: fn => listener = fn },
     sendMessage: async msg => {
       if (msg.type === "contentPreferences") return { concurrency: 1 };
-      if (msg.type === "translate") { calls.push(msg); return { parts: await translator(msg.parts) }; }
+      if (msg.type === "translate") { calls.push(msg); return { document: await translator(msg.document) }; }
       return {};
     }
   } };
-  w.eval(source);
+  w.eval(core); w.eval(source);
   const message = msg => listener(msg);
   async function settle() {
     for (let i = 0; i < 100; i++) {
@@ -50,7 +52,8 @@ test("manual DOM translation preserves links and code, skips hidden/editable/tar
   a.addEventListener("click", event => { event.preventDefault(); clicks++; });
   await s.message({ type: "start", source: "en", target: "ja" }); await s.settle();
   assert.equal(s.calls.length, 1);
-  assert.deepEqual(Array.from(s.calls[0].parts), ["Read ", "the docs", " carefully."]);
+  assert.equal(s.w.Kotoba.documentText(s.calls[0].document), "Read the docs carefully.");
+  assert.equal(s.calls[0].document[1].tag, "a");
   assert.equal(s.w.document.querySelector("a"), a);
   assert.equal(a.getAttribute("href"), "/docs"); a.click(); assert.equal(clicks, 1);
   assert.equal(s.w.document.querySelector("pre").textContent, "do not translate code");
@@ -78,8 +81,8 @@ test("inline code stays attached and unchanged while its surrounding sentence is
   const s = setup('<p>Call <code><span>request()</span></code> to load the document.</p>');
   const code = s.w.document.querySelector("code");
   await s.message({ type: "start", source: "en", target: "ja" }); await s.settle();
-  assert.deepEqual(Array.from(s.calls[0].parts), ["Call ", "request()", " to load the document."]);
-  assert.deepEqual(Array.from(s.calls[0].protectedParts), [false, true, false]);
+  assert.equal(s.w.Kotoba.documentText(s.calls[0].document), "Call request() to load the document.");
+  assert.equal(s.calls[0].document[1].protected, true);
   assert.equal(s.w.document.querySelector("code"), code);
   assert.equal(code.textContent, "request()");
   await s.message({ type: "restore" });
@@ -87,9 +90,55 @@ test("inline code stays attached and unchanged while its surrounding sentence is
   s.dom.window.close();
 });
 
+test("nested links and screen-reader notes remain one complete paragraph with punctuation", async () => {
+  const s = setup(`<p><span>As models improve, the July </span><a href="/incident"><u class="decoration"><span>Hugging Face incident</span></u></a><span> and </span><a href="https://alignment.openai.com/misalignment-reports/" target="_blank"><u><span>other model misalignment examples</span></u>⁠<span class="sr-only">(opens in a new window)</span></a><span> show that models can evade containment.</span></p>`);
+  const original = s.w.document.querySelector("p").innerHTML;
+  await s.message({ type: "start", source: "en", target: "ja" }); await s.settle();
+  assert.equal(s.calls.length, 1);
+  assert.equal(s.w.Kotoba.documentText(s.calls[0].document), "As models improve, the July Hugging Face incident and other model misalignment examples show that models can evade containment.");
+  assert.ok(!s.w.Kotoba.serializeDocument(s.calls[0].document).includes("opens in a new window"));
+  assert.equal(s.w.document.querySelector(".sr-only").textContent, "(opens in a new window)");
+  await s.message({ type: "restore" });
+  assert.equal(s.w.document.querySelector("p").innerHTML, original);
+  s.dom.window.close();
+});
+
+test("CVE lists, commas and parentheses do not split a paragraph into independent translations", async () => {
+  const labels = ["CVE-2026-24834", "privilege isolation", "filesystem isolation", "gVisor (file descriptor handling)", "Moby/Docker (syscall filters)", "kernel security", "CVE-2026-74753", "CVE-2026-80521", "CVE-2026-80841"];
+  const links = labels.map((text, i) => `<a href="/patch/${i}"><u><span>${text}</span></u>⁠<span class="sr-only">(opens in a new window)</span></a>`);
+  const html = `<p><span>We upstream patches for Kata Containers (</span>${links.slice(0, 3).join("<span>, </span>")}<span>), </span>${links[3]}<span>, and </span>${links[4]}<span>. We also improve </span>${links[5]}<span>, including fixes for </span>${links.slice(6).join("<span>, </span>")}<span>. We disclosed additional vulnerabilities.</span></p>`;
+  const s = setup(html);
+  await s.message({ type: "start", source: "en", target: "ja" }); await s.settle();
+  assert.equal(s.calls.length, 1);
+  const text = s.w.Kotoba.documentText(s.calls[0].document);
+  assert.ok(text.includes("Kata Containers (CVE-2026-24834, privilege isolation, filesystem isolation), gVisor"));
+  assert.ok(text.endsWith("CVE-2026-74753, CVE-2026-80521, CVE-2026-80841. We disclosed additional vulnerabilities."));
+  assert.equal(s.w.document.querySelectorAll("a").length, 9);
+  assert.equal(s.w.document.querySelectorAll(".sr-only").length, 9);
+  s.dom.window.close();
+});
+
+test("translated word order can move links while preserving the live anchors and exact original DOM", async () => {
+  const s = setup('<p><span>If you have read my </span><a href="/posts">earlier posts</a><span> about </span><a href="/asm">assembly on Linux x86_64</a><span>, you may know my interest in low-level programming.</span></p>', tree => {
+    const links = tree.filter(node => node.tag === "a");
+    return [{ text: "以前の" }, { ...links[1], children: [{ text: "Linux x86_64のアセンブリ言語" }] }, { text: "に関する" }, { ...links[0], children: [{ text: "投稿" }] }, { text: "を読んだ方は、私が低レベルプログラミングに関心を持っていることをご存じでしょう。" }];
+  });
+  const p = s.w.document.querySelector("p"), original = p.innerHTML;
+  const [posts, asm] = p.querySelectorAll("a"); let clicks = 0;
+  posts.addEventListener("click", event => { event.preventDefault(); clicks++; });
+  await s.message({ type: "start", source: "en", target: "ja" }); await s.settle();
+  assert.equal(p.textContent, "以前のLinux x86_64のアセンブリ言語に関する投稿を読んだ方は、私が低レベルプログラミングに関心を持っていることをご存じでしょう。");
+  assert.equal(p.querySelectorAll("a")[0], asm);
+  assert.equal(p.querySelectorAll("a")[1], posts);
+  posts.click(); assert.equal(clicks, 1); assert.equal(posts.getAttribute("href"), "/posts");
+  await s.message({ type: "restore" });
+  assert.equal(p.innerHTML, original); assert.equal(p.querySelectorAll("a")[0], posts);
+  s.dom.window.close();
+});
+
 test("late responses cannot overwrite a stopped page or site mutation", async () => {
   let release;
-  const s = setup('<p id="text">Original sentence.</p>', parts => new Promise(resolve => { release = () => resolve(parts.map(x => `訳:${x}`)); }));
+  const s = setup('<p id="text">Original sentence.</p>', tree => new Promise(resolve => { release = () => resolve(translateTree(tree)); }));
   await s.message({ type: "start", source: "en", target: "ja" });
   await new Promise(r => setImmediate(r));
   await s.message({ type: "stop" }); release();
@@ -100,7 +149,7 @@ test("late responses cannot overwrite a stopped page or site mutation", async ()
 
 test("chunk progress updates the same panel and dismissing it survives further progress", async () => {
   let release;
-  const s = setup('<p>A long sentence with several chunks.</p>', parts => new Promise(resolve => { release = () => resolve(parts.map(x => `訳:${x}`)); }));
+  const s = setup('<p>A long sentence with several chunks.</p>', tree => new Promise(resolve => { release = () => resolve(translateTree(tree)); }));
   await s.message({ type: "start", source: "en", target: "ja" });
   await new Promise(r => setImmediate(r));
   const panel = s.shadow.querySelector(".panel");

@@ -5,6 +5,8 @@
   const SKIP = new Set("SCRIPT STYLE NOSCRIPT TEMPLATE PRE CODE KBD SAMP VAR TEXTAREA INPUT SELECT OPTION BUTTON SVG MATH CANVAS VIDEO AUDIO IFRAME OBJECT EMBED".split(" "));
   const INLINE_CODE = new Set(["CODE", "KBD", "SAMP", "VAR"]);
   const records = new Map();
+  const transactions = new Set();
+  const K = globalThis.Kotoba;
   let state = { url: location.href, source: null, target: null, running: false, done: 0, total: 0, failed: 0, message: "", concurrency: 1, percent: 0, startedAt: 0, finishedAt: 0, hoverEnabled: true };
   let generation = 0, panel, tooltip, host, shadow, lastHover;
   let appliedDirection = null;
@@ -125,10 +127,18 @@
   }
   function restore() {
     stop(); clearTooltip();
-    for (const [node, record] of records) {
-      // Never restore an outdated snapshot over a site's own update.
-      if (node.isConnected && node.data === record.translated) node.data = record.original;
+    for (const unit of transactions) {
+      if (!snapshotMatches(unit.appliedSnapshot) || !contiguous(unit.appliedRoots, unit.parent)) continue;
+      const next = unit.appliedRoots.at(-1).nextSibling;
+      for (const node of unit.appliedRoots) node.remove();
+      for (const item of [...unit.originalSnapshot].reverse()) {
+        if (item.children) item.node.replaceChildren(...item.children);
+        else item.node.data = item.data;
+      }
+      const fragment = document.createDocumentFragment(); fragment.append(...unit.roots);
+      unit.parent.insertBefore(fragment, next);
     }
+    transactions.clear();
     records.clear(); appliedDirection = null; state.done = 0; state.total = 0; state.failed = 0; state.percent = 0; state.startedAt = 0; state.finishedAt = 0;
     state.message = "原文に戻しました";
     if (panelKind === "page") closePanel();
@@ -158,52 +168,125 @@
     if (state.target === "ko" && /\p{Script=Hangul}/u.test(value) && !/[a-zA-Z]{4}/.test(value)) return false;
     return true;
   }
-  function collect() {
-    const groups = [];
-    const styleCache = new WeakMap();
-    const computed = el => { if (!styleCache.has(el)) styleCache.set(el, getComputedStyle(el)); return styleCache.get(el); };
-    const isBlock = el => /^(block|flow-root|flex|grid|list-item|table-cell|table-caption|table-row|inline-block|inline-flex|inline-grid)$/.test(computed(el).display) || /^(P|H[1-6]|LI|DT|DD|TD|TH|BLOCKQUOTE|FIGCAPTION|SUMMARY|HR)$/.test(el.tagName);
-    let group = null;
-    const boundary = () => { group = null; };
-    function append(node, original, block, protectedPart = false) {
-      if (!group || group.block !== block || group.root !== node.getRootNode() || group.nodes.length >= 200 || group.size + original.length > 100000) {
-        group = { block, root: node.getRootNode(), nodes: [], size: 0 }; groups.push(group);
+  function snapshot(roots) {
+    const result = [];
+    function visit(node) {
+      if (node.nodeType === Node.TEXT_NODE) result.push({ node, data: node.data });
+      else if (node.nodeType === Node.ELEMENT_NODE) {
+        result.push({ node, children: [...node.childNodes] });
+        for (const child of node.childNodes) visit(child);
       }
-      group.nodes.push({ node, original, protectedPart }); group.size += original.length;
     }
-    function walk(element, block) {
-      if (element === host || SKIP.has(element.tagName) && !INLINE_CODE.has(element.tagName) || element.matches('[data-kotoba-ui],.notranslate,[translate="no"],[hidden],[inert],[aria-hidden="true"],[contenteditable]:not([contenteditable="false"]),[role="textbox"],[role="searchbox"],[role="combobox"]')) { boundary(); return; }
-      const css = computed(element);
-      if (css.display === "none" || css.visibility !== "visible" || css.opacity === "0") { boundary(); return; }
-      if (INLINE_CODE.has(element.tagName)) {
-        if (!css.display.startsWith("inline") || !element.textContent.trim() || element.textContent.length > 10000) boundary();
-        else append(element, element.textContent, block, true);
-        return;
+    roots.forEach(visit); return result;
+  }
+  function snapshotMatches(items) {
+    return items.every(item => item.node.isConnected && (item.children
+      ? item.children.length === item.node.childNodes.length && item.children.every((child, i) => child === item.node.childNodes[i])
+      : item.node.data === item.data));
+  }
+  function contiguous(roots, parent) {
+    return roots.length && roots.every((node, i) => node.parentNode === parent && (!i || roots[i - 1].nextSibling === node));
+  }
+  function collect() {
+    const groups = [], cache = new WeakMap();
+    const computed = el => { if (!cache.has(el)) cache.set(el, getComputedStyle(el)); return cache.get(el); };
+    const isBlock = el => /^(block|flow-root|flex|grid|list-item|table-cell|table-caption|table-row)$/.test(computed(el).display) || /^(P|H[1-6]|LI|DT|DD|TD|TH|BLOCKQUOTE|FIGCAPTION|SUMMARY|HR)$/.test(el.tagName);
+    const hidden = el => {
+      const css = computed(el);
+      return el === host || el.matches('[data-kotoba-ui],[hidden],[inert],[aria-hidden="true"],.sr-only,.visually-hidden,.screen-reader-text') || css.display === "none" || css.visibility && css.visibility !== "visible" || css.opacity === "0" ||
+        (/absolute|fixed/.test(css.position) && parseFloat(css.width) <= 1 && parseFloat(css.height) <= 1 && (css.overflow === "hidden" || css.clipPath?.includes("inset(50%")));
+    };
+    const excluded = el => SKIP.has(el.tagName) && !INLINE_CODE.has(el.tagName) || el.matches('[contenteditable]:not([contenteditable="false"]),[role="textbox"],[role="searchbox"],[role="combobox"]');
+    const applied = new Set([...transactions].flatMap(unit => unit.appliedRoots));
+    function makeUnit(roots) {
+      if (!roots.length) return;
+      const parent = roots[0].parentNode;
+      if (!contiguous(roots, parent)) return;
+      const elements = new Map(), extras = new Map();
+      let eligible = false, id = 0;
+      const extra = (node, owner) => { if (!extras.has(owner)) extras.set(owner, []); extras.get(owner).push(node); return []; };
+      function build(node, owner = null) {
+        if (node.nodeType === Node.TEXT_NODE) {
+          const text = node.data.replace(/[\u200b-\u200f\u2060\ufeff]/g, "");
+          if (!text) return extra(node, owner);
+          if (/\p{L}/u.test(text) && prose(text, parentElement(node))) eligible = true;
+          return [{ text }];
+        }
+        if (node.nodeType !== Node.ELEMENT_NODE) return extra(node, owner);
+        if (hidden(node)) return extra(node, owner);
+        if (excluded(node)) {
+          const key = `k${id++}`; elements.set(key, node);
+          return [{ id: key, tag: "span", protected: true, children: [] }];
+        }
+        const lang = language(node);
+        const protect = INLINE_CODE.has(node.tagName) || node.matches('.notranslate,[translate="no"]') || lang && sameLanguage(lang, state.target);
+        // Attribute-free spans are DOM scaffolding, not linguistic boundaries.
+        if (node.tagName === "SPAN" && !node.attributes.length && !protect) return [...node.childNodes].flatMap(child => build(child, owner));
+        const key = `k${id++}`;
+        const tag = protect && !INLINE_CODE.has(node.tagName) ? "span" : node.tagName.toLowerCase();
+        if (!["a","span","strong","em","b","i","u","s","del","sub","sup","mark","small","abbr","q","cite","code","kbd","samp","var"].includes(tag)) {
+          elements.set(key, node);
+          return [{ id: key, tag: "span", protected: true, children: [] }];
+        }
+        elements.set(key, node);
+        const children = protect ? [{ text: node.textContent }] : [...node.childNodes].flatMap(child => build(child, key));
+        return [{ id: key, tag, children, ...(protect ? { protected: true } : {}) }];
       }
-      if (isBlock(element)) { block = element; boundary(); }
-      if (element.shadowRoot) {
-        // Traverse rendered light DOM through <slot>, avoiding duplicate content.
-        for (const child of element.shadowRoot.children) walk(child, block);
-      } else {
-        const children = element.tagName === "SLOT" && element.assignedNodes().length ? element.assignedNodes({ flatten: true }) : element.childNodes;
-        for (const node of children) {
-          if (node.nodeType === Node.ELEMENT_NODE) {
-            if (node.tagName === "BR") boundary(); else walk(node, block);
-          } else if (node.nodeType === Node.TEXT_NODE && node.data.trim()) {
-            const record = records.get(node);
-            if (record && node.data === record.translated) { boundary(); continue; }
-            records.delete(node);
-            if (!prose(node.data, element)) { boundary(); continue; }
-            const range = document.createRange(); range.selectNodeContents(node);
-            if (![...range.getClientRects()].some(rect => rect.width > 0 && rect.height > 0)) continue;
-            append(node, node.data, block);
-          }
+      const tree = roots.flatMap(node => build(node));
+      if (!eligible || !K.documentLength(tree)) return;
+      groups.push({ roots: [...roots], parent, elements, extras, document: tree, length: K.documentLength(tree), originalBlock: K.documentText(tree), originalSnapshot: snapshot(roots) });
+    }
+    function hasBlock(el) { return [...el.children].some(child => !hidden(child) && (isBlock(child) || hasBlock(child))); }
+    function walk(container) {
+      let roots = [];
+      const flush = () => { makeUnit(roots); roots = []; };
+      const children = container.tagName === "SLOT" && container.assignedNodes().length ? container.assignedNodes({ flatten: true }) : container.childNodes;
+      for (const node of children) {
+        if (applied.has(node)) { flush(); continue; }
+        if (node.nodeType === Node.ELEMENT_NODE && (hidden(node) || excluded(node) || node.matches('.notranslate,[translate="no"]') || language(node) && sameLanguage(language(node), state.target))) {
+          // Inline exclusions remain in the paragraph, but are never sent as prose.
+          if (isBlock(node)) flush(); else roots.push(node);
+          continue;
+        }
+        if (node.nodeType === Node.ELEMENT_NODE && node.shadowRoot) { flush(); walk(node.shadowRoot); continue; }
+        if (node.nodeType === Node.ELEMENT_NODE && (node.tagName === "BR" || isBlock(node) || hasBlock(node))) {
+          flush(); if (node.tagName !== "BR") walk(node); continue;
+        }
+        if (roots.length && roots[0].parentNode !== node.parentNode) flush();
+        roots.push(node);
+      }
+      flush();
+    }
+    if (document.body) walk(document.body);
+    return groups;
+  }
+  function applyDocument(unit, tree) {
+    if (!snapshotMatches(unit.originalSnapshot) || !contiguous(unit.roots, unit.parent)) return false;
+    const next = unit.roots.at(-1).nextSibling;
+    for (const node of unit.roots) node.remove();
+    const translatedNodes = [];
+    function render(nodes, owner = null) {
+      const fragment = document.createDocumentFragment();
+      for (const item of nodes) {
+        if (item.text !== undefined) {
+          const node = document.createTextNode(item.text); translatedNodes.push(node); fragment.append(node);
+        } else {
+          const element = unit.elements.get(item.id);
+          if (!element) throw new Error("翻訳結果の要素が一致しません。");
+          if (!item.protected) element.replaceChildren(render(item.children, item.id));
+          fragment.append(element);
         }
       }
-      if (isBlock(element)) boundary();
+      fragment.append(...(unit.extras.get(owner) || []));
+      return fragment;
     }
-    if (document.body) walk(document.body, document.body);
-    return groups.filter(group => group.nodes.some(node => !node.protectedPart));
+    const fragment = render(tree);
+    unit.appliedRoots = [...fragment.childNodes];
+    unit.parent.insertBefore(fragment, next);
+    unit.appliedSnapshot = snapshot(unit.appliedRoots); transactions.add(unit);
+    const group = { originalBlock: unit.originalBlock, nodes: translatedNodes };
+    for (const node of translatedNodes) records.set(node, { translated: node.data, group });
+    return true;
   }
   async function translatePage(source, target) {
     currentPage();
@@ -217,7 +300,7 @@
     state.message = groups.length ? "" : "翻訳対象がありません";
     if (panelKind === "selection") closePanel();
     pageDismissed = false; clearTooltip();
-    const totalChars = groups.reduce((sum, group) => sum + group.nodes.reduce((n, item) => n + (item.protectedPart ? 0 : item.original.length), 0), 0);
+    const totalChars = groups.reduce((sum, group) => sum + group.length, 0);
     let completedChars = 0;
     const activeProgress = new Map();
     const updateProgress = () => {
@@ -231,31 +314,24 @@
       while (run === generation && cursor < groups.length) {
         const group = groups[cursor++];
         const requestId = `page-${run}-${++requestSequence}`;
-        const length = group.nodes.reduce((sum, item) => sum + (item.protectedPart ? 0 : item.original.length), 0);
+        const length = group.length;
         progressListeners.set(requestId, progress => {
           if (run !== generation) return;
           activeProgress.set(requestId, Math.max(activeProgress.get(requestId) || 0, Math.min(length, progress.completed)));
           updateProgress();
         });
         try {
-          const response = await browser.runtime.sendMessage({ type: "translate", requestId, parts: group.nodes.map(n => n.original), protectedParts: group.nodes.map(n => n.protectedPart), source, target });
+          const response = await browser.runtime.sendMessage({ type: "translate", requestId, document: group.document, source, target });
           if (state.url !== location.href) { currentPage(); return; }
           if (run !== generation) return;
-          if (response.error) throw new Error(response.error);
-          if (!response.parts || response.parts.length !== group.nodes.length) throw new Error("翻訳結果の数が一致しません。");
-          // Atomic per paragraph: don't mix a response with a live site update.
-          if (group.nodes.every(({ node, original, protectedPart }) => node.isConnected && (protectedPart ? node.textContent : node.data) === original)) {
-            const range = document.createRange();
-            range.setStartBefore(group.nodes[0].node); range.setEndAfter(group.nodes.at(-1).node);
-            const originalBlock = range.toString();
-            const translatedGroup = { originalBlock, nodes: group.nodes.filter(item => !item.protectedPart).map(item => item.node) };
-            appliedDirection = `${source}:${target}`;
-            group.nodes.forEach(({ node, original, protectedPart }, i) => {
-              if (protectedPart) return;
-              node.data = response.parts[i];
-              records.set(node, { original, translated: node.data, group: translatedGroup });
-            });
-          } else { state.failed++; state.message = "更新された段落は適用していません"; }
+          if (response.error && response.errorCode === "structure") {
+            state.failed++; state.message = response.error;
+          } else {
+            if (response.error) throw new Error(response.error);
+            if (!response.document) throw new Error("翻訳結果が不正です。");
+            if (applyDocument(group, response.document)) appliedDirection = `${source}:${target}`;
+            else { state.failed++; state.message = "更新された段落は適用していません"; }
+          }
         } catch (error) {
           if (run !== generation) return;
           state.failed++; state.message = error.message;

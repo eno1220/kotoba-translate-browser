@@ -35,9 +35,12 @@ globalThis.Kotoba = (() => {
     u.pathname = u.pathname.replace(/\/$/, "") + path;
     return u.href;
   }
-  function body(s, text, { source, target, domain }) {
+  function body(s, text, { source, target, domain, html = false, retry = false }) {
     languages(source, target);
-    const options = { context: domain, form: s.form, target_lang: target };
+    let context = `This text is from a web page on ${domain}. Translate it as part of the website, preserving the meaning and natural flow of complete sentences.`;
+    if (html) context += " The input is an HTML fragment of one paragraph. Translate the whole paragraph together. Preserve every HTML tag and id exactly once, keep link labels with their links, and do not translate code or elements marked translate=\"no\". You may reorder sibling inline elements and place translated prose outside tags to produce natural grammar. Return only the translated HTML fragment.";
+    if (retry) context += " The previous response did not preserve the HTML structure. Keep all tags and id attributes, including links, in the translated fragment. Do not return Markdown fences or explanations.";
+    const options = { context, form: s.form, target_lang: target };
     if (source !== "auto") options.source_lang = source;
     const result = { model: s.model, messages: [{ role: "user", content: text }], max_tokens: MAX_TOKENS, stream: false, temperature: 0 };
     if (s.apiFormat === "template") {
@@ -49,20 +52,81 @@ globalThis.Kotoba = (() => {
   // PLaMo's byte fallback makes UTF-8 byte length a conservative token estimate.
   const byteTokens = text => new TextEncoder().encode(text).length;
   const escape = text => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  const unescape = text => text.replace(/&(?:amp|lt|gt);/g, x => ({ "&amp;": "&", "&lt;": "<", "&gt;": ">" })[x]);
-  function serialize(parts, protectedParts = []) { return parts.map((p, i) => { const tag = protectedParts[i] ? "x" : "t"; return `<${tag}${i}>${escape(p)}</${tag}${i}>`; }).join(""); }
-  function parse(text, count, protectedParts = []) {
-    let rest = text.trim();
-    const result = [];
-    for (let i = 0; i < count; i++) {
-      const tag = protectedParts[i] ? "x" : "t";
-      const match = rest.match(new RegExp(`^<${tag}${i}>([\\s\\S]*?)</${tag}${i}>`));
-      if (!match || /[<>]/.test(match[1])) throw new Error("翻訳結果の構造が一致しません。");
-      if (!match[1].trim()) throw new Error("空の翻訳結果です。");
-      result.push(unescape(match[1]));
-      rest = rest.slice(match[0].length);
+  const INLINE_TAGS = new Set(["a", "span", "strong", "em", "b", "i", "u", "s", "del", "sub", "sup", "mark", "small", "abbr", "q", "cite", "code", "kbd", "samp", "var"]);
+  function documentText(nodes) { return nodes.map(node => node.text !== undefined ? node.text : documentText(node.children)).join(""); }
+  function documentLength(nodes) { return nodes.reduce((sum, node) => sum + (node.protected ? 0 : node.text !== undefined ? node.text.length : documentLength(node.children)), 0); }
+  function serializeDocument(nodes) {
+    return nodes.map(node => {
+      if (node.text !== undefined) return escape(node.text);
+      if (!INLINE_TAGS.has(node.tag) || !/^k\d+$/.test(node.id)) throw new Error("翻訳対象のHTML構造が不正です。");
+      return `<${node.tag} id="${node.id}"${node.protected ? ' translate="no"' : ""}>${serializeDocument(node.children)}</${node.tag}>`;
+    }).join("");
+  }
+  function parseDocument(text, source) {
+    const expected = new Map();
+    function index(nodes, parent = null) {
+      for (const node of nodes) if (node.text === undefined) {
+        if (expected.has(node.id)) throw new Error("翻訳対象のIDが重複しています。");
+        expected.set(node.id, { node, parent }); index(node.children, node.id);
+      }
     }
-    if (rest.trim()) throw new Error("翻訳結果に余分な内容があります。");
+    index(source);
+    const cleaned = text.trim().replace(/^```(?:html|xml)?\s*\n([\s\S]*?)\n```$/i, "$1");
+    const parsed = new DOMParser().parseFromString(`<kotoba-root>${cleaned.replace(/&nbsp;/g, "&#160;")}</kotoba-root>`, "application/xml");
+    if (parsed.querySelector("parsererror")) throw new Error("翻訳結果のHTMLを解釈できません。");
+    const seen = new Set();
+    function read(parentNode, parentId = null) {
+      return [...parentNode.childNodes].map(element => {
+        if (element.nodeType === 3) return { text: element.data };
+        if (element.nodeType !== 1) throw new Error("翻訳結果に不明な内容があります。");
+        const id = element.getAttribute("id"), entry = expected.get(id);
+        if (!entry || seen.has(id) || element.tagName !== entry.node.tag || entry.parent !== parentId || [...element.attributes].some(attr => attr.name !== "id" && !(attr.name === "translate" && attr.value === "no" && entry.node.protected))) throw new Error("翻訳結果のリンク・書式が一致しません。");
+        seen.add(id);
+        const children = read(element, id);
+        if (entry.node.protected && documentText(children) !== documentText(entry.node.children)) throw new Error("保護した内容が変更されました。");
+        if (documentText(entry.node.children).trim() && !documentText(children).trim()) throw new Error("翻訳結果のリンク・書式が空です。");
+        return { tag: entry.node.tag, id, children, ...(entry.node.protected ? { protected: true } : {}) };
+      });
+    }
+    const result = read(parsed.documentElement);
+    if (seen.size !== expected.size || !documentText(result).trim()) throw new Error("翻訳結果のリンク・書式が不足しています。");
+    return result;
+  }
+  // Split by readable text, never by the number or position of DOM text nodes.
+  // Tags surrounding a long leaf are repeated in chunks, then merged afterwards.
+  async function splitDocument(nodes, limit, count = byteTokens) {
+    const chunks = [];
+    let current = [];
+    const fits = async value => await count(serializeDocument(value)) <= limit;
+    async function pieces(node, wrappers = []) {
+      const wrap = children => wrappers.reduceRight((value, wrapper) => [{ ...wrapper, children: value }], children);
+      if (await fits(wrap([node]))) return [wrap([node])];
+      if (node.text !== undefined) {
+        const overhead = await count(serializeDocument(wrap([{ text: "" }])));
+        const pieces = await split(node.text, Math.max(1, limit - overhead - 16), async text => (await count(serializeDocument(wrap([{ text }])))) - overhead);
+        return pieces.map(text => wrap([{ text }]));
+      }
+      if (node.protected) throw new Error("保護対象が入力上限を超えています。入力上限を増やしてください。");
+      const result = [];
+      for (const child of node.children) result.push(...await pieces(child, [...wrappers, node]));
+      return result;
+    }
+    for (const node of nodes) for (const piece of await pieces(node)) {
+      if (current.length && !await fits(mergeDocuments([current, piece]))) { chunks.push(current); current = []; }
+      if (!await fits(piece)) throw new Error("HTML構造が入力上限を超えています。");
+      current = mergeDocuments([current, piece]);
+    }
+    if (current.length) chunks.push(current);
+    return chunks;
+  }
+  function mergeDocuments(chunks) {
+    const result = [];
+    for (const node of chunks.flat()) {
+      const previous = result.at(-1);
+      if (node.text !== undefined && previous?.text !== undefined) previous.text += node.text;
+      else if (node.id && previous?.id === node.id) previous.children = mergeDocuments([previous.children, node.children]);
+      else result.push(node.text !== undefined ? { ...node } : { ...node, children: mergeDocuments([node.children]) });
+    }
     return result;
   }
   // Keep every code point and whitespace; prefer paragraphs, sentences, then words.
@@ -117,5 +181,5 @@ globalThis.Kotoba = (() => {
       }
     }
   }
-  return { MAX_TOKENS, DEFAULTS, LANGUAGES, settings, languages, endpoint, body, byteTokens, serialize, parse, split, Queue };
+  return { MAX_TOKENS, DEFAULTS, LANGUAGES, settings, languages, endpoint, body, byteTokens, split, Queue, documentText, documentLength, serializeDocument, parseDocument, splitDocument, mergeDocuments };
 })();

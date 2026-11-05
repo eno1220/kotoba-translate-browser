@@ -1,6 +1,7 @@
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 require("../extension/core.js");
+globalThis.DOMParser = new (require("jsdom").JSDOM)("").window.DOMParser;
 const K = globalThis.Kotoba;
 
 test("request formats, Bearer-independent body and endpoint composition", () => {
@@ -8,13 +9,15 @@ test("request formats, Bearer-independent body and endpoint composition", () => 
   assert.equal(K.endpoint(s), "http://127.0.0.1:8000/v1/chat/completions");
   const page = { source: "en", target: "ja", domain: "https://example.com" };
   const body = K.body(s, "Hello", page);
-  assert.equal(body.context, page.domain);
+  assert.ok(body.context.includes(page.domain));
+  assert.ok(body.context.includes("web page"));
   assert.equal(body.max_tokens, 8096);
   assert.deepEqual(body.messages, [{ role: "user", content: "Hello" }]);
   assert.equal(body.source_lang, "en");
   assert.equal(body.use_glossary, false);
   const official = K.body({ ...s, apiFormat: "template" }, "Hello", { ...page, source: "auto" });
   assert.equal(official.chat_template_kwargs.target_lang, "ja");
+  assert.ok(official.chat_template_kwargs.context.includes("web page"));
   assert.equal(official.chat_template_kwargs.source_lang, undefined);
   assert.equal(official.target_lang, undefined);
   assert.throws(() => K.settings({ endpoint: "https://name:secret@example.com" }));
@@ -30,9 +33,22 @@ test("long Unicode text is split losslessly under the token budget", async () =>
   assert.ok(parts.every(x => !/[\uD800-\uDBFF]$/.test(x)));
 });
 
-test("markers reject lost, reordered, injected and empty segments", () => {
-  assert.deepEqual(K.parse(K.serialize(["A < B & C", "link"]), 2), ["A < B & C", "link"]);
-  for (const input of ["<t1>x</t1><t0>y</t0>", "<t0>x</t0>", "<t0><img src=x></t0><t1>y</t1>", "<t0></t0><t1>y</t1>", "<t0>x</t0><t1>y</t1>extra"]) assert.throws(() => K.parse(input, 2));
+test("paragraph HTML accepts free prose and sibling reordering, rejects missing/duplicate links and injected markup", () => {
+  const document = [{ text: "Read " }, { tag: "a", id: "k0", children: [{ text: "earlier posts" }] }, { text: " about " }, { tag: "a", id: "k1", children: [{ text: "assembly" }] }, { text: "." }];
+  const result = K.parseDocument('以前の<a id="k1">アセンブリ言語</a>についての<a id="k0">投稿</a>を読んだ方は。', document);
+  assert.equal(result[1].id, "k1");
+  assert.equal(K.documentText(result), "以前のアセンブリ言語についての投稿を読んだ方は。");
+  for (const input of ['<a id="k0">x</a>', '<a id="k0">x</a><a id="k0">x</a><a id="k1">y</a>', '<a id="k0"><img src="x"/></a><a id="k1">y</a>', '<a id="k0"></a><a id="k1">y</a>', '<a id="k0" href="evil">x</a><a id="k1">y</a>']) assert.throws(() => K.parseDocument(input, document));
+});
+
+test("long paragraph HTML chunks remain bounded and merge without losing link identity", async () => {
+  const document = [{ text: "A complete sentence. ".repeat(20) }, { tag: "a", id: "k0", children: [{ text: "A linked sentence. ".repeat(20) }] }, { text: " A final sentence." }];
+  const chunks = await K.splitDocument(document, 128);
+  assert.ok(chunks.length > 2);
+  assert.ok(chunks.every(chunk => K.byteTokens(K.serializeDocument(chunk)) <= 128));
+  const merged = K.mergeDocuments(chunks);
+  assert.deepEqual(merged, document);
+  assert.deepEqual(K.parseDocument(K.serializeDocument(merged), document), document);
 });
 
 test("global queue is serial by default and removes cancelled waiters", async () => {

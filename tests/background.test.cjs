@@ -8,7 +8,7 @@ function background(responder, settings = {}) {
   const progress = [];
   const event = { addListener() {} };
   const context = vm.createContext({
-    URL, TextEncoder, AbortController, DOMException, setTimeout, clearTimeout,
+    URL, TextEncoder, AbortController, DOMException, setTimeout, clearTimeout, DOMParser: new (require("jsdom").JSDOM)("").window.DOMParser,
     browser: {
       runtime: { id: "test", onMessage: { addListener: fn => listener = fn } },
       storage: { local: { get: async () => ({ settings }) }, onChanged: event },
@@ -33,23 +33,23 @@ test("background sends correct body, domain-only context and Bearer authenticati
   const b = background(() => completion("こんにちは"), { apiKey: "my-key" });
   const response = await b.send(["Hello"]);
   assert.equal(response.parts[0], "こんにちは");
-  assert.equal(b.calls[0].body.context, "https://example.org");
+  assert.ok(b.calls[0].body.context.includes("web page on https://example.org"));
+  assert.ok(!b.calls[0].body.context.includes("private?q=secret"));
   assert.equal(b.calls[0].body.max_tokens, 8096);
   assert.equal(b.calls[0].options.headers.Authorization, "Bearer my-key");
   assert.equal(b.calls[0].options.redirect, "error");
 });
 
-test("invalid markers fall back to leaf translation; truncated text is split again", async () => {
+test("truncated plain text is split again with accurate progress", async () => {
   let truncated = false;
   const b = background(({ body }) => {
     const input = body.messages[0].content;
-    if (input.includes("<t0>")) return completion("broken structure");
     if (input.length > 40 && !truncated) { truncated = true; return { choices: [{ finish_reason: "length", message: { content: "partial" } }] }; }
     return completion(`訳:${input}`);
   });
-  const input = ["A short sentence.", "A slightly longer sentence with more than forty letters to force splitting."];
+  const input = ["A short sentence. A slightly longer sentence with more than forty letters to force splitting."];
   const result = await b.send(input, { requestId: "test-progress" });
-  assert.equal(result.parts.length, 2);
+  assert.equal(result.parts.length, 1);
   assert.ok(result.parts.every(x => x.includes("訳:")));
   assert.ok(!result.parts.join("").includes("partial"));
   assert.ok(truncated);
@@ -69,14 +69,16 @@ test("two tabs share a single network queue and tokenize supports actual server 
   assert.ok(b.calls.some(x => x.url.endsWith("/tokenize")));
 });
 
-test("inline code is supplied as protected context and never translated on fallback", async () => {
+test("broken inline structure retries the complete paragraph and never translates fragments", async () => {
   const b = background(({ body }) => {
     const input = body.messages[0].content;
-    if (input.includes("<x1>")) return completion("<t0>呼び出す</t0><x1>changed()</x1><t2>続ける</t2>");
-    assert.notEqual(input, "request()");
-    return completion(`訳:${input}`);
+    assert.ok(input.includes('Call <code id="k0" translate="no">request()</code> to continue.'));
+    return completion('呼び出す<code id="k0" translate="no">changed()</code>続ける');
   });
-  const response = await b.send(["Call ", "request()", " to continue."], { protectedParts: [false, true, false] });
-  assert.equal(response.parts[1], "request()");
-  assert.ok(b.calls[0].body.messages[0].content.includes("<x1>request()</x1>"));
+  const document = [{ text: "Call " }, { tag: "code", id: "k0", protected: true, children: [{ text: "request()" }] }, { text: " to continue." }];
+  const response = await b.send([], { document });
+  assert.equal(response.errorCode, "structure");
+  assert.equal(b.calls.length, 2);
+  assert.equal(b.calls[0].body.messages[0].content, b.calls[1].body.messages[0].content);
+  assert.ok(b.calls[1].body.context.includes("previous response"));
 });
