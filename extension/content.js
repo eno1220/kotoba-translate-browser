@@ -1,6 +1,6 @@
 /* global browser */
 (() => {
-  const PROTOCOL = 3;
+  const PROTOCOL = 4;
   if (globalThis.__kotobaLoaded) return;
   globalThis.__kotobaLoaded = true;
   const SKIP = new Set("SCRIPT STYLE NOSCRIPT TEMPLATE PRE CODE KBD SAMP VAR TEXTAREA INPUT SELECT OPTION BUTTON SVG MATH CANVAS VIDEO AUDIO IFRAME OBJECT EMBED".split(" "));
@@ -17,7 +17,16 @@
   let showTimer, hideTimer, hoverCandidate, hoverAnchor, pinned = false, marks;
   let requestSequence = 0;
   const progressListeners = new Map();
-  const preferences = { responsiveScan: true, prioritizeVisible: true, mainContentOnly: false, selectionButton: false,
+  function yieldToBrowser() {
+    // Posted tasks yield to input/paint without the background-tab timer clamp.
+    if (typeof MessageChannel === "function") return new Promise(resolve => {
+      const channel = new MessageChannel();
+      channel.port1.onmessage = () => { channel.port1.close(); channel.port2.close(); resolve(); };
+      channel.port2.postMessage(null);
+    });
+    return new Promise(resolve => setTimeout(resolve, 0));
+  }
+  const preferences = { responsiveScan: true, prioritizeVisible: true, prioritizeContent: true, semanticBatching: true, inputTokens: 6000, tokenizer: "bytes", mainContentOnly: false, selectionButton: false,
     keyboardShortcuts: true, copyButton: true, focusOriginal: true, pageProgress: true, announceProgress: true, hoverEnabled: true };
   let announcer, announcementKey, launcher, launcherTimer, originalFocus;
   function applyPreferences(value) {
@@ -52,14 +61,14 @@
       .tooltip { width:max-content; max-width:min(520px,calc(100vw - 24px)); max-height:min(360px,45vh); overflow:auto; white-space:pre-wrap; pointer-events:auto; z-index:2; }
       .heading { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px; }
       h2 { margin:0; font-size:13px; font-weight:600; } p { margin:8px 0; white-space:pre-wrap; } small { color:#62626c; }
-      button { display:inline-flex; align-items:center; justify-content:center; min-height:30px; font:inherit; font-size:12px; font-weight:500; border:1px solid #dedee3; border-radius:5px; padding:4px 10px; background:#fff; color:#52525b; cursor:pointer; }
-      button:hover { background:#f4f4f5; } button.primary { color:#fff; border-color:#087fdb; background:#087fdb; } button.primary:hover { background:#006fc5; }
-      button:disabled { opacity:.45; cursor:default; } button:focus-visible,select:focus-visible,summary:focus-visible { outline:2px solid #38bdf8; outline-offset:2px; }
-      button.icon { border:0; background:transparent; min-height:24px; min-width:24px; padding:0 4px; color:#71717a; }
+      button { display:inline-flex; align-items:center; justify-content:center; min-height:36px; font:inherit; font-size:12px; font-weight:500; border:1px solid #dedee3; border-radius:5px; padding:4px 10px; background:#fff; color:#52525b; cursor:pointer; }
+      button:hover { background:#f4f4f5; } button.primary { color:#fff; border-color:#006fc5; background:#006fc5; } button.primary:hover { background:#005da6; }
+      button:disabled { opacity:.45; cursor:default; } button:focus-visible,select:focus-visible,summary:focus-visible,.box:focus-visible { outline:2px solid #006fc5; outline-offset:2px; }
+      button.icon { border:0; background:transparent; min-height:32px; min-width:32px; padding:0 4px; color:#71717a; }
       button.icon:hover,button[aria-pressed="true"] { color:#087fdb; background:#f0f9ff; }
       .close { font-size:20px; line-height:1; } .tools,.actions { display:flex; align-items:center; gap:8px; } .actions { margin-top:12px; justify-content:flex-end; }
       select { width:100%; min-width:0; font:inherit; padding:7px 8px; background:white; color:#27272a; border:1px solid #dedee3; border-radius:5px; }
-      .languages { display:flex; gap:12px; margin-bottom:12px; } label { display:block; flex:1; min-width:0; font-size:11px; color:#71717a; } label select { margin-top:4px; font-size:12px; }
+      .languages { display:flex; align-items:end; gap:8px; margin-bottom:12px; } label { display:block; flex:1; min-width:0; font-size:12px; color:#62626c; } label select { margin-top:4px; font-size:13px; }
       .result { border-top:1px solid #e4e4e7; padding-top:12px; font-size:14px; line-height:1.8; user-select:text; }
       .error { color:#b42318; font-size:12px; } .message:empty { display:none; }
       .progress-label,.progress-detail { display:flex; justify-content:space-between; align-items:center; gap:10px; font-size:12px; }
@@ -160,8 +169,8 @@
     pageUI.pending.style.left = `${state.percent}%`; pageUI.pending.style.width = `${state.activePercent}%`;
     pageUI.activity.hidden = !state.running || state.preparing;
     pageUI.work.textContent = `処理中 ${state.active}段落 · 未着手 ${state.pending}段落`;
-    const phase = { preparing: "翻訳を準備中", queued: "順番待ち", tokenizing: "入力を計測中", translating: "応答待ち" }[state.phase] || "";
-    pageUI.phase.textContent = phase ? `${phase} ${Math.floor((Date.now() - state.phaseStartedAt) / 1000)}秒` : "";
+    const phase = { preparing: "翻訳を準備中", queued: "順番待ち", tokenizing: "入力を計測中", translating: "応答待ち", retrying: "再試行まで待機", receiving: "訳文を受信中" }[state.phase] || "";
+    pageUI.phase.textContent = phase ? `${phase}${state.phase === "receiving" && state.receivedCharacters ? ` · ${state.receivedCharacters}文字` : ""} ${Math.floor((Date.now() - state.phaseStartedAt) / 1000)}秒` : "";
     pageUI.count.textContent = `${state.done} / ${state.total} 段落`;
     pageUI.elapsed.textContent = state.startedAt ? `${Math.floor(((state.finishedAt || Date.now()) - state.startedAt) / 1000)}秒` : "";
     pageUI.message.textContent = state.failed || !state.total ? state.message : "";
@@ -187,7 +196,7 @@
     }
   }
   function clearActivity() {
-    state.active = 0; state.pending = 0; state.activePercent = 0; state.phase = ""; state.phaseStartedAt = 0;
+    state.active = 0; state.pending = 0; state.activePercent = 0; state.phase = ""; state.phaseStartedAt = 0; state.receivedCharacters = 0;
   }
   function stop() {
     generation++; clearActivity();
@@ -267,6 +276,9 @@
     return roots.length && roots.every((node, i) => node.parentNode === parent && (!i || roots[i - 1].nextSibling === node));
   }
   async function collect(run = generation) {
+    // Release detached SPA paragraphs when another manual scan starts.
+    for (const [node] of records) if (!node.isConnected) records.delete(node);
+    for (const unit of transactions) if (!unit.appliedRoots.some(node => node.isConnected)) transactions.delete(unit);
     const groups = [], cache = new WeakMap(), blockCache = new WeakMap(), omissionCache = new WeakMap(), languageCache = new WeakMap();
     const getLanguage = element => {
       const path = [];
@@ -280,6 +292,11 @@
     const computed = el => { if (!cache.has(el)) cache.set(el, getComputedStyle(el)); return cache.get(el); };
     const isBlock = el => /^(block|flow-root|flex|grid|list-item|table(?:-.+)?)(?:\s|$)/.test(computed(el).display) || /^(P|H[1-6]|LI|DT|DD|TD|TH|BLOCKQUOTE|FIGCAPTION|SUMMARY|HR)$/.test(el.tagName);
     const hidden = el => {
+      const disclosure = el.closest("details:not([open])");
+      if (disclosure && el !== disclosure) {
+        const summary = [...disclosure.children].find(child => child.tagName === "SUMMARY");
+        if (!summary?.contains(el)) return true;
+      }
       const css = computed(el);
       return el === host || el.matches('[data-kotoba-ui],[hidden],[inert],[aria-hidden="true"],.sr-only,.visually-hidden,.screen-reader-text') || css.display === "none" || css.contentVisibility === "hidden" || css.visibility && css.visibility !== "visible" || css.opacity === "0" ||
         (/absolute|fixed/.test(css.position) && parseFloat(css.width) <= 1 && parseFloat(css.height) <= 1 && (css.overflow === "hidden" || css.clipPath?.includes("inset(50%")));
@@ -344,7 +361,7 @@
     let visited = 0;
     function checkpoint() {
       if (run !== generation || state.url !== pageURL()) throw new DOMException("キャンセルしました", "AbortError");
-      if (preferences.responsiveScan && ++visited % 80 === 0) return new Promise(resolve => setTimeout(resolve, 0));
+      if (preferences.responsiveScan && ++visited % 80 === 0) return yieldToBrowser();
     }
     // Post-order indexing avoids recursive look-ahead into huge SPA subtrees.
     async function indexBlocks(root) {
@@ -365,7 +382,9 @@
       const flush = () => { makeUnit(roots); roots = []; };
       if (!blockCache.has(container)) await indexBlocks(container);
       const assigned = container.tagName === "SLOT" ? container.assignedNodes({ flatten: true }) : [];
-      const children = assigned.length ? assigned : [...container.childNodes];
+      const children = container.tagName === "DETAILS" && !container.open
+        ? [...container.children].filter(child => child.tagName === "SUMMARY").slice(0, 1)
+        : assigned.length ? assigned : [...container.childNodes];
       for (const node of children) {
         const pause = checkpoint(); if (pause) await pause;
         if (applied.has(node)) { flush(); continue; }
@@ -392,14 +411,40 @@
       for (let el = scope; el; el = parentElement(el)) if (omitted(el)) { blocked = true; break; }
       if (!blocked) await walk(scope);
     }
-    if (preferences.prioritizeVisible) {
+    if (preferences.prioritizeVisible || preferences.prioritizeContent || preferences.semanticBatching) {
       const ordered = [];
       for (const group of groups) {
-        if (preferences.responsiveScan && ++visited % 80 === 0) await new Promise(resolve => setTimeout(resolve, 0));
+        if (preferences.responsiveScan && ++visited % 80 === 0) await yieldToBrowser();
         if (run !== generation) throw new DOMException("キャンセルしました", "AbortError");
-        ordered.push({ group, distance: viewportDistance(group) });
+        const context = group.context;
+        const content = context.closest('article,main,[role="main"],[role="article"]');
+        const peripheral = context.closest('nav,aside,footer,[role="navigation"],[role="complementary"],[role="contentinfo"],.sidebar,.widget-area');
+        const chrome = peripheral && (!content || content.contains(peripheral)) ? peripheral : !content && context.closest('header,[role="banner"]');
+        const table = context.closest("table");
+        group.priority = chrome ? 3 : content ? (table || context.closest("summary") ? 1 : 0) : 2;
+        group.component = table || chrome || context.closest('section,blockquote,figure,article,main,[role="main"],[role="article"],ul,ol,dl') || context.closest("div") || document.body;
+        group.semanticUnit = context.closest("tr,li,figure,blockquote");
+        ordered.push({ group, distance: preferences.prioritizeVisible ? viewportDistance(group) : 0 });
       }
-      return ordered.sort((a, b) => a.distance - b.distance).map(item => item.group);
+      if (preferences.prioritizeContent) {
+        // Some sites use only divs. Infer priority conservatively from complete
+        // prose and link density; this changes ordering, never the target scope.
+        const stats = new Map();
+        const linkedLength = (nodes, linked = false) => nodes.reduce((sum, node) => sum + (node.protected ? 0 : node.text !== undefined
+          ? linked ? node.text.length : 0 : linkedLength(node.children, linked || node.tag === "a")), 0);
+        for (const { group } of ordered) if (group.priority === 2) {
+          const item = stats.get(group.component) || { chars: 0, prose: 0, links: 0, units: 0 };
+          item.chars += group.length; item.units++; item.links += linkedLength(group.document);
+          if (/[。！？]|[.!?](?:\s|$)/u.test(group.originalBlock)) item.prose += group.length;
+          stats.set(group.component, item);
+        }
+        for (const { group } of ordered) if (group.priority === 2) {
+          const item = stats.get(group.component), density = item.links / Math.max(1, item.chars);
+          if (item.chars >= 160 && item.prose >= 120 && density < 0.45) group.priority = group.component.tagName === "TABLE" ? 1 : 0;
+          else if (item.units >= 3 && density >= 0.8) group.priority = 3;
+        }
+      }
+      return ordered.sort((a, b) => (preferences.prioritizeContent ? a.group.priority - b.group.priority : 0) || a.distance - b.distance).map(item => item.group);
     }
     return groups;
   }
@@ -488,7 +533,7 @@
     state.preparing = false; state.total = groups.length;
     state.message = groups.length ? "" : "翻訳対象がありません";
     const totalChars = groups.reduce((sum, group) => sum + group.length, 0);
-    let completedChars = 0, cursor = 0;
+    let completedChars = 0, cursor = 0, batchingAvailable = true;
     const activeProgress = new Map();
     const updateProgress = () => {
       if (run !== generation) return;
@@ -498,12 +543,39 @@
       state.active = active.reduce((sum, item) => sum + item.remaining.size, 0);
       state.pending = groups.length - cursor;
       state.activePercent = totalChars ? Math.max(0, (active.reduce((sum, item) => sum + item.length, 0) - processed) / totalChars * 100) : 0;
-      const current = active.find(item => item.phase === "translating") || active.find(item => item.phase === "tokenizing") || active[0];
+      const current = active.find(item => item.phase === "receiving" || item.phase === "translating") || active.find(item => item.phase === "tokenizing") || active[0];
       state.phase = current?.phase || ""; state.phaseStartedAt = current?.since || 0;
+      state.receivedCharacters = current?.receivedCharacters || 0;
       statusPanel();
     };
     updateProgress();
     function nextBatch() {
+      if (!batchingAvailable) return [groups[cursor++]];
+      if (preferences.semanticBatching && state.batchTranslation) {
+        const first = groups[cursor], batch = [];
+        const limit = cursor === 0 ? Math.min(1800, preferences.inputTokens) : preferences.inputTokens;
+        const maxItems = cursor === 0 ? 8 : 64;
+        const estimateSize = group => {
+          group.wireBytes ??= wireSize(group.document) + 18;
+          return preferences.tokenizer === "bytes" ? group.wireBytes : group.wireBytes / 3;
+        };
+        let bytes = 0;
+        while (cursor < groups.length && batch.length < maxItems) {
+          const group = groups[cursor];
+          // Remote tokenizers do the exact packing in the background. This is
+          // only a planning estimate; the bytes mode is a conservative bound.
+          const estimate = estimateSize(group);
+          if (batch.length && (group.component !== first.component || group.priority !== first.priority || bytes + estimate > limit)) break;
+          if (batch.length && group.semanticUnit && group.semanticUnit !== batch.at(-1).semanticUnit) {
+            let end = cursor, unitSize = 0;
+            while (end < groups.length && end - cursor <= 64 && groups[end].semanticUnit === group.semanticUnit) unitSize += estimateSize(groups[end++]);
+            // Keep a table row/list item together when it fits a fresh request.
+            if (unitSize <= limit && (bytes + unitSize > limit || batch.length + end - cursor > maxItems)) break;
+          }
+          batch.push(group); cursor++; bytes += estimate;
+        }
+        return batch;
+      }
       const visible = viewportDistance(groups[cursor]) === 0;
       const limit = !state.batchTranslation || cursor === 0 ? 1 : cursor < 3 ? 2 : visible ? 4 : 16;
       const batch = [];
@@ -538,7 +610,8 @@
         progressListeners.set(requestId, value => {
           if (run !== generation) return;
           progress.completed = Math.max(progress.completed, Math.min(length, value.completed));
-          if (["queued", "translating", "tokenizing", "preparing"].includes(value.phase) && progress.phase !== value.phase) {
+          if (Number.isFinite(value.receivedCharacters)) progress.receivedCharacters = value.receivedCharacters;
+          if (["queued", "translating", "tokenizing", "preparing", "retrying", "receiving"].includes(value.phase) && progress.phase !== value.phase) {
             progress.phase = value.phase; progress.since = Date.now();
           }
           for (const result of value.results || []) accept(result.index, result);
@@ -546,10 +619,11 @@
         });
         updateProgress();
         try {
-          const response = await browser.runtime.sendMessage({ type: "translate", protocol: PROTOCOL, requestId, ...(batch.length > 1 ? { documents: batch.map(group => group.document) } : { document: batch[0].document }), source, target });
+          const response = await browser.runtime.sendMessage({ type: "translate", protocol: PROTOCOL, requestId, sessionId: `${run}-${state.startedAt}`, sessionStartedAt: state.startedAt, ...(batch.length > 1 ? { documents: batch.map(group => group.document) } : { document: batch[0].document }), source, target });
           if (state.url !== pageURL()) { currentPage(); return; }
           if (run !== generation) return;
           if (response.error && (batch.length > 1 || response.errorCode !== "structure")) throw new Error(response.error);
+          if (response.batchFallback) batchingAvailable = false;
           const responses = batch.length > 1 ? response.documents : [response];
           if (!responses || responses.length !== batch.length) throw new Error("翻訳結果が不正です。");
           responses.forEach((result, index) => accept(index, result));
@@ -572,6 +646,12 @@
       state.message = state.failed ? "一部の段落を適用できませんでした" : groups.length ? "" : "翻訳対象がありません";
       statusPanel();
     }
+  }
+  const wireEncoder = new TextEncoder();
+  function wireSize(nodes) {
+    return nodes.reduce((size, node) => size + (node.text !== undefined
+      ? wireEncoder.encode(node.text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")).length
+      : wireEncoder.encode(`<${node.tag} id="${node.id}"${node.protected ? ' translate="no"' : ""}></${node.tag}>`).length + wireSize(node.children)), 0);
   }
   function hoverRecord(event) {
     const caret = document.caretPositionFromPoint?.(event.clientX, event.clientY);
@@ -754,7 +834,13 @@
       control.value = value; wrapper.append(control); languages.append(wrapper); return control;
     }
     const source = select("原文", state.source, ["auto", ...languageCodes]);
+    const swap = button("⇄", () => {
+      [source.value, target.value] = [target.value, source.value];
+    });
+    swap.className = "icon"; swap.setAttribute("aria-label", "言語を入れ替える"); swap.title = "言語を入れ替える";
+    languages.append(swap);
     const target = select("訳文", state.target, languageCodes);
+    source.addEventListener("change", () => { swap.disabled = busy || source.value === "auto"; });
     const original = document.createElement("details"); const summary = document.createElement("summary"); summary.textContent = "原文";
     const originalText = document.createElement("p"); originalText.dir = "auto"; originalText.textContent = text; original.append(summary, originalText);
     const result = document.createElement("p"); result.className = "result"; result.dir = "auto"; result.setAttribute("aria-live", "polite");
@@ -765,13 +851,14 @@
     const cancel = () => {
       request++; busy = false; progressListeners.delete(requestId); clearInterval(elapsedTimer);
       copy.disabled = true;
+      result.setAttribute("aria-live", "polite"); result.setAttribute("aria-busy", "false");
       browser.runtime.sendMessage({ type: "cancel" }).catch(() => {});
     };
     selectionCleanup = () => { cancel(); if (previousFocus?.isConnected) previousFocus.focus({ preventScroll: true }); };
     const action = button("停止", () => {
       if (busy) {
         cancel(); progress.node.hidden = true; result.hidden = false; result.textContent = "停止しました";
-        action.textContent = "再翻訳"; source.disabled = false; target.disabled = false;
+        action.textContent = "再翻訳"; source.disabled = false; target.disabled = false; swap.disabled = source.value === "auto";
       } else run();
     }); action.className = "primary";
     const run = async () => {
@@ -779,17 +866,21 @@
       requestId = `selection-${++requestSequence}`;
       const currentId = requestId;
       const startedAt = Date.now();
-      busy = true; source.disabled = true; target.disabled = true;
+      busy = true; source.disabled = true; target.disabled = true; swap.disabled = true;
       state.source = source.value; state.target = target.value;
       copy.disabled = true; copy.textContent = "コピー";
       originalText.lang = source.value === "auto" ? "" : source.value; result.lang = target.value;
-      result.hidden = true; result.classList.remove("error"); progress.node.hidden = false;
+      result.hidden = true; result.textContent = ""; result.classList.remove("error"); result.setAttribute("aria-live", "off"); result.setAttribute("aria-busy", "true"); progress.node.hidden = false;
       progress.bar.value = 0; progress.percent.textContent = "0%"; progress.count.textContent = "";
+      progress.label.textContent = "翻訳中";
       progress.elapsed.textContent = "0秒"; action.textContent = "停止";
       elapsedTimer = setInterval(() => { progress.elapsed.textContent = `${Math.floor((Date.now() - startedAt) / 1000)}秒`; }, 1000);
       progressListeners.set(currentId, value => {
+        if (id !== request || !node.isConnected) return;
         const percent = Math.min(100, Math.floor(value.completed / Math.max(1, value.total) * 100));
         progress.bar.value = percent; progress.percent.textContent = `${percent}%`;
+        if (value.phase === "receiving") progress.label.textContent = `訳文を受信中${value.receivedCharacters ? ` · ${value.receivedCharacters}文字` : ""}`;
+        if (typeof value.preview === "string") { result.textContent = value.preview; result.hidden = false; }
       });
       try {
         const response = await browser.runtime.sendMessage({ type: "translate", protocol: PROTOCOL, requestId: currentId, parts: [text], source: source.value, target: target.value });
@@ -801,8 +892,9 @@
       finally {
         progressListeners.delete(currentId);
         if (id === request) {
+          result.setAttribute("aria-live", "polite"); result.setAttribute("aria-busy", "false");
           clearInterval(elapsedTimer); busy = false; progress.node.hidden = true; result.hidden = false;
-          action.textContent = "再翻訳"; source.disabled = false; target.disabled = false;
+          action.textContent = "再翻訳"; source.disabled = false; target.disabled = false; swap.disabled = source.value === "auto";
           if (visibleAnchor) positionNear(node, visibleAnchor);
         }
       }

@@ -37,8 +37,8 @@ function render(state) {
   $("progress-pending").style.left = `${percent}%`; $("progress-pending").style.width = `${state.activePercent || 0}%`;
   $("progress-activity").hidden = !state.running || state.preparing;
   $("work").textContent = `処理中 ${state.active || 0}段落 · 未着手 ${state.pending || 0}段落`;
-  const phase = { preparing: "翻訳を準備中", queued: "順番待ち", tokenizing: "入力を計測中", translating: "応答待ち" }[state.phase] || "";
-  $("phase").textContent = phase ? `${phase} ${Math.floor((Date.now() - state.phaseStartedAt) / 1000)}秒` : "";
+  const phase = { preparing: "翻訳を準備中", queued: "順番待ち", tokenizing: "入力を計測中", translating: "応答待ち", retrying: "再試行まで待機", receiving: "訳文を受信中" }[state.phase] || "";
+  $("phase").textContent = phase ? `${phase}${state.phase === "receiving" && state.receivedCharacters ? ` · ${state.receivedCharacters}文字` : ""} ${Math.floor((Date.now() - state.phaseStartedAt) / 1000)}秒` : "";
   $("counts").textContent = `${state.done} / ${state.total} 段落`;
   $("elapsed").textContent = state.startedAt ? `${Math.floor(((state.finishedAt || Date.now()) - state.startedAt) / 1000)}秒` : "";
   $("hover").checked = state.hoverEnabled !== false;
@@ -80,6 +80,10 @@ for (const id of ["source", "target"]) $(id).addEventListener("change", async ()
   try { await page("configure"); await refresh(); } catch (e) { error(e); }
 });
 $("options").addEventListener("click", () => browser.runtime.openOptionsPage());
+$("history").addEventListener("click", async () => {
+  try { await browser.tabs.create({ url: browser.runtime.getURL("history.html") }); window.close(); }
+  catch (e) { error(e); }
+});
 $("swap").addEventListener("click", async () => {
   [$("source").value, $("target").value] = [$("target").value, $("source").value];
   try { await page("configure"); await refresh(); } catch (e) { error(e); }

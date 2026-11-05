@@ -3,37 +3,42 @@ const assert = require("node:assert/strict");
 const vm = require("node:vm");
 const { readFileSync } = require("node:fs");
 function background(responder, settings = {}) {
-  let listener, commandListener, settingsChanged, active = 0, maximum = 0;
+  let listener, commandListener, settingsChanged, active = 0, maximum = 0, reads = 0;
   let now = Date.now();
   const calls = [];
   const progress = [];
   const clipboard = [];
   const event = { addListener() {} };
   const context = vm.createContext({
-    URL, TextEncoder, AbortController, DOMException, setTimeout, clearTimeout, setInterval() {}, Date: class extends Date { static now() { return now; } }, DOMParser: new (require("jsdom").JSDOM)("").window.DOMParser,
+    URL, TextEncoder, TextDecoder, AbortController, DOMException, setTimeout, clearTimeout, setInterval() {}, Date: class extends Date { static now() { return now; } }, DOMParser: new (require("jsdom").JSDOM)("").window.DOMParser,
     navigator: { clipboard: { writeText: async text => clipboard.push(text) } },
     browser: {
-      runtime: { id: "test", onMessage: { addListener: fn => listener = fn } },
-      storage: { local: { get: async () => ({ settings }) }, onChanged: { addListener: fn => settingsChanged = fn } },
-      tabs: { onRemoved: event, onUpdated: event, query: async () => [], sendMessage: async (_tab, message) => { progress.push(message); return { protocol: 3 }; } },
+      runtime: { id: "test", getURL: path => `moz-extension://test/${path}`, onMessage: { addListener: fn => listener = fn } },
+      storage: { local: { get: async () => { reads++; return { settings }; } }, onChanged: { addListener: fn => settingsChanged = fn } },
+      tabs: { onRemoved: event, onUpdated: event, query: async () => [], sendMessage: async (_tab, message) => { progress.push(message); return { protocol: 4 }; } },
       commands: { onCommand: { addListener: fn => commandListener = fn } }, contextMenus: { create() {}, onClicked: event }
     },
     fetch: async (url, options) => {
       active++; maximum = Math.max(maximum, active);
       const call = { url, options, body: JSON.parse(options.body) }; calls.push(call);
-      try { return { ok: true, json: async () => await responder(call) }; }
+      try {
+        const result = await responder(call);
+        if (result instanceof Response) return result;
+        return { ok: !result.httpStatus, status: result.httpStatus, headers: { get: () => result.retryAfter }, json: async () => result };
+      }
       finally { active--; }
     }
   });
   for (const file of ["core.js", "background.js"]) vm.runInContext(readFileSync(require.resolve(`../extension/${file}`), "utf8"), context);
   return {
-    calls, progress, clipboard, max: () => maximum,
+    calls, progress, clipboard, max: () => maximum, reads: () => reads,
     command: (name, tab = { id: 1, url: "https://example.org" }) => commandListener(name, tab),
     content: message => listener(message, { id: "test", tab: { id: 1 }, frameId: 0, url: "http://example.org" }),
     tick: milliseconds => now += milliseconds,
     configure: values => { settings = { ...settings, ...values }; settingsChanged({ settings: { newValue: settings } }, "local"); },
     control: message => listener(message, { id: "test" }),
-    send: (parts, overrides = {}, tabId = 1, sender = {}) => listener({ type: "translate", protocol: 3, parts, source: "en", target: "ja", ...overrides }, { id: "test", tab: { id: tabId }, frameId: 0, url: "https://example.org/private?q=secret", ...sender })
+    extension: message => listener(message, { id: "test", tab: { id: 20 }, url: "moz-extension://test/options.html" }),
+    send: (parts, overrides = {}, tabId = 1, sender = {}) => listener({ type: "translate", protocol: 4, parts, source: "en", target: "ja", ...overrides }, { id: "test", tab: { id: tabId }, frameId: 0, url: "https://example.org/private?q=secret", ...sender })
   };
 }
 const completion = text => ({ choices: [{ message: { content: text }, finish_reason: "stop" }] });
@@ -123,7 +128,7 @@ const batchDocuments = [
 test("batch markers map reordered results back with paragraph-local link IDs and accurate progress", async () => {
   const b = background(({ body }) => {
     assert.ok(body.context.includes("multiple independent paragraphs"));
-    return completion('<kotoba-item id="b1">二番目&copy;<a id="k0">リンク</a></kotoba-item>\n<kotoba-item id="b0">最初<a id="k0">リンク</a></kotoba-item>');
+    return completion('<p id="b1">二番目&copy;<a id="k0">リンク</a></p>\n<p id="b0">最初<a id="k0">リンク</a></p>');
   });
   const response = await b.send([], { documents: batchDocuments, requestId: "batch" });
   assert.equal(b.calls.length, 1);
@@ -135,14 +140,14 @@ test("batch markers map reordered results back with paragraph-local link IDs and
 
 test("invalid or truncated batches fall back to whole paragraphs and retain structure errors", async () => {
   for (const bad of [
-    '<kotoba-item id="b0">missing second</kotoba-item>',
-    '<kotoba-item id="b0">duplicate</kotoba-item><kotoba-item id="b0">duplicate</kotoba-item>',
-    '<kotoba-item id="b0">lost link</kotoba-item><kotoba-item id="b1">lost link</kotoba-item>',
+    '<p id="b0">missing second</p>',
+    '<p id="b0">duplicate</p><p id="b0">duplicate</p>',
+    '<p id="b0">lost link</p><p id="b1">lost link</p>',
     'unmarked output', null
   ]) {
     const b = background(({ body }) => {
       const input = body.messages[0].content;
-      if (input.includes("kotoba-item")) return bad === null ? { choices: [{ finish_reason: "length" }] } : completion(bad);
+      if (input.includes('<p id="b')) return bad === null ? { choices: [{ finish_reason: "length" }] } : completion(bad);
       assert.ok(input.includes('<a id="k0">link</a>'));
       return completion(input.includes("First") ? input.replace("First", "最初") : "broken structure");
     });
@@ -163,7 +168,7 @@ test("batch packing includes marker overhead in the token budget and disabling s
     }, { inputTokens: 128, batchTranslation });
     const result = await b.send([], { documents });
     assert.equal(result.documents.length, 5);
-    assert.equal(b.calls.length, batchTranslation ? 3 : 5);
+    assert.equal(b.calls.length, batchTranslation ? 2 : 5);
   }
 });
 
@@ -235,7 +240,7 @@ test("packed responses deliver validated paragraphs before later API calls finis
   for (let i = 0; i < 100 && !release; i++) await new Promise(resolve => setImmediate(resolve));
   assert.ok(release); assert.equal(settled, false);
   const early = b.progress.flatMap(message => message.results || []);
-  assert.deepEqual(early.map(result => result.index), [0, 1]);
+  assert.deepEqual(early.map(result => result.index), [0, 1, 2, 3]);
   assert.equal(early[0].document[0].text, "Paragraph 0.");
   release(); const result = await pending;
   assert.equal(result.documents.length, 5);
@@ -276,4 +281,182 @@ test("page and selection requests use the sender domain dictionary and edits inv
   await b.send(["File"]);
   assert.equal(b.calls[3].body.glossary, undefined);
   assert.equal(b.calls[3].body.use_glossary, false);
+});
+
+test("settings reads are shared across requests and invalidated by edits; token counts stay job-local", async () => {
+  const b = background(({ url, body }) => url.endsWith('/tokenize') ? { count: body.content.length } : completion('訳文'), { tokenizer: 'llama', cacheMinutes: 0 });
+  const document = [{ text: 'Repeated sentence.' }];
+  await Promise.all([b.control({ type: 'preferences' }), b.control({ type: 'preferences' })]);
+  await b.send([], { document });
+  assert.equal(b.reads(), 1);
+  assert.equal(b.calls.filter(call => call.url.endsWith('/tokenize')).length, 1);
+  await b.send([], { document });
+  assert.equal(b.calls.filter(call => call.url.endsWith('/tokenize')).length, 2);
+  b.configure({ model: 'updated-model' });
+  await b.send(['New sentence.']);
+  assert.equal(b.reads(), 2);
+  assert.equal(b.calls.at(-1).body.model, 'updated-model');
+});
+
+test("optional retry is bounded, respects HTTP status and keeps the queue free during backoff", async () => {
+  for (const [retryTransient, httpStatus, expected] of [[false, 503, 1], [true, 401, 1], [true, 503, 3]]) {
+    const b = background(() => ({ httpStatus, retryAfter: '0' }), { retryTransient });
+    assert.ok((await b.send(['Hello.'])).error);
+    assert.equal(b.calls.length, expected);
+  }
+  let first = true;
+  const b = background(({ body }) => {
+    if (body.messages[0].content === 'First' && first) { first = false; return { httpStatus: 429, retryAfter: '0.05' }; }
+    return completion('訳文');
+  }, { retryTransient: true });
+  const pending = b.send(['First'], { requestId: 'retry' });
+  for (let i = 0; i < 20 && !b.progress.some(p => p.phase === 'retrying'); i++) await new Promise(setImmediate);
+  assert.ok(b.progress.some(p => p.phase === 'retrying'));
+  const second = await b.send(['Second'], {}, 2);
+  assert.equal(second.parts[0], '訳文');
+  assert.equal((await pending).parts[0], '訳文');
+  assert.deepEqual(b.calls.map(call => call.body.messages[0].content), ['First', 'Second', 'First']);
+  assert.equal(b.max(), 1);
+});
+
+test("Stop interrupts retry backoff without another request and connection probes never save settings", async () => {
+  const b = background(() => ({ httpStatus: 503, retryAfter: '10' }), { retryTransient: true });
+  const pending = b.send(['Hello.'], { requestId: 'cancel-retry' });
+  for (let i = 0; i < 20 && !b.progress.some(p => p.phase === 'retrying'); i++) await new Promise(setImmediate);
+  assert.ok(b.progress.some(p => p.phase === 'retrying'));
+  await b.content({ type: 'cancel' });
+  assert.ok((await pending).error);
+  assert.equal(b.calls.length, 1);
+  const probe = background(() => completion('訳文'), { model: 'saved-model' });
+  assert.ok((await probe.content({ type: 'testConnection', settings: {} })).error);
+  const result = await probe.extension({ type: 'testConnection', settings: { model: 'unsaved-model', apiKey: 'probe-key' } });
+  assert.equal(result.milliseconds, 0);
+  assert.equal(probe.calls[0].body.model, 'unsaved-model');
+  assert.equal(probe.calls[0].options.headers.Authorization, 'Bearer probe-key');
+  await probe.send(['Hello.']);
+  assert.equal(probe.calls.at(-1).body.model, 'saved-model');
+});
+
+test('cache history groups a page run, measures API speed, and shrinks with live cache entries', async () => {
+  const b = background(() => {
+    b.tick(200);
+    return { ...completion('訳文'), usage: { completion_tokens: 10 } };
+  }, { cacheMinutes: 1, apiKey: 'never-expose-me' });
+  const first = [{ text: 'First paragraph.' }], second = [{ text: 'Second paragraph.' }];
+  await b.send([], { document: first, sessionId: 'one-page' });
+  await b.send([], { document: second, sessionId: 'one-page' });
+  let data = await b.extension({ type: 'cacheHistory' });
+  assert.equal(data.rows.length, 1);
+  assert.equal(data.rows[0].paragraphs, 2);
+  assert.equal(data.rows[0].characters, 33);
+  assert.equal(data.rows[0].milliseconds, 400);
+  assert.equal(data.rows[0].outputTokens, 20);
+  assert.equal(data.rows[0].tokensPerSecond, 50);
+  assert.equal(data.rows[0].requests, 2);
+  assert.ok(!JSON.stringify(data).includes('never-expose-me'));
+  assert.ok(!JSON.stringify(data).includes('First paragraph.'));
+  assert.ok((await b.content({ type: 'cacheHistory' })).error);
+  await b.send([], { document: first, sessionId: 'cache-hit' });
+  assert.equal((await b.control({ type: 'cacheHistory' })).rows.length, 1);
+  assert.equal(b.calls.length, 2);
+  b.tick(59801);
+  data = await b.control({ type: 'cacheHistory' });
+  assert.equal(data.rows[0].paragraphs, 1);
+  assert.equal(data.rows[0].characters, 17);
+  b.tick(200);
+  assert.equal((await b.control({ type: 'cacheHistory' })).rows.length, 0);
+});
+
+test('history excludes private, selection, disabled and failed translations and clears with the cache', async () => {
+  const b = background(() => completion('訳文'));
+  await b.send(['Selection']);
+  await b.send([], { document: [{ text: 'Private paragraph.' }] }, 1, { tab: { id: 1, incognito: true } });
+  assert.equal((await b.control({ type: 'cacheHistory' })).rows.length, 0);
+  await b.send([], { document: [{ text: 'Public paragraph.' }] });
+  let data = await b.control({ type: 'cacheHistory' });
+  assert.equal(data.rows.length, 1);
+  assert.equal(data.rows[0].tokensPerSecond, null);
+  assert.equal(data.rows[0].outputTokens, null);
+  b.configure({ cacheMinutes: 0 });
+  await b.send([], { document: [{ text: 'Uncached paragraph.' }] });
+  assert.equal((await b.control({ type: 'cacheHistory' })).rows.length, 0);
+  const failed = background(() => completion('broken links'));
+  await failed.send([], { document: batchDocuments[0] });
+  assert.equal((await failed.control({ type: 'cacheHistory' })).rows.length, 0);
+  await b.control({ type: 'clearCache' });
+  assert.equal((await b.control({ type: 'cacheHistory' })).bytes, 0);
+});
+
+function sseResponse(text, onRead = () => {}) {
+  const bytes = new TextEncoder().encode(text);
+  let offset = 0;
+  return new Response(new ReadableStream({ pull(controller) {
+    if (offset >= bytes.length) { controller.close(); return; }
+    onRead(); controller.enqueue(bytes.slice(offset, offset += 7));
+  } }), { headers: { 'Content-Type': 'text/event-stream' } });
+}
+const sse = value => `data: ${JSON.stringify(value)}\r\n\r\n`;
+
+test('streaming handles split UTF-8 and SSE lines, obtains trailing usage, and verifies complete inline structure', async () => {
+  const document = [{ text: 'Read ' }, { tag: 'a', id: 'k0', children: [{ text: 'docs' }] }];
+  const b = background(() => sseResponse(': ping\r\n\r\n' +
+    sse({ choices: [{ index: 0, delta: { content: '資料を<a id="' } }] }) +
+    sse({ choices: [{ index: 0, delta: { content: 'k0">読む</a>' }, finish_reason: 'stop' }] }) +
+    sse({ choices: [], usage: { completion_tokens: 42 } }) + 'data: [DONE]\r\n\r\n', () => b.tick(20)), { streamTranslation: true });
+  const result = await b.send([], { document, requestId: 'stream' });
+  assert.equal(result.document[0].text, '資料を');
+  assert.equal(result.document[1].children[0].text, '読む');
+  assert.equal(b.calls[0].body.stream, true);
+  assert.equal(b.calls[0].body.stream_options.include_usage, true);
+  assert.ok(b.progress.some(p => p.phase === 'receiving'));
+  const h = (await b.extension({ type: 'cacheHistory' })).rows[0];
+  assert.equal(h.outputTokens, 42); assert.ok(h.firstTokenMilliseconds >= 0);
+});
+
+test('server generation speed is distinct from whole API speed and broken streams never enter the cache', async () => {
+  const b = background(() => { b.tick(2000); return { ...completion('訳文'), usage: { completion_tokens: 120 }, timings: { predicted_n: 120, predicted_ms: 1000 } }; });
+  await b.send([], { document: [{ text: 'A sentence.' }] });
+  const row = (await b.extension({ type: 'cacheHistory' })).rows[0];
+  assert.equal(row.tokensPerSecond, 60); assert.equal(row.generationTokensPerSecond, 120); assert.equal(row.generationSpeedSource, 'server');
+  for (const stream of [sse({ choices: [{ delta: { content: 'unfinished' } }] }), 'data: invalid\n\ndata: [DONE]\n\n']) {
+    const bad = background(() => sseResponse(stream), { streamTranslation: true });
+    const result = await bad.send([], { document: [{ text: 'Original sentence.' }] });
+    assert.ok(result.error); assert.equal((await bad.extension({ type: 'cacheHistory' })).rows.length, 0);
+  }
+});
+
+test('selection streams preview as text and Stop aborts a live stream without caching it', async () => {
+  let streamingController;
+  const b = background(({ options }) => new Response(new ReadableStream({ start(controller) {
+    streamingController = controller;
+    controller.enqueue(new TextEncoder().encode(sse({ choices: [{ delta: { content: 'Partial <img src=x>' } }] })));
+    options.signal.addEventListener('abort', () => controller.error(new DOMException('cancelled', 'AbortError')), { once: true });
+  } }), { headers: { 'Content-Type': 'text/event-stream' } }), { streamTranslation: true });
+  const pending = b.send(['Original selection.'], { requestId: 'preview' });
+  for (let i = 0; i < 20 && !b.progress.some(p => p.preview); i++) await new Promise(setImmediate);
+  assert.ok(streamingController);
+  assert.equal(b.progress.find(p => p.preview).preview, 'Partial <img src=x>');
+  await b.content({ type: 'cancel' });
+  assert.match((await pending).error, /キャンセル/);
+  assert.equal((await b.extension({ type: 'cacheHistory' })).rows.length, 0);
+});
+
+test('remote tokenizer measures one fitting semantic batch instead of every growing prefix', async () => {
+  const b = background(({ url, body }) => url.endsWith('/tokenize') ? { count: 100 } : completion(body.messages[0].content), { tokenizer: 'llama' });
+  const documents = Array.from({ length: 64 }, (_, i) => [{ text: `Short paragraph ${i}.` }]);
+  const result = await b.send([], { documents });
+  assert.equal(result.documents.length, 64);
+  assert.equal(b.calls.filter(call => call.url.endsWith('/tokenize')).length, 1);
+  assert.equal(b.calls.filter(call => !call.url.endsWith('/tokenize')).length, 1);
+});
+
+test('stream receive speed is explicitly a reference value when the MLX response has no server timings', async () => {
+  const b = background(() => sseResponse(sse({ choices: [{ delta: { content: 'First fragment. '.repeat(8) } }] }) +
+    sse({ choices: [{ delta: { content: 'Last fragment. '.repeat(8) }, finish_reason: 'stop' }] }) +
+    sse({ choices: [], usage: { completion_tokens: 120 } }) + 'data: [DONE]\n\n', () => b.tick(100)), { streamTranslation: true });
+  await b.send([], { document: [{ text: 'Original paragraph.' }] });
+  const row = (await b.extension({ type: 'cacheHistory' })).rows[0];
+  assert.equal(row.generationSpeedSource, 'stream');
+  assert.ok(row.generationTokensPerSecond > 0);
+  assert.ok(row.firstTokenMilliseconds > 0);
 });

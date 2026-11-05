@@ -127,3 +127,15 @@ test("dictionary merges language and domain overrides into both API formats", ()
     assert.equal(K.contentPreferences(s).dictionary, undefined);
   }
 });
+
+test('extended context budgets reserve output, instructions and glossary instead of blindly filling 32768', () => {
+  const page = { source: 'en', target: 'ja', domain: 'https://example.com' };
+  const s = K.settings({ inputTokens: 24000, contextTokens: 32768 });
+  const budget = K.inputBudget(s, page);
+  assert.ok(budget > 20000 && budget < 24000);
+  assert.ok(budget + K.MAX_TOKENS + 512 < s.contextTokens);
+  const dictionary = [{ domain: '', sourceLang: 'en', targetLang: 'ja', source: 'Term'.repeat(20), target: '訳'.repeat(80) }];
+  assert.ok(K.inputBudget(K.settings({ ...s, dictionary }), page) < budget);
+  assert.throws(() => K.inputBudget(K.settings({ contextTokens: 8192 }), page), /コンテキスト長/);
+  assert.throws(() => K.settings({ inputTokens: 24001 }));
+});

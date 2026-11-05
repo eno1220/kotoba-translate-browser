@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="ja">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>翻訳の履歴</title><link rel="stylesheet" href="ui.css"><script src="history.js" defer></script></head>
+<body class="history"><main>
+  <header class="header"><h1>翻訳の履歴</h1><a href="options.html">設定</a></header>
+  <p>現在のキャッシュに残っているページ翻訳です。復元だけの操作・選択翻訳は含みません。</p>
+  <div class="history-actions"><button id="refresh" type="button">更新</button><button id="clear-cache" type="button" disabled>キャッシュと履歴を削除</button><span id="summary" role="status"></span></div>
+  <p id="status" role="status" aria-live="polite">履歴を読み込んでいます…</p>
+  <p id="empty" hidden>キャッシュに残っている翻訳はありません。</p>
+  <div id="results" hidden>
+    <div class="history-table" tabindex="0" role="region" aria-label="翻訳履歴の一覧" aria-describedby="history-help">
+      <table>
+        <caption class="sr-only">キャッシュに残っている翻訳（新しい順）</caption>
+        <thead><tr><th scope="col">翻訳開始</th><th scope="col">サイト・言語</th><th scope="col">残存段落</th><th scope="col">原文文字数</th><th scope="col">処理時間</th><th scope="col">API回数</th><th scope="col">出力トークン</th><th scope="col">API tok/s</th><th scope="col">生成 tok/s</th><th scope="col">初回受信</th></tr></thead>
+        <tbody id="entries"></tbody>
+      </table>
+    </div>
+  </div>
+  <p id="history-help"><small>段落数・文字数はキャッシュの残存範囲、時間・API回数・速度は元の処理全体の記録です。API tok/sは入力処理・初回応答待ちを含む通信全体の速度です。生成 tok/sはサーバーの計測値を優先し、ない場合はストリームの最初〜最後の受信時間から計算した参考値を表示します（32トークン・1秒以上のサンプル）。参考値は通信のまとめ方にも影響され、モデル内部の実測ではありません。初回受信は送信〜最初の訳文までの平均です。取得できない値は「—」です。</small></p>
+  <p><small>履歴は本文と同じくメモリ内だけに保持し、キャッシュの期限切れ・削除・設定の保存・Firefox終了で消えます。表示中は5秒ごとに更新します。</small></p>
+</main></body></html>

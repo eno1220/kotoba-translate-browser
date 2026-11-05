@@ -4,7 +4,7 @@ const http = require("node:http");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const os = require("node:os");
-const { spawn } = require("node:child_process");
+const { spawn, execFileSync } = require("node:child_process");
 const assert = require("node:assert/strict");
 const parserWindow = new (require("jsdom").JSDOM)("").window;
 
@@ -14,12 +14,19 @@ const parserWindow = new (require("jsdom").JSDOM)("").window;
   const result = new Promise(resolve => resolveResult = resolve);
   const requests = [];
   const events = [];
+  let articleHTML;
+  if (process.env.KOTOBA_HTML_FIXTURE) {
+    const doc = new parserWindow.DOMParser().parseFromString(await fs.readFile(process.env.KOTOBA_HTML_FIXTURE, "utf8"), "text/html");
+    doc.querySelectorAll("script,link,iframe,img,video,audio,source,object,embed,base").forEach(node => node.remove());
+    articleHTML = doc.documentElement.outerHTML;
+  }
   let active = 0, maximum = 0;
   const server = http.createServer(async (req, res) => {
     if (req.url === "/request-count") { res.end(JSON.stringify(requests.length)); return; }
     if (req.url === "/away") { res.setHeader("Content-Type", "text/html"); res.end('<!doctype html><title>Linked page</title><p>Another page.</p>'); return; }
     if (req.url === "/fixture") {
       res.setHeader("Content-Type", "text/html; charset=utf-8");
+      if (articleHTML) { res.end(articleHTML); return; }
       res.end(`<!doctype html><html lang="en"><title>Kotoba smoke</title><body>
         <h1>Translation example</h1><p id="paragraph">Read <a id="link" href="/docs">the documentation</a> carefully.</p>
         <pre id="code">const code = 123;</pre><p translate="no" id="skip">Keep this brand</p>
@@ -59,15 +66,34 @@ const parserWindow = new (require("jsdom").JSDOM)("").window;
     }
     if (input.includes("earlier posts") && input.includes("assembly on Linux x86_64")) content = '以前の<a id="k2"><u id="k3">Linux x86_64のアセンブリ言語</u></a>に関する<a id="k0"><u id="k1">投稿</u></a>を読んだ方は、私が低レベルプログラミングに関心を持っていることをご存じでしょう。';
     if (input.includes("Potentially unsafe")) content = '<img src=x onerror="window.compromised=true">';
-    await new Promise(r => setTimeout(r, 40));
-    res.setHeader("Content-Type", "application/json");
-    res.end(JSON.stringify({ choices: [{ message: { content }, finish_reason: "stop" }] }));
+    await new Promise(r => setTimeout(r, articleHTML ? 4 : 40));
+    if (body.stream) {
+      res.setHeader("Content-Type", "text/event-stream");
+      const points = Array.from(content);
+      for (let i = 0; i < points.length; i += 32) {
+        res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: points.slice(i, i + 32).join("") }, finish_reason: null }] })}\n\n`);
+        await new Promise(resolve => setTimeout(resolve, 2));
+      }
+      res.end(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\ndata: ${JSON.stringify({ choices: [], usage: { completion_tokens: 42 } })}\n\ndata: [DONE]\n\n`);
+    } else {
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ choices: [{ message: { content }, finish_reason: "stop" }], usage: { completion_tokens: 42 } }));
+    }
     active--;
   });
-  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => { server.removeListener("error", reject); resolve(); });
+  });
   const port = server.address().port;
   const source = path.join(directory, "extension");
   await fs.cp(path.resolve("extension"), source, { recursive: true });
+  if (process.env.KOTOBA_BASELINE) {
+    const core = await fs.readFile(path.join(source, "core.js"), "utf8");
+    const protocol = core.match(/const CONTENT_PROTOCOL = (\d+);/)[1];
+    const previous = execFileSync("git", ["show", `${process.env.KOTOBA_BASELINE_REF || "HEAD"}:extension/content.js`], { encoding: "utf8" });
+    await fs.writeFile(path.join(source, "content.js"), previous.replace(/const PROTOCOL = \d+;/, `const PROTOCOL = ${protocol};`));
+  }
   if (process.env.KOTOBA_PAGE_URL) {
     const file = path.join(source, "background.js");
     const value = await fs.readFile(file, "utf8");
@@ -95,7 +121,18 @@ const parserWindow = new (require("jsdom").JSDOM)("").window;
       const check = (value, message) => { if (!value) throw new Error(message); };
       const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
       try {
-        await browser.storage.local.set({ settings: { ...Kotoba.DEFAULTS, port: '${port}', apiKey: 'smoke-key', inputTokens: ${process.env.KOTOBA_PAGE_URL ? 3000 : 400} } });
+        await browser.storage.local.set({ settings: { ...Kotoba.DEFAULTS, port: '${port}', apiKey: 'smoke-key', responsiveScan:${!process.env.KOTOBA_HTML_FIXTURE}, streamTranslation:${!!process.env.KOTOBA_STREAM}, inputTokens: ${process.env.KOTOBA_HTML_FIXTURE ? process.env.KOTOBA_BASELINE ? 3000 : 6000 : process.env.KOTOBA_PAGE_URL ? 3000 : 400} } });
+        ${process.env.KOTOBA_HTML_FIXTURE ? `
+        const articleTab = await browser.tabs.create({url:base+'/fixture',active:true});
+        for(let i=0;i<100;i++) { if((await browser.tabs.get(articleTab.id)).status === 'complete') break; await wait(50); }
+        await ensureContent(articleTab.id);
+        await browser.tabs.sendMessage(articleTab.id,{type:'start',source:'ja',target:'en'});
+        let articleState;
+        for(let i=0;i<1000;i++) { articleState=await browser.tabs.sendMessage(articleTab.id,{type:'status'}); if(!articleState.running) break; await wait(30); }
+        check(!articleState.running && articleState.total > 0 && !articleState.failed,JSON.stringify(articleState));
+        ${process.env.KOTOBA_BASELINE ? '' : `check(articleState.total < 200, 'closed tables entered translation');
+        check(!(await browser.tabs.executeScript(articleTab.id,{code:'[...document.querySelectorAll("details:not([open]) td")].some(el=>el.textContent.startsWith("訳:"))'}))[0], 'closed table text changed');`}
+        await fetch(base+'/result',{method:'POST',body:JSON.stringify({ok:true,articleFixture:true,state:articleState})}); return;` : ''}
         ${process.env.KOTOBA_PAGE_URL ? `
         browser.tabs.onUpdated.addListener((tabId,change) => { if(change.status || change.url) fetch(base+'/event',{method:'POST',body:JSON.stringify({kind:'tab',tabId,change})}).catch(()=>{}); });
         const realTab = await browser.tabs.create({url:${JSON.stringify(process.env.KOTOBA_PAGE_URL)},active:true});
@@ -113,7 +150,7 @@ const parserWindow = new (require("jsdom").JSDOM)("").window;
         let dictionaryView;
         for(let i=0;i<100;i++) {
           dictionaryView = browser.extension.getViews().find(view => view.location.pathname === '/dictionary.html');
-          if(dictionaryView && !dictionaryView.document.querySelector('#save').disabled) break;
+          if(dictionaryView?.document.querySelector('#save')?.disabled === false) break;
           await wait(50);
         }
         check(dictionaryView?.document.querySelector('#scope').value === '127.0.0.1', 'dictionary did not select the current domain');
@@ -176,6 +213,18 @@ const parserWindow = new (require("jsdom").JSDOM)("").window;
         for (let i=0; i<300; i++) { state = await send({type:'status'}); if (!state.running) break; await wait(100); }
         check(state.done === state.total && state.failed === 0 && state.translated > 0, JSON.stringify(state));
         check(state.percent === 100, 'progress did not reach 100%');
+        const history = await handle({type:'cacheHistory'}, {id:browser.runtime.id});
+        check(history.rows.length === 1 && history.rows[0].paragraphs > 0 && history.rows[0].paragraphs <= state.total && history.rows[0].characters > 0, 'history did not group cached page paragraphs: '+JSON.stringify(history));
+        check(history.rows[0].outputTokens > 0 && history.rows[0].tokensPerSecond > 0 && history.rows[0].milliseconds > 0, 'history metrics missing');
+        const historyTab = await browser.tabs.create({url:browser.runtime.getURL('history.html'),active:true});
+        await wait(150);
+        const historyView = browser.extension.getViews().find(view => view.location.pathname === '/history.html');
+        for (let i=0; i<20 && !historyView.document.querySelectorAll('#entries tr').length; i++) await wait(50);
+        check(historyView.document.querySelectorAll('#entries tr').length === 1, 'history page did not render: '+historyView.document.querySelector('#status')?.textContent);
+        await fetch(base + '/screenshot', {method:'POST',body:JSON.stringify({name:'history',image:await browser.tabs.captureTab(historyTab.id,{format:'png'})})});
+        check(historyView.document.documentElement.scrollWidth <= historyView.innerWidth, 'history overflows the viewport');
+        await fetch(base + '/screenshot', {method:'POST',body:JSON.stringify({name:'history-narrow',image:await browser.tabs.captureTab(historyTab.id,{format:'png'})})});
+        await browser.tabs.remove(historyTab.id); await browser.tabs.update(tab.id,{active:true});
         const data = await inspect(\`(() => {
           document.querySelector('#link').click();
           return { paragraph:document.querySelector('#paragraph').textContent, href:document.querySelector('#link').getAttribute('href'), clicks:window.testClicks,
@@ -211,7 +260,13 @@ const parserWindow = new (require("jsdom").JSDOM)("").window;
         const options = await browser.tabs.create({url:browser.runtime.getURL('options.html'),active:true});
         await wait(200);
         await fetch(base + '/screenshot', {method:'POST',body:JSON.stringify({name:'options',image:await browser.tabs.captureTab(options.id,{format:'png'})})});
-        const optionsForm = browser.extension.getViews().find(view => view.location.pathname === "/options.html").document.querySelector("#settings");
+        const optionsView = browser.extension.getViews().find(view => view.location.pathname === "/options.html");
+        const optionsForm = optionsView.document.querySelector("#settings");
+        optionsView.document.querySelector('#test-connection').click();
+        for (let i=0; i<30 && !optionsView.document.querySelector('#connection-status').textContent.includes('接続できました'); i++) await wait(50);
+        check(optionsView.document.querySelector('#connection-status').textContent.includes('接続できました'), 'settings connection probe failed');
+        check(optionsView.document.documentElement.scrollWidth <= optionsView.innerWidth, 'settings overflow the viewport');
+        await fetch(base + '/screenshot', {method:'POST',body:JSON.stringify({name:'options-narrow',image:await browser.tabs.captureTab(options.id,{format:'png'})})});
         for (const key of ['responsiveScan','pageProgress','announceProgress','copyButton','focusOriginal']) optionsForm.elements.namedItem(key).checked = false;
         optionsForm.elements.namedItem('selectionButton').checked = true;
         optionsForm.requestSubmit();
@@ -220,10 +275,12 @@ const parserWindow = new (require("jsdom").JSDOM)("").window;
         check(saved.batchTranslation === false, 'options reset batch setting');
         check(saved.selectionButton === true && ['responsiveScan','pageProgress','announceProgress','copyButton','focusOriginal'].every(key => saved[key] === false), 'options did not save boolean switches');
         await browser.tabs.remove(options.id);
-        await inspect('document.querySelector("[data-kotoba-ui]").shadowRoot.querySelector(".panel [aria-label=閉じる]")?.click(); const quickRange = document.createRange(); quickRange.selectNodeContents(document.querySelector("#paragraph")); getSelection().removeAllRanges(); getSelection().addRange(quickRange); document.dispatchEvent(new Event("selectionchange"));');
-        await wait(300);
+        await browser.tabs.update(tab.id, {active:true});
+        await wait(100);
+        await inspect('document.querySelector("[data-kotoba-ui]").shadowRoot.querySelector(".panel [aria-label=閉じる]")?.click(); const quickRange = document.createRange(); quickRange.selectNodeContents(document.querySelector("#paragraph")); document.dispatchEvent(new PointerEvent("pointerdown",{bubbles:true})); getSelection().removeAllRanges(); getSelection().addRange(quickRange); document.dispatchEvent(new Event("selectionchange")); document.dispatchEvent(new PointerEvent("pointerup",{bubbles:true}));');
+        for (let i=0;i<100;i++) { if(await inspect('!!document.querySelector("[data-kotoba-ui]").shadowRoot.querySelector(".launcher")')) break; await wait(50); }
         const beforeQuick = await (await fetch(base+'/request-count')).json();
-        check(await inspect('!!document.querySelector("[data-kotoba-ui]").shadowRoot.querySelector(".launcher")'), 'selection launcher missing');
+        check(await inspect('!!document.querySelector("[data-kotoba-ui]").shadowRoot.querySelector(".launcher")'), 'selection launcher missing: '+JSON.stringify(await inspect('({focus:document.hasFocus(),selection:getSelection().toString(),top:document.querySelector("#paragraph").getBoundingClientRect().top})')));
         await inspect('document.querySelector("[data-kotoba-ui]").shadowRoot.querySelector(".launcher").click()');
         for(let i=0;i<100;i++) { if(await inspect('!!document.querySelector("[data-kotoba-ui]").shadowRoot.querySelector(".result")?.textContent')) break; await wait(50); }
         check((await (await fetch(base+'/request-count')).json()) > beforeQuick && await inspect('document.querySelector("[data-kotoba-ui]").shadowRoot.querySelector(".result").textContent.startsWith("訳:")'), 'selection launcher did not translate on click');
@@ -270,6 +327,11 @@ const parserWindow = new (require("jsdom").JSDOM)("").window;
     const response = await Promise.race([result, new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error("Firefox smoke timed out\n" + logs)), 45000); })]);
     assert.ok(response.ok, response.error + (process.env.KOTOBA_PAGE_URL ? JSON.stringify(response.events) : ""));
     assert.equal(maximum, 1);
+    if (response.articleFixture) {
+      if (!process.env.KOTOBA_BASELINE) assert.ok(requests.length < 40);
+      console.log(JSON.stringify({ articleFixture: true, baseline: !!process.env.KOTOBA_BASELINE, blocks: response.state.total, requests: requests.length, milliseconds: response.state.finishedAt - response.state.startedAt, characters: requests.reduce((sum, request) => sum + request.body.messages[0].content.length, 0) }));
+      return;
+    }
     if (response.realPage) {
       assert.ok(requests.length > 0);
       assert.ok(requests.every(r => r.body.context.includes(new URL(process.env.KOTOBA_PAGE_URL).origin)));

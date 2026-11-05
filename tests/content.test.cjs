@@ -7,7 +7,7 @@ const textOf = nodes => nodes.map(node => node.text !== undefined ? node.text : 
 const translateTree = nodes => nodes.map(node => node.protected ? node : node.text !== undefined ? { text: node.text.trim() ? `訳:${node.text}` : node.text } : { ...node, children: translateTree(node.children) });
 function setup(html, translator = translateTree, preferences = {}) {
   const dom = new JSDOM(html, { url: "https://example.com/article", runScripts: "outside-only", pretendToBeVisual: true });
-  const w = dom.window;
+  const w = dom.window; w.TextEncoder = TextEncoder;
   w.Range.prototype.getClientRects = () => [{ width: 100, height: 20, left: 0, top: 0, right: 100, bottom: 20 }];
   w.Range.prototype.getBoundingClientRect = function() {
     const node = this.commonAncestorContainer;
@@ -27,7 +27,7 @@ function setup(html, translator = translateTree, preferences = {}) {
   w.browser = { runtime: {
     onMessage: { addListener: fn => listener = fn },
     sendMessage: async msg => {
-      if (msg.type === "contentPreferences") return { concurrency: 1, ...preferences };
+      if (msg.type === "contentPreferences") return { concurrency: 1, prioritizeContent: false, semanticBatching: false, ...preferences };
       if (msg.type === "translate") {
         calls.push(msg);
         if (msg.parts) return { parts: msg.parts.map(text => `訳:${text}`) };
@@ -522,4 +522,136 @@ test("validated batch paragraphs appear before the final response and are never 
   releases.forEach(release => release()); const status = await s.settle();
   assert.equal(status.done, 3); assert.equal(status.failed, 0);
   await s.message({ type: "restore" }); assert.equal(paragraphs[1].textContent, "Second paragraph.");
+});
+
+test('selection language swap waits for an explicit retranslation and leaves page text intact', async () => {
+  const s = setup('<p>Selected prose.</p>');
+  const range = s.w.document.createRange(); range.selectNodeContents(s.w.document.querySelector('p'));
+  s.w.getSelection().addRange(range);
+  await s.message({ type: 'selection', source: 'en', target: 'ja' });
+  await new Promise(setImmediate);
+  const swap = s.shadow.querySelector('[aria-label="言語を入れ替える"]');
+  const selects = s.shadow.querySelectorAll('.languages select');
+  assert.equal(s.calls.length, 1); assert.equal(swap.disabled, false);
+  swap.click();
+  assert.equal(selects[0].value, 'ja'); assert.equal(selects[1].value, 'en');
+  assert.equal(s.calls.length, 1);
+  s.shadow.querySelector('.actions .primary').click(); await new Promise(setImmediate);
+  assert.equal(s.calls[1].source, 'ja'); assert.equal(s.calls[1].target, 'en');
+  assert.equal(s.w.document.querySelector('p').textContent, 'Selected prose.');
+  selects[0].value = 'auto'; selects[0].dispatchEvent(new s.w.Event('change'));
+  assert.equal(swap.disabled, true);
+  s.w.close();
+});
+
+test('closed disclosures translate only their first summary, including direct hidden text, and opened content can be translated later', async () => {
+  const s = setup('<article><p>Article prose.</p><details><summary>Stores <strong>by area</strong></summary>Hidden direct text.<table><tr><td>Hidden city.</td><td>Hidden store.</td></tr></table></details></article>');
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await s.settle();
+  assert.deepEqual(s.calls.map(call => textOf(call.document)), ['Article prose.', 'Stores by area']);
+  assert.equal(s.w.document.querySelector('td').textContent, 'Hidden city.');
+  s.w.document.querySelector('details').open = true;
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await s.settle();
+  assert.ok(s.calls.slice(2).some(call => textOf(call.document) === 'Hidden direct text.'));
+  assert.ok(s.w.document.querySelector('td').textContent.startsWith('訳:'));
+  await s.message({ type: 'restore' });
+  assert.equal(s.w.document.querySelector('td').textContent, 'Hidden city.');
+  s.w.close();
+});
+
+test('semantic scheduling processes article prose, article tables, other text, then menus even when menus are visible', async () => {
+  const html = '<nav><p>Visible menu.</p></nav><p>Other text.</p><article><table><tr><td>Article table.</td></tr></table><p>Offscreen article.</p></article><aside><p>Sidebar.</p></aside>';
+  const s = setup(html, translateTree, { prioritizeContent: true, semanticBatching: true, batchTranslation: true });
+  const originalHTML = s.w.document.body.innerHTML;
+  s.w.document.querySelector('article p').getBoundingClientRect = () => ({ top: 5000, bottom: 5020, left: 0, right: 100 });
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await s.settle();
+  assert.deepEqual(s.calls.flatMap(call => (call.documents || [call.document]).map(textOf)), ['Offscreen article.', 'Article table.', 'Other text.', 'Visible menu.', 'Sidebar.']);
+  await s.message({ type: 'restore' }); assert.equal(s.w.document.body.innerHTML, originalHTML);
+  s.w.close();
+});
+
+test('semantic batches pack adjacent table cells and short paragraphs without mixing page components', async () => {
+  const html = '<nav><p>Menu one.</p><p>Menu two.</p></nav><article><section><h2>Heading.</h2><p>First sentence.</p><p>Second sentence.</p></section><table>' + '<tr><td>City.</td><td>Store.</td></tr>'.repeat(60) + '</table></article>';
+  const s = setup(html, translateTree, { prioritizeContent: true, semanticBatching: true, batchTranslation: true, inputTokens: 6000 });
+  const originalHTML = s.w.document.body.innerHTML;
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await s.settle();
+  assert.equal(s.calls[0].documents.length, 3);
+  const tableCalls = s.calls.filter(call => (call.documents || [call.document]).some(tree => textOf(tree) === 'City.'));
+  assert.equal(tableCalls.length, 2);
+  assert.equal(tableCalls[0].documents.length, 64);
+  assert.ok(tableCalls.every(call => call.documents.every(tree => ['City.', 'Store.'].includes(textOf(tree)))));
+  assert.equal(s.calls.length, 4);
+  await s.message({ type: 'restore' }); assert.equal(s.w.document.body.innerHTML, originalHTML);
+  s.w.close();
+});
+
+test('selection streaming preview is literal text, cannot be copied early, and late updates after close are ignored', async () => {
+  const s = setup('<p>Selected prose.</p>');
+  const originalSend = s.w.browser.runtime.sendMessage;
+  let request, release;
+  s.w.browser.runtime.sendMessage = message => {
+    if (message.type === 'translate' && message.parts) { request = message; return new Promise(resolve => release = resolve); }
+    return originalSend(message);
+  };
+  await s.message({ type: 'selection', text: 'Selected prose.', source: 'en', target: 'ja' }); await new Promise(setImmediate);
+  await s.message({ type: 'translationProgress', requestId: request.requestId, completed: 0, total: 15, phase: 'receiving', preview: '<img src=x> unfinished' });
+  assert.equal(s.shadow.querySelector('.result').textContent, '<img src=x> unfinished');
+  assert.equal(s.shadow.querySelector('img'), null);
+  assert.equal(s.shadow.querySelector('.copy').disabled, true);
+  s.shadow.querySelector('.panel [aria-label="閉じる"]').click();
+  release({ parts: ['Late translation.'] }); await new Promise(setImmediate);
+  assert.equal(s.shadow.querySelector('.panel'), null);
+  assert.equal(s.w.document.querySelector('p').textContent, 'Selected prose.');
+  s.w.close();
+});
+
+test('semantic batches keep multi-cell rows together at the 64-unit boundary', async () => {
+  const s = setup('<article><p>Intro.</p><table>' + '<tr><td>City.</td><td>Store.</td><td>Address.</td></tr>'.repeat(24) + '</table></article>', translateTree,
+    { prioritizeContent: true, semanticBatching: true, batchTranslation: true, inputTokens: 6000 });
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await s.settle();
+  const batches = s.calls.filter(call => call.documents);
+  assert.equal(batches[0].documents.length, 63); assert.equal(batches[1].documents.length, 9);
+  s.w.close();
+});
+
+test('a rejected batch disables further batch attempts for that page run', async () => {
+  const s = setup('<article>' + '<p>Short sentence.</p>'.repeat(10) + '</article>', translateTree,
+    { prioritizeContent: true, semanticBatching: true, batchTranslation: true, inputTokens: 6000 });
+  const send = s.w.browser.runtime.sendMessage;
+  s.w.browser.runtime.sendMessage = async message => {
+    const result = await send(message);
+    return message.type === 'translate' && message.documents ? { ...result, batchFallback: true } : result;
+  };
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await s.settle();
+  assert.equal(s.calls[0].documents.length, 8);
+  assert.ok(s.calls.slice(1).every(call => call.document));
+  s.w.close();
+});
+
+test('posted scan tasks yield to Stop without depending on a background-tab timer', async () => {
+  const s = setup('<p>Paragraph to scan.</p>'.repeat(250));
+  const NativeChannel = require('node:worker_threads').MessageChannel;
+  let yielded = false;
+  s.w.MessageChannel = class {
+    constructor() {
+      const channel = new NativeChannel(); this.port1 = channel.port1; this.port2 = channel.port2;
+      const post = channel.port2.postMessage.bind(channel.port2);
+      channel.port2.postMessage = value => { if (!yielded) { yielded = true; s.message({ type: 'stop' }); } post(value); };
+    }
+  };
+  await s.message({ type: 'start', source: 'en', target: 'ja' });
+  await new Promise(resolve => setTimeout(resolve, 40));
+  assert.equal(yielded, true); assert.equal(s.calls.length, 0);
+  assert.equal((await s.message({ type: 'status' })).running, false);
+  s.w.close();
+});
+
+test('prose and link density prioritize a div-based article without excluding an unlabelled menu', async () => {
+  const article = 'This is a complete article sentence with enough detail to identify its prose. '.repeat(3);
+  const s = setup('<div id="menu"><p><a href="/one">Menu one</a></p><p><a href="/two">Menu two</a></p><p><a href="/three">Menu three</a></p></div><p>Other short label</p><div id="story"><p>' + article + '</p></div>', translateTree,
+    { prioritizeContent: true, semanticBatching: true, batchTranslation: true });
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await s.settle();
+  const texts = s.calls.flatMap(call => (call.documents || [call.document]).map(textOf));
+  assert.equal(texts[0], article); assert.equal(texts[1], 'Other short label');
+  assert.deepEqual(texts.slice(2), ['Menu one', 'Menu two', 'Menu three']);
+  s.w.close();
 });

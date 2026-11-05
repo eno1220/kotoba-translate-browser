@@ -1,28 +1,42 @@
 <!doctype html>
 <html lang="ja">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>翻訳の設定</title><link rel="stylesheet" href="ui.css"><script src="core.js" defer></script><script src="options.js" defer></script></head>
-<body><main>
-  <h1>翻訳の設定</h1>
-  <p><a href="dictionary.html">翻訳辞書を編集</a></p>
-  <form id="settings">
+<body class="settings"><main>
+  <header class="header"><h1>翻訳の設定</h1><a href="dictionary.html">翻訳辞書</a></header>
+  <form id="settings" aria-busy="true" inert>
     <fieldset><legend>接続先</legend>
       <div class="row"><label>サーバURL<input name="endpoint" type="url" required placeholder="http://127.0.0.1" spellcheck="false"></label><label class="port">ポート<input name="port" inputmode="numeric" placeholder="8000"><small>空欄でURLの値</small></label></div>
       <label>APIパス<input name="path" required placeholder="/v1/chat/completions" spellcheck="false"></label>
-      <label>APIキー<input name="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="認証なしの場合は空欄"><small>Bearer認証。設定はこのFirefoxに保存されます。</small></label>
+      <label for="api-key">APIキー</label><div class="credential-row"><input id="api-key" name="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="認証なしの場合は空欄" aria-describedby="api-key-help"><button type="button" id="show-key" aria-label="APIキーを表示" aria-pressed="false" aria-controls="api-key">表示</button></div><small id="api-key-help">Bearer認証。設定はこのFirefoxに保存されます。</small>
       <label>モデル<input name="model" required spellcheck="false"></label>
-      <label>API形式<select name="apiFormat"><option value="top-level">トップレベル</option><option value="template">chat_template_kwargs（llama.cpp / vLLM）</option></select></label>
+      <label>API形式<select name="apiFormat"><option value="top-level">トップレベル</option><option value="template">chat_template_kwargs（MLX / llama.cpp / vLLM）</option></select><small>公式MLXモデルのserve.pyではchat_template_kwargsを使います。</small></label>
+      <button type="button" id="test-connection">接続を確認</button>
+      <p id="connection-status" role="status" aria-live="polite"></p>
+      <small>入力中の接続先へ短いテスト翻訳を送信します。設定は保存しません。</small>
     </fieldset>
     <fieldset><legend>既定の翻訳</legend>
       <div class="row"><label>原文<select name="source"></select></label><label>訳文<select name="target"></select></label></div>
       <label>日本語の文体<select name="form"><option value="">指定なし</option><option value="plain">常体（だ・である）</option><option value="polite">敬体（です・ます）</option></select></label>
     </fieldset>
     <fieldset><legend>翻訳の処理</legend>
+      <label class="switch-row">複数の段落をまとめて翻訳<input name="batchTranslation" type="checkbox" role="switch"></label>
+      <small>短い段落をまとめて送信し、APIの呼び出し回数を減らします。</small>
       <label class="switch-row">長いページの解析中も操作できるようにする<input name="responsiveScan" type="checkbox" role="switch"></label>
       <small>短い間隔でブラウザへ制御を返します。解析中にも停止できます。</small>
       <label class="switch-row">画面内の段落を先に翻訳<input name="prioritizeVisible" type="checkbox" role="switch"></label>
-      <small>開始時に見えている段落、近くの段落の順に処理します。ページ全体が対象です。</small>
+      <small>同じ優先度の中で、画面内・近くの段落の順に処理します。</small>
+      <label class="switch-row">本文をメニュー・サイドバーより先に翻訳<input name="prioritizeContent" type="checkbox" role="switch"></label>
+      <small>記事・本文、本文内の表や折りたたみ見出し、その他、メニュー・サイドバーの順に処理します。翻訳範囲は変わりません。</small>
       <label class="switch-row">本文だけを翻訳<input name="mainContentOnly" type="checkbox" role="switch"></label>
       <small>main・role="main"、なければarticle内を対象にします。見つからないページでは全体を翻訳します。次の翻訳開始から反映します。</small>
+    </fieldset>
+    <fieldset><legend>実験的な機能</legend>
+      <label class="switch-row">同じ記事・表・メニューの段落をまとめる<input name="semanticBatching" type="checkbox" role="switch"></label>
+      <small>既定オン。「複数の段落をまとめて翻訳」と併用し、同じコンポーネントの段落を入力上限までまとめます。オフで従来の小分けに戻ります。</small>
+      <label class="switch-row">訳文をストリーミングで受信<input name="streamTranslation" type="checkbox" role="switch"></label>
+      <small>既定オフ。選択翻訳は受信中から表示し、ページ本文は構造の検証後に反映します。対応APIで使ってください。初回受信時間と参考の生成速度も履歴に記録します。</small>
+      <label class="switch-row">一時的なサーバーエラーを自動で再試行<input name="retryTransient" type="checkbox" role="switch"></label>
+      <small>HTTP 429・502・503・504のとき最大2回再試行します。待機中も停止できます。既定はオフです。</small>
     </fieldset>
     <fieldset><legend>操作と表示</legend>
       <label class="switch-row">選択した文章の近くに翻訳ボタン<input name="selectionButton" type="checkbox" role="switch"></label>
@@ -39,16 +53,18 @@
       <small>開始・25%ごと・完了・停止を通知します。</small>
     </fieldset>
     <fieldset><legend>翻訳キャッシュ</legend>
+      <p><a href="history.html">翻訳の履歴と処理速度を見る</a></p>
       <label>保存期間（分）<input name="cacheMinutes" type="number" min="0" max="1440" required><small>既定30分。0で無効。再訪時は一致する段落の訳文だけを復元します。</small></label>
       <p><small>原文と訳文は拡張のメモリに最大約8MiB保持します。Firefox終了・拡張の再読み込みで消えます。プライベートウィンドウでは保存しません。設定の保存時にもキャッシュを削除します。</small></p>
       <button type="button" id="clear-cache">キャッシュを削除</button>
     </fieldset>
     <details class="advanced"><summary>詳細設定</summary>
       <div class="row"><label>同時リクエスト<input name="concurrency" type="number" min="1" max="8" required><small>全タブ共通</small></label><label>タイムアウト（秒）<input name="timeoutSeconds" type="number" min="10" max="1800" required></label></div>
-      <label>入力上限（トークン）<input name="inputTokens" type="number" min="128" max="3900" required><small>出力上限：8096トークン</small></label>
+      <label>サーバーのコンテキスト長<input name="contextTokens" type="number" min="8192" max="32768" required><small>入力＋出力の合計。サーバーの設定と合わせてください。拡張からサーバー設定は変更しません。</small></label>
+      <label>入力上限（トークン）<input name="inputTokens" type="number" min="128" max="24000" required><small>既定6000。出力8096・辞書・制御情報を除いた残りに自動調整します。大きい入力は初回表示が遅くなる場合があります。</small></label>
       <label>トークン計測<select name="tokenizer"><option value="bytes">UTF-8バイト数で見積もり</option><option value="llama">llama.cpp /tokenize</option><option value="vllm">vLLM /tokenize</option></select><small>実測にはサーバの /tokenize API が必要です。</small></label>
       <label>Tokenizeパス<input name="tokenizePath" required placeholder="/tokenize" spellcheck="false"></label>
     </details>
-    <div class="save-row"><button type="submit" class="primary">保存</button><p id="status" role="status" aria-live="polite"></p></div>
+    <div class="save-row"><button type="submit" id="save" class="primary" disabled>保存</button><button type="button" id="discard" disabled>変更を破棄</button><p id="status" role="status" aria-live="polite">設定を読み込んでいます…</p></div>
   </form>
 </main></body></html>

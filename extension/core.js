@@ -1,21 +1,21 @@
 /* Shared pure logic; also loaded directly by the small Node test suite. */
 globalThis.Kotoba = (() => {
   const MAX_TOKENS = 8096;
-  const CONTENT_PROTOCOL = 3;
+  const CONTENT_PROTOCOL = 4;
   const DICTIONARY_LIMITS = Object.freeze({ entries: 500, perScope: 100, domains: 20, term: 100, bytes: 6000 });
   const DEFAULTS = Object.freeze({
     endpoint: "http://127.0.0.1", port: "8000", path: "/v1/chat/completions",
     apiKey: "", model: "plamo-translate", apiFormat: "top-level",
-    batchTranslation: true, concurrency: 1, inputTokens: 3000, timeoutSeconds: 180,
+    batchTranslation: true, concurrency: 1, inputTokens: 6000, contextTokens: 32768, timeoutSeconds: 180,
     tokenizer: "bytes", tokenizePath: "/tokenize", source: "en", target: "ja", form: "", cacheMinutes: 30,
-    responsiveScan: true, prioritizeVisible: true, mainContentOnly: false,
+    responsiveScan: true, prioritizeVisible: true, prioritizeContent: true, semanticBatching: true, streamTranslation: false, mainContentOnly: false,
     selectionButton: false, keyboardShortcuts: true, copyButton: true,
-    focusOriginal: true, pageProgress: true, announceProgress: true, hoverEnabled: true
+    focusOriginal: true, pageProgress: true, announceProgress: true, hoverEnabled: true, retryTransient: false
   });
-  const FEATURES = ["batchTranslation", "responsiveScan", "prioritizeVisible", "mainContentOnly", "selectionButton", "keyboardShortcuts", "copyButton", "focusOriginal", "pageProgress", "announceProgress", "hoverEnabled"];
+  const FEATURES = ["batchTranslation", "responsiveScan", "prioritizeVisible", "prioritizeContent", "semanticBatching", "streamTranslation", "mainContentOnly", "selectionButton", "keyboardShortcuts", "copyButton", "focusOriginal", "pageProgress", "announceProgress", "hoverEnabled", "retryTransient"];
   // Only this allowlist may be sent to content scripts; never spread connection settings.
   function contentPreferences(s) {
-    return Object.fromEntries(["concurrency", ...FEATURES].map(key => [key, s[key]]));
+    return Object.fromEntries(["concurrency", "inputTokens", "tokenizer", ...FEATURES.filter(key => !["retryTransient", "streamTranslation"].includes(key))].map(key => [key, s[key]]));
   }
   const LANGUAGES = "ja en zh-hans zh-hant ko ar az be bg bn ca ceb de es et eu fa fr gu he hi hr hu hy id it jv ka kk km lt lv ml mr ms my ne nl pa pl ru si sk sl sr sw ta te th tl ur uz vi".split(" ");
   function settings(raw = {}) {
@@ -26,7 +26,7 @@ globalThis.Kotoba = (() => {
     for (const name of ["path", "tokenizePath"]) {
       if (!s[name].startsWith("/") || s[name].startsWith("//") || /[?#]/.test(s[name])) throw new Error("APIパスは / から始まるパスを指定してください。");
     }
-    for (const [key, min, max] of [["concurrency", 1, 8], ["inputTokens", 128, 3900], ["timeoutSeconds", 10, 1800], ["cacheMinutes", 0, 1440]]) {
+    for (const [key, min, max] of [["concurrency", 1, 8], ["inputTokens", 128, 24000], ["contextTokens", 8192, 32768], ["timeoutSeconds", 10, 1800], ["cacheMinutes", 0, 1440]]) {
       s[key] = Number(s[key]);
       if (!Number.isInteger(s[key]) || s[key] < min || s[key] > max) throw new Error(`${key} は ${min}〜${max} の整数で指定してください。`);
     }
@@ -91,13 +91,14 @@ globalThis.Kotoba = (() => {
     languages(source, target);
     let context = `This text is from a web page on ${domain}. Translate it as part of the website, preserving the meaning and natural flow of complete sentences.`;
     if (html) context += (batch ? " The input is an HTML fragment containing independent paragraphs. Translate each whole paragraph together." : " The input is an HTML fragment of one paragraph. Translate the whole paragraph together.") + " Preserve every HTML tag and id exactly once, keep link labels with their links, and do not translate code or elements marked translate=\"no\". You may reorder sibling inline elements and place translated prose outside tags to produce natural grammar. Return only the translated HTML fragment.";
-    if (batch) context += " The input contains multiple independent paragraphs in kotoba-item elements. Preserve each kotoba-item tag and its id exactly once. Translate each paragraph separately within its own element; never move text or inline elements between paragraphs. Return only these HTML fragments with no text outside them.";
+    if (batch) context += " The input contains multiple independent paragraphs from one page component in source order, in p elements. Use neighboring paragraphs as context. Preserve each p tag and its id exactly once. Translate each paragraph separately within its own element; never move text or inline elements between paragraphs. Return only these HTML fragments with no text outside them.";
     if (retry) context += " The previous response did not preserve the HTML structure. Keep all tags and id attributes, including links, in the translated fragment. Do not return Markdown fences or explanations.";
     const options = { context, form: s.form, target_lang: target };
     const terms = glossary(s.dictionary, new URL(domain).hostname.toLowerCase().replace(/\.$/, ""), source, target);
     if (terms.length) options.glossary = terms;
     if (source !== "auto") options.source_lang = source;
-    const result = { model: s.model, messages: [{ role: "user", content: text }], max_tokens: MAX_TOKENS, stream: false, temperature: 0 };
+    const result = { model: s.model, messages: [{ role: "user", content: text }], max_tokens: MAX_TOKENS, stream: s.streamTranslation === true, temperature: 0 };
+    if (result.stream) result.stream_options = { include_usage: true };
     if (s.apiFormat === "template") {
       result.chat_template_kwargs = options;
       result.stop = ["<|plamo:tag|>", "<|plamo:bos|>"];
@@ -107,6 +108,14 @@ globalThis.Kotoba = (() => {
   // PLaMo's byte fallback makes UTF-8 byte length a conservative token estimate.
   const encoder = new TextEncoder();
   const byteTokens = text => encoder.encode(text).length;
+  function inputBudget(s, page) {
+    // Reserve output + template framing + context/glossary before packing source.
+    // Counting the JSON as bytes intentionally overestimates the option text.
+    const overhead = byteTokens(JSON.stringify(body(s, "", { ...page, html: true, batch: true })));
+    const available = s.contextTokens - MAX_TOKENS - 512 - overhead;
+    if (available < 128) throw new Error("コンテキスト長に入力・辞書と出力8096トークンを収められません。コンテキスト長の設定を増やしてください。");
+    return Math.min(s.inputTokens, available);
+  }
   const escape = text => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   const INLINE_TAGS = new Set(["a", "span", "strong", "em", "b", "i", "u", "s", "del", "sub", "sup", "mark", "small", "abbr", "q", "cite", "code", "kbd", "samp", "var"]);
   function documentText(nodes) { return nodes.map(node => node.text !== undefined ? node.text : documentText(node.children)).join(""); }
@@ -292,5 +301,5 @@ globalThis.Kotoba = (() => {
       }
     }
   }
-  return { DICTIONARY_LIMITS, dictionaryDomain, dictionary, glossary, MAX_TOKENS, CONTENT_PROTOCOL, DEFAULTS, FEATURES, contentPreferences, LANGUAGES, settings, languages, endpoint, body, byteTokens, split, Queue, documentText, documentLength, serializeDocument, normalizeEntities, parseDocument, splitDocument, mergeDocuments };
+  return { DICTIONARY_LIMITS, dictionaryDomain, dictionary, glossary, MAX_TOKENS, CONTENT_PROTOCOL, DEFAULTS, FEATURES, contentPreferences, LANGUAGES, settings, languages, endpoint, body, inputBudget, byteTokens, split, Queue, documentText, documentLength, serializeDocument, normalizeEntities, parseDocument, splitDocument, mergeDocuments };
 })();

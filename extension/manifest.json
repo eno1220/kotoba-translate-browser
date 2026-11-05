@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Kotoba",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "ローカル翻訳サーバでページと選択範囲を翻訳します。",
   "browser_specific_settings": {"gecko": {"id": "kotoba-local@eno1220.local", "strict_min_version": "128.0"}},
   "permissions": ["activeTab", "storage", "contextMenus", "clipboardWrite", "http://*/*", "https://*/*"],
