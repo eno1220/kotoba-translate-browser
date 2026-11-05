@@ -73,8 +73,10 @@ function abortTab(tabId, frameId) {
     if (job.tabId === tabId && (frameId === undefined || job.frameId === frameId)) job.controller.abort();
   }
 }
-async function post(s, url, data, signal) {
+async function post(s, url, data, signal, notify = () => {}, phase = "translating") {
+  notify("queued");
   return queue.run(async () => {
+    notify(phase);
     const controller = new AbortController();
     const abort = () => controller.abort();
     signal.addEventListener("abort", abort, { once: true });
@@ -96,18 +98,18 @@ async function post(s, url, data, signal) {
     } finally { clearTimeout(timer); signal.removeEventListener("abort", abort); }
   }, signal);
 }
-function counter(s, signal) {
+function counter(s, signal, notify) {
   if (s.tokenizer === "bytes") return K.byteTokens;
   return async text => {
     const data = s.tokenizer === "llama" ? { content: text, add_special: false } : { model: s.model, prompt: text, add_special_tokens: false };
-    const result = await post(s, K.endpoint(s, s.tokenizePath), data, signal);
+    const result = await post(s, K.endpoint(s, s.tokenizePath), data, signal, notify, "tokenizing");
     const count = Array.isArray(result.tokens) ? result.tokens.length : result.count;
     if (!Number.isInteger(count) || count < 0) throw new Error("/tokenizeの応答が不正です。tokenizer設定を確認してください。");
     return count;
   };
 }
 async function generate(s, text, page, signal) {
-  const result = await post(s, K.endpoint(s), K.body(s, text, page), signal);
+  const result = await post(s, K.endpoint(s), K.body(s, text, page), signal, page.notify);
   const choice = result.choices?.[0];
   if (choice?.finish_reason === "length") return { truncated: true };
   if (choice?.finish_reason && !["stop", "eos"].includes(choice.finish_reason)) throw new Error(`翻訳が完了しませんでした (${choice.finish_reason})。`);
@@ -134,7 +136,7 @@ async function translatePlain(s, text, page, signal, count, limit = s.inputToken
   return result.map((part, i) => i && !["ja", "zh-hans", "zh-hant", "th", "km", "my"].includes(page.target) && !/\s$/.test(result[i - 1]) && !/^\s|^[,.;:!?、。]/.test(part) ? " " + part : part).join("");
 }
 async function translateDocument(s, document, page, signal, advance, limit = s.inputTokens, depth = 0) {
-  const count = counter(s, signal);
+  const count = counter(s, signal, page.notify);
   const chunks = await K.splitDocument(document, limit, count);
   const translated = [];
   for (const chunk of chunks) {
@@ -193,8 +195,9 @@ function parseBatch(text, documents) {
   if (result.filter(Boolean).length !== documents.length) throw new Error("Missing batch marker");
   return result;
 }
-async function translateDocuments(s, documents, page, signal, advance) {
-  const count = counter(s, signal), results = [];
+async function translateDocuments(s, documents, page, signal, advance, deliver = () => {}) {
+  const count = counter(s, signal, page.notify), results = [];
+  function accept(result) { const index = results.length; results.push(result); deliver(index, result); }
   async function flush(batch) {
     if (signal.aborted) throw new DOMException("キャンセルしました。", "AbortError");
     if (batch.length > 1) {
@@ -203,17 +206,17 @@ async function translateDocuments(s, documents, page, signal, advance) {
         let accepted;
         try { accepted = parseBatch(output.text, batch); } catch { /* Retry whole paragraphs below. */ }
         if (accepted) {
-          results.push(...accepted);
+          accepted.forEach(accept);
           advance(batch.reduce((sum, document) => sum + K.documentLength(document), 0));
           return;
         }
       }
     }
     for (const document of batch) {
-      try { results.push({ document: await translateDocument(s, document, page, signal, advance) }); }
+      try { accept({ document: await translateDocument(s, document, page, signal, advance) }); }
       catch (error) {
         if (error.code !== "structure") throw error;
-        results.push({ error: error.message, errorCode: error.code });
+        accept({ error: error.message, errorCode: error.code });
       }
     }
   }
@@ -251,16 +254,19 @@ async function translate(message, sender) {
   const id = Symbol(); jobs.set(id, job);
   let completed = 0;
   const total = inputs ? inputs.reduce((sum, document) => sum + K.documentLength(document), 0) : message.parts[0].length;
-  const advance = amount => {
-    completed += amount;
+  let phase = "preparing";
+  const notify = (next = phase, result) => {
+    phase = next;
     if (typeof message.requestId === "string" && message.requestId.length < 100 && !job.controller.signal.aborted) {
-      browser.tabs.sendMessage(job.tabId, { type: "translationProgress", requestId: message.requestId, completed, total }, { frameId: job.frameId }).catch(() => {});
+      browser.tabs.sendMessage(job.tabId, { type: "translationProgress", requestId: message.requestId, completed, total, phase,
+        ...(result ? { results: [result] } : {}) }, { frameId: job.frameId }).catch(() => {});
     }
   };
+  const advance = amount => { completed += amount; notify(); };
   try {
     const revision = cacheRevision;
     const s = await getSettings();
-    const page = { source: message.source, target: message.target, domain: pageURL.origin };
+    const page = { source: message.source, target: message.target, domain: pageURL.origin, notify };
     if (inputs) {
       const useCache = s.cacheMinutes > 0 && !sender.tab.incognito;
       const url = documentURL(sender.url);
@@ -269,9 +275,12 @@ async function translate(message, sender) {
         if (hit) advance(K.documentLength(input));
         return hit ? { document: hit } : null;
       });
-      const missing = inputs.filter((_, index) => !results[index]);
+      results.forEach((result, index) => { if (result) notify("preparing", { index, ...result }); });
+      const missingIndices = inputs.flatMap((_, index) => results[index] ? [] : [index]);
+      const missing = missingIndices.map(index => inputs[index]);
       if (missing.length) {
-        const fresh = documents ? await translateDocuments(s, missing, page, job.controller.signal, advance) : [{ document: await translateDocument(s, document, page, job.controller.signal, advance) }];
+        const fresh = documents ? await translateDocuments(s, missing, page, job.controller.signal, advance,
+          (index, result) => notify("preparing", { index: missingIndices[index], ...result })) : [{ document: await translateDocument(s, document, page, job.controller.signal, advance) }];
         if (job.controller.signal.aborted) throw new DOMException("キャンセルしました。", "AbortError");
         let cursor = 0;
         for (let i = 0; i < inputs.length; i++) if (!results[i]) {
@@ -281,7 +290,7 @@ async function translate(message, sender) {
       }
       return documents ? { documents: results } : results[0];
     }
-    return { parts: [await translatePlain(s, message.parts[0], page, job.controller.signal, counter(s, job.controller.signal), s.inputTokens, 0, advance)] };
+    return { parts: [await translatePlain(s, message.parts[0], page, job.controller.signal, counter(s, job.controller.signal, notify), s.inputTokens, 0, advance)] };
   } finally { jobs.delete(id); }
 }
 function staleContent() {

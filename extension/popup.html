@@ -11,8 +11,9 @@
   <label class="switch-row" for="main-content-only">本文だけを翻訳<input id="main-content-only" type="checkbox" role="switch"></label>
   <section class="progress" id="progress-section" hidden aria-label="翻訳の進捗">
     <div class="progress-label"><span id="progress-label">翻訳中</span><strong id="percent">0%</strong></div>
-    <progress id="progress" max="100" value="0" aria-label="翻訳の進捗"></progress>
+    <div class="progress-track"><progress id="progress" max="100" value="0" aria-label="翻訳の進捗"></progress><div class="progress-pending" id="progress-pending" hidden aria-hidden="true"></div></div>
     <div class="progress-detail"><span id="counts"></span><span id="elapsed"></span></div>
+    <div class="progress-activity" id="progress-activity" hidden><span id="work"></span><span id="phase"></span></div>
   </section>
   <p id="status" role="status" aria-live="polite">ページを確認しています…</p>
   <button class="full" id="reload" hidden>ページを再読み込み</button>

@@ -222,3 +222,38 @@ test("restore lookup returns only matching page data with no API or credentials,
   await b.send([], { type: "restoreCachedPage" });
   assert.equal(b.progress.length, 0);
 });
+
+test("packed responses deliver validated paragraphs before later API calls finish", async () => {
+  let release, settled = false;
+  const b = background(({ body }) => {
+    const input = body.messages[0].content;
+    if (b.calls.length === 2) return new Promise(resolve => { release = () => resolve(completion(input)); });
+    return completion(input);
+  }, { inputTokens: 128, cacheMinutes: 0 });
+  const documents = Array.from({ length: 5 }, (_, i) => [{ text: `Paragraph ${i}.` }]);
+  const pending = b.send([], { documents, requestId: "incremental" }).then(result => { settled = true; return result; });
+  for (let i = 0; i < 100 && !release; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.ok(release); assert.equal(settled, false);
+  const early = b.progress.flatMap(message => message.results || []);
+  assert.deepEqual(early.map(result => result.index), [0, 1]);
+  assert.equal(early[0].document[0].text, "Paragraph 0.");
+  release(); const result = await pending;
+  assert.equal(result.documents.length, 5);
+  assert.deepEqual(b.progress.flatMap(message => message.results || []).map(result => result.index), [0, 1, 2, 3, 4]);
+  assert.equal(b.progress.at(-1).completed, b.progress.at(-1).total);
+});
+
+test("progress distinguishes waiting in the shared queue from awaiting a server response", async () => {
+  let release;
+  const b = background(({ body }) => body.messages[0].content === "First" ? new Promise(resolve => { release = () => resolve(completion("最初")); }) : completion("次"));
+  const first = b.send(["First"], { requestId: "first" }, 1);
+  for (let i = 0; i < 100 && !release; i++) await new Promise(resolve => setImmediate(resolve));
+  const second = b.send(["Second"], { requestId: "second" }, 2);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(b.progress.some(message => message.requestId === "first" && message.phase === "translating"));
+  assert.ok(b.progress.some(message => message.requestId === "second" && message.phase === "queued"));
+  assert.ok(!b.progress.some(message => message.requestId === "second" && message.phase === "translating"));
+  release(); await Promise.all([first, second]);
+  assert.ok(b.progress.some(message => message.requestId === "second" && message.phase === "translating"));
+  assert.equal(b.max(), 1);
+});

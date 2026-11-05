@@ -33,6 +33,12 @@ function render(state) {
   $("progress").value = percent; $("percent").textContent = `${percent}%`;
   if (state.preparing) { $("progress").removeAttribute("value"); $("percent").textContent = ""; }
   $("progress-label").textContent = state.preparing ? "ページを解析中" : state.running ? "翻訳中" : state.failed ? "一部未翻訳" : percent === 100 ? "翻訳完了" : "停止中";
+  $("progress-pending").hidden = !state.running || state.preparing || !state.activePercent;
+  $("progress-pending").style.left = `${percent}%`; $("progress-pending").style.width = `${state.activePercent || 0}%`;
+  $("progress-activity").hidden = !state.running || state.preparing;
+  $("work").textContent = `処理中 ${state.active || 0}段落 · 未着手 ${state.pending || 0}段落`;
+  const phase = { preparing: "翻訳を準備中", queued: "順番待ち", tokenizing: "入力を計測中", translating: "応答待ち" }[state.phase] || "";
+  $("phase").textContent = phase ? `${phase} ${Math.floor((Date.now() - state.phaseStartedAt) / 1000)}秒` : "";
   $("counts").textContent = `${state.done} / ${state.total} 段落`;
   $("elapsed").textContent = state.startedAt ? `${Math.floor(((state.finishedAt || Date.now()) - state.startedAt) / 1000)}秒` : "";
   $("hover").checked = state.hoverEnabled !== false;

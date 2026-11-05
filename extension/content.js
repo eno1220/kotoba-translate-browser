@@ -10,7 +10,7 @@
   const records = new Map();
   const transactions = new Set();
   const pageURL = () => { const url = new URL(location.href); url.hash = ""; return url.href; };
-  let state = { url: pageURL(), source: null, target: null, running: false, done: 0, total: 0, failed: 0, message: "", concurrency: 1, percent: 0, startedAt: 0, finishedAt: 0, hoverEnabled: true };
+  let state = { url: pageURL(), source: null, target: null, running: false, done: 0, total: 0, failed: 0, message: "", concurrency: 1, percent: 0, startedAt: 0, finishedAt: 0, active: 0, pending: 0, activePercent: 0, phase: "", phaseStartedAt: 0, hoverEnabled: true };
   let generation = 0, panel, tooltip, host, shadow, lastHover;
   let appliedDirection = null;
   let panelKind, pageUI, pageDismissed = false, panelTimer, selectionCleanup;
@@ -65,8 +65,12 @@
       .progress-label,.progress-detail { display:flex; justify-content:space-between; align-items:center; gap:10px; font-size:12px; }
       .progress-label strong { color:#087fdb; font-variant-numeric:tabular-nums; font-weight:600; }
       .progress-detail { font-size:11px; color:#71717a; margin-top:6px; font-variant-numeric:tabular-nums; }
-      progress { display:block; appearance:none; width:100%; height:4px; border:0; border-radius:3px; overflow:hidden; background:#e4e4e7; margin-top:8px; }
+      progress { display:block; appearance:none; width:100%; height:4px; border:0; border-radius:3px; overflow:hidden; background:#e4e4e7; }
+      .progress-track { margin-top:8px; }
       progress::-moz-progress-bar { background:#0ba5ec; border-radius:3px; }
+      .progress-track { position:relative; border-radius:3px; overflow:hidden; }
+      .progress-pending { position:absolute; inset-block:0; pointer-events:none; background:repeating-linear-gradient(120deg,#bae6fd 0 4px,#e0f2fe 4px 8px); }
+      .progress-activity { display:flex; flex-wrap:wrap; justify-content:space-between; gap:2px 10px; margin-top:6px; color:#62626c; font-size:11px; font-variant-numeric:tabular-nums; }
       details { font-size:12px; color:#71717a; } summary { cursor:pointer; } details p { color:#52525b; max-height:150px; overflow:auto; }
       .mark { position:fixed; pointer-events:none; border-radius:2px; background:#0ea5e91a; border-bottom:1px solid #0ea5e955; }
       .original { margin:0; font-size:14px; line-height:1.75; user-select:text; } .tooltip .heading { margin-bottom:6px; }
@@ -127,8 +131,13 @@
     const bar = document.createElement("progress"); bar.max = 100; bar.value = 0; bar.setAttribute("aria-label", "翻訳の進捗");
     const detail = document.createElement("div"); detail.className = "progress-detail";
     const count = document.createElement("span"), elapsed = document.createElement("span"); detail.append(count, elapsed);
-    node.append(header, bar, detail);
-    return { node, label, percent, bar, count, elapsed };
+    const track = document.createElement("div"); track.className = "progress-track";
+    const pending = document.createElement("div"); pending.className = "progress-pending"; pending.hidden = true; pending.setAttribute("aria-hidden", "true");
+    track.append(bar, pending);
+    const activity = document.createElement("div"); activity.className = "progress-activity"; activity.hidden = true;
+    const work = document.createElement("span"), phase = document.createElement("span"); activity.append(work, phase);
+    node.append(header, track, detail, activity);
+    return { node, label, percent, bar, count, elapsed, pending, activity, work, phase };
   }
   function statusPanel() {
     announce();
@@ -147,6 +156,12 @@
     pageUI.label.textContent = state.preparing ? "ページを解析中" : state.running ? "翻訳中" : state.failed ? "一部未翻訳" : state.percent === 100 ? "翻訳完了" : state.total ? "停止中" : "対象なし";
     pageUI.bar.value = state.percent; pageUI.percent.textContent = `${state.percent}%`;
     if (state.preparing) { pageUI.bar.removeAttribute("value"); pageUI.percent.textContent = ""; }
+    pageUI.pending.hidden = !state.running || state.preparing || !state.activePercent;
+    pageUI.pending.style.left = `${state.percent}%`; pageUI.pending.style.width = `${state.activePercent}%`;
+    pageUI.activity.hidden = !state.running || state.preparing;
+    pageUI.work.textContent = `処理中 ${state.active}段落 · 未着手 ${state.pending}段落`;
+    const phase = { preparing: "翻訳を準備中", queued: "順番待ち", tokenizing: "入力を計測中", translating: "応答待ち" }[state.phase] || "";
+    pageUI.phase.textContent = phase ? `${phase} ${Math.floor((Date.now() - state.phaseStartedAt) / 1000)}秒` : "";
     pageUI.count.textContent = `${state.done} / ${state.total} 段落`;
     pageUI.elapsed.textContent = state.startedAt ? `${Math.floor(((state.finishedAt || Date.now()) - state.startedAt) / 1000)}秒` : "";
     pageUI.message.textContent = state.failed || !state.total ? state.message : "";
@@ -171,8 +186,11 @@
       state = { ...state, url: pageURL(), source: null, target: null, done: 0, total: 0, failed: 0, message: "", percent: 0, startedAt: 0, finishedAt: 0 };
     }
   }
+  function clearActivity() {
+    state.active = 0; state.pending = 0; state.activePercent = 0; state.phase = ""; state.phaseStartedAt = 0;
+  }
   function stop() {
-    generation++;
+    generation++; clearActivity();
     state.running = false; state.preparing = false;
     state.finishedAt = Date.now(); state.message = "停止しました";
     browser.runtime.sendMessage({ type: "cancel" }).catch(() => {});
@@ -375,21 +393,22 @@
       if (!blocked) await walk(scope);
     }
     if (preferences.prioritizeVisible) {
-      const distance = group => {
-        if (!group.parent.isConnected || !contiguous(group.roots, group.parent)) return Infinity;
-        const range = document.createRange(); range.setStartBefore(group.roots[0]); range.setEndAfter(group.roots.at(-1));
-        const rect = range.getBoundingClientRect?.() || group.parent.getBoundingClientRect?.();
-        return !rect || rect.bottom >= 0 && rect.top <= innerHeight ? 0 : rect.bottom < 0 ? -rect.bottom : rect.top - innerHeight;
-      };
       const ordered = [];
       for (const group of groups) {
         if (preferences.responsiveScan && ++visited % 80 === 0) await new Promise(resolve => setTimeout(resolve, 0));
         if (run !== generation) throw new DOMException("キャンセルしました", "AbortError");
-        ordered.push({ group, distance: distance(group) });
+        ordered.push({ group, distance: viewportDistance(group) });
       }
       return ordered.sort((a, b) => a.distance - b.distance).map(item => item.group);
     }
     return groups;
+  }
+  function viewportDistance(group) {
+    if (!group.parent.isConnected || !contiguous(group.roots, group.parent)) return Infinity;
+    const range = document.createRange(); range.setStartBefore(group.roots[0]); range.setEndAfter(group.roots.at(-1));
+    const rect = range.getBoundingClientRect?.() || group.parent.getBoundingClientRect?.();
+    if (!rect) return 0;
+    return Math.max(0, -rect.bottom, rect.top - innerHeight, -rect.right || 0, rect.left - innerWidth || 0);
   }
   function applyDocument(unit, tree) {
     if (!snapshotMatches(unit.originalSnapshot) || !contiguous(unit.roots, unit.parent) || !attributesMatch(unit.context, unit.contextAttributes) || language(unit.context) !== unit.contextLanguage) return false;
@@ -457,7 +476,7 @@
     const run = ++generation;
     state.running = true; state.preparing = true; state.done = 0; state.total = 0; state.failed = 0; state.cacheRestored = false;
     state.percent = 0; state.startedAt = Date.now(); state.finishedAt = 0;
-    state.message = "";
+    state.message = ""; clearActivity();
     if (panelKind === "selection") closePanel();
     pageDismissed = false; clearTooltip();
     statusPanel();
@@ -469,26 +488,63 @@
     state.preparing = false; state.total = groups.length;
     state.message = groups.length ? "" : "翻訳対象がありません";
     const totalChars = groups.reduce((sum, group) => sum + group.length, 0);
-    let completedChars = 0;
+    let completedChars = 0, cursor = 0;
     const activeProgress = new Map();
     const updateProgress = () => {
       if (run !== generation) return;
-      state.percent = totalChars ? Math.min(100, Math.floor((completedChars + [...activeProgress.values()].reduce((a, b) => a + b, 0)) / totalChars * 100)) : 0;
+      const active = [...activeProgress.values()];
+      const processed = active.reduce((sum, item) => sum + Math.max(item.completed, item.deliveredChars), 0);
+      state.percent = totalChars ? Math.min(100, Math.floor((completedChars + processed) / totalChars * 100)) : 0;
+      state.active = active.reduce((sum, item) => sum + item.remaining.size, 0);
+      state.pending = groups.length - cursor;
+      state.activePercent = totalChars ? Math.max(0, (active.reduce((sum, item) => sum + item.length, 0) - processed) / totalChars * 100) : 0;
+      const current = active.find(item => item.phase === "translating") || active.find(item => item.phase === "tokenizing") || active[0];
+      state.phase = current?.phase || ""; state.phaseStartedAt = current?.since || 0;
       statusPanel();
     };
-    statusPanel();
-    let cursor = 0;
+    updateProgress();
+    function nextBatch() {
+      const visible = viewportDistance(groups[cursor]) === 0;
+      const limit = !state.batchTranslation || cursor === 0 ? 1 : cursor < 3 ? 2 : visible ? 4 : 16;
+      const batch = [];
+      let size = 0;
+      while (cursor < groups.length && batch.length < limit) {
+        const group = groups[cursor], nextSize = visible ? JSON.stringify(group.document).length : 0;
+        if (batch.length && ((viewportDistance(group) === 0) !== visible || visible && size + nextSize > 1200)) break;
+        batch.push(group); cursor++; size += nextSize;
+      }
+      return batch;
+    }
     async function worker() {
       while (run === generation && cursor < groups.length) {
-        const batch = groups.slice(cursor, cursor + (state.batchTranslation ? 16 : 1));
-        cursor += batch.length;
+        const batch = nextBatch();
         const requestId = `page-${run}-${++requestSequence}`;
         const length = batch.reduce((sum, group) => sum + group.length, 0);
-        progressListeners.set(requestId, progress => {
+        const progress = { length, completed: 0, deliveredChars: 0, remaining: new Set(batch.map((_, index) => index)), phase: "preparing", since: Date.now() };
+        activeProgress.set(requestId, progress);
+        const accept = (index, response) => {
+          if (!Number.isInteger(index) || !progress.remaining.has(index)) return;
+          const group = batch[index];
+          if (response.error && response.errorCode === "structure") {
+            state.failed++; state.message = response.error;
+          } else {
+            if (response.error) throw new Error(response.error);
+            if (!response.document) throw new Error("翻訳結果が不正です。");
+            if (applyDocument(group, response.document)) appliedDirection = `${source}:${target}`;
+            else { state.failed++; state.message = "更新された段落は適用していません"; }
+          }
+          progress.remaining.delete(index); progress.deliveredChars += group.length; state.done++;
+        };
+        progressListeners.set(requestId, value => {
           if (run !== generation) return;
-          activeProgress.set(requestId, Math.max(activeProgress.get(requestId) || 0, Math.min(length, progress.completed)));
+          progress.completed = Math.max(progress.completed, Math.min(length, value.completed));
+          if (["queued", "translating", "tokenizing", "preparing"].includes(value.phase) && progress.phase !== value.phase) {
+            progress.phase = value.phase; progress.since = Date.now();
+          }
+          for (const result of value.results || []) accept(result.index, result);
           updateProgress();
         });
+        updateProgress();
         try {
           const response = await browser.runtime.sendMessage({ type: "translate", protocol: PROTOCOL, requestId, ...(batch.length > 1 ? { documents: batch.map(group => group.document) } : { document: batch[0].document }), source, target });
           if (state.url !== pageURL()) { currentPage(); return; }
@@ -496,32 +552,22 @@
           if (response.error && (batch.length > 1 || response.errorCode !== "structure")) throw new Error(response.error);
           const responses = batch.length > 1 ? response.documents : [response];
           if (!responses || responses.length !== batch.length) throw new Error("翻訳結果が不正です。");
-          for (const [index, group] of batch.entries()) {
-            const response = responses[index];
-            if (response.error && response.errorCode === "structure") {
-              state.failed++; state.message = response.error;
-            } else {
-              if (response.error) throw new Error(response.error);
-              if (!response.document) throw new Error("翻訳結果が不正です。");
-              if (applyDocument(group, response.document)) appliedDirection = `${source}:${target}`;
-              else { state.failed++; state.message = "更新された段落は適用していません"; }
-            }
-          }
+          responses.forEach((result, index) => accept(index, result));
         } catch (error) {
           if (run !== generation) return;
           state.failed++; state.message = error.message;
           // A failed connection should not produce hundreds of identical calls.
-          state.running = false; state.finishedAt = Date.now(); generation++;
+          state.running = false; state.finishedAt = Date.now(); generation++; clearActivity();
           browser.runtime.sendMessage({ type: "cancel" }).catch(() => {});
           statusPanel(); return;
         } finally { progressListeners.delete(requestId); }
         activeProgress.delete(requestId); completedChars += length;
-        state.done += batch.length; updateProgress();
+        updateProgress();
       }
     }
     await Promise.all(Array.from({ length: Math.min(state.concurrency, Math.max(1, groups.length)) }, worker));
     if (run === generation) {
-      state.running = false;
+      state.running = false; clearActivity();
       state.finishedAt = Date.now();
       state.message = state.failed ? "一部の段落を適用できませんでした" : groups.length ? "" : "翻訳対象がありません";
       statusPanel();

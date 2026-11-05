@@ -130,11 +130,19 @@ const parserWindow = new (require("jsdom").JSDOM)("").window;
         await inspect('window.modernOriginal = document.querySelector("#modern").innerHTML; window.modernText = document.querySelector("#modern x-label").firstChild; window.articleRoot = document.querySelector("#component").attachShadow({mode:"open"}); window.articleRoot.innerHTML = "<section><slot name=body></slot><p>Shadow prose.</p></section>";');
         await send({type:'start',source:'en',target:'ja'});
         ${process.env.KOTOBA_HISTORY ? 'await browser.tabs.executeScript(tab.id,{code:"history.replaceState({test:true}, document.title, location.href)"});' : ''}
+        let firstPaint;
+        for (let i=0; i<100; i++) { firstPaint = await send({type:'status'}); if (firstPaint.done > 0) break; await wait(10); }
+        check(firstPaint.done > 0 && firstPaint.running && firstPaint.done < firstPaint.total, 'first translation waited for the full page');
         const preview = await browser.tabs.create({url:browser.runtime.getURL('popup.html')+'?previewTab='+tab.id,active:true});
         await wait(250);
         await fetch(base + '/screenshot', {method:'POST',body:JSON.stringify({name:'popup',image:await browser.tabs.captureTab(preview.id,{format:'png'})})});
         const popupView = browser.extension.getViews().find(view => view.location.href.includes("previewTab="));
         check(popupView.document.querySelector("#batch-translation").checked === true, 'batch setting should default on');
+        const progressState = await send({type:'status'}); popupView.render(progressState);
+        if (progressState.running) {
+          check(!popupView.document.querySelector('#progress-activity').hidden && popupView.document.querySelector('#work').textContent.includes('処理中'), 'popup activity missing');
+          check(popupView.document.querySelector('#phase').textContent.length > 0, 'popup request phase missing');
+        }
         popupView.document.querySelector("#batch-translation").click();
         await wait(100);
         check((await browser.storage.local.get('settings')).settings.batchTranslation === false, 'popup did not save batch setting');

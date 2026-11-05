@@ -225,45 +225,43 @@ test("original hover waits, stays stable across inline nodes, and supports pinni
 });
 
 
-test("batch mode applies each result to its paragraph, preserves links and restores originals", async () => {
-  const html = '<p>First <a href="/one">link</a>.</p><p>Second <a href="/two">link</a>.</p>';
-  const s = setup(html, translateTree, { batchTranslation: true });
+test("batch mode starts with one paragraph, then preserves links in grouped results and restores originals", async t => {
+  const html = '<p>First <a href="/one">link</a>.</p><p>Second <a href="/two">link</a>.</p><p>Third paragraph.</p>';
+  const s = setup(html, translateTree, { batchTranslation: true }); t.after(() => s.dom.window.close());
   const links = [...s.w.document.querySelectorAll("a")];
   await s.message({ type: "start", source: "en", target: "ja" });
   const state = await s.settle();
-  assert.equal(s.calls.length, 1);
-  assert.equal(s.calls[0].documents.length, 2);
-  assert.equal(state.done, 2);
-  assert.equal(state.percent, 100);
+  assert.equal(s.calls.length, 2);
+  assert.ok(s.calls[0].document);
+  assert.equal(s.calls[1].documents.length, 2);
+  assert.equal(state.done, 3); assert.equal(state.percent, 100);
   assert.match(s.w.document.querySelectorAll("p")[1].textContent, /訳:Second/);
   assert.deepEqual([...s.w.document.querySelectorAll("a")], links);
-  await s.message({ type: "restore" });
-  assert.equal(s.w.document.body.innerHTML, html);
-  s.dom.window.close();
+  await s.message({ type: "restore" }); assert.equal(s.w.document.body.innerHTML, html);
 
-  const off = setup(html, translateTree, { batchTranslation: false });
-  await off.message({ type: "start", source: "en", target: "ja" });
-  await off.settle();
-  assert.equal(off.calls.length, 2);
+  const off = setup(html, translateTree, { batchTranslation: false }); t.after(() => off.dom.window.close());
+  await off.message({ type: "start", source: "en", target: "ja" }); await off.settle();
+  assert.equal(off.calls.length, 3);
   assert.ok(off.calls.every(call => call.document && !call.documents));
-  off.dom.window.close();
 });
 
-
-test("late batch responses respect stop and changes to individual paragraphs", async () => {
+test("late batch responses respect stop and changes to individual paragraphs", async t => {
   for (const stop of [true, false]) {
     const releases = [];
-    const s = setup('<p>First sentence.</p><p>Second sentence.</p>', tree => new Promise(resolve => releases.push(() => resolve(translateTree(tree)))), { batchTranslation: true });
+    const s = setup('<p>First sentence.</p><p>Second sentence.</p><p>Third sentence.</p>', tree => textOf(tree).startsWith("First") ? translateTree(tree)
+      : new Promise(resolve => releases.push(() => resolve(translateTree(tree)))), { batchTranslation: true });
+    t.after(() => s.dom.window.close());
     await s.message({ type: "start", source: "en", target: "ja" });
     await new Promise(r => setImmediate(r));
+    assert.equal(releases.length, 2);
     if (stop) await s.message({ type: "stop" });
-    else s.w.document.querySelector("p").textContent = "Updated by site.";
+    else s.w.document.querySelectorAll("p")[1].textContent = "Updated by site.";
     releases.forEach(release => release());
-    await new Promise(r => setImmediate(r));
+    await s.settle(); await new Promise(r => setImmediate(r));
     const paragraphs = s.w.document.querySelectorAll("p");
-    assert.equal(paragraphs[0].textContent, stop ? "First sentence." : "Updated by site.");
-    assert.equal(paragraphs[1].textContent, stop ? "Second sentence." : "訳:Second sentence.");
-    s.dom.window.close();
+    assert.equal(paragraphs[0].textContent, "訳:First sentence.");
+    assert.equal(paragraphs[1].textContent, stop ? "Second sentence." : "Updated by site.");
+    assert.equal(paragraphs[2].textContent, stop ? "Third sentence." : "訳:Third sentence.");
   }
 });
 
@@ -462,4 +460,66 @@ test("restoration preserves live updates inside protected widgets after link reo
   assert.equal(p.textContent, "Read one and two New live state.");
   assert.equal(p.querySelector("a").getAttribute("href"), "/one");
   s.dom.window.close();
+});
+
+
+test("visible paragraphs appear in small batches while offscreen paragraphs keep large batches", async t => {
+  const s = setup(Array.from({ length: 27 }, (_, i) => `<p>Paragraph ${i}.</p>`).join(""), translateTree, { batchTranslation: true });
+  t.after(() => s.dom.window.close());
+  [...s.w.document.querySelectorAll("p")].forEach((el, index) => {
+    const top = index < 7 ? 20 + index * 30 : 2000 + index * 30;
+    el.getBoundingClientRect = () => ({ top, bottom: top + 20, left: 0, right: 100 });
+  });
+  await s.message({ type: "start", source: "en", target: "ja" });
+  const status = await s.settle();
+  assert.deepEqual(s.calls.map(call => call.documents?.length || 1), [1, 2, 4, 16, 4]);
+  assert.equal(status.done, 27); assert.equal(status.failed, 0);
+});
+
+test("progress shows work and actual waiting phase before the first paragraph finishes", async t => {
+  let release;
+  const s = setup('<p>First paragraph.</p><p>Second paragraph.</p>', tree => new Promise(resolve => { release = () => resolve(translateTree(tree)); }), { batchTranslation: true });
+  t.after(() => s.dom.window.close());
+  await s.message({ type: "start", source: "en", target: "ja" });
+  await new Promise(r => setImmediate(r));
+  const requestId = s.calls[0].requestId;
+  const panel = s.shadow.querySelector(".panel");
+  await s.message({ type: "translationProgress", requestId, completed: 0, total: 16, phase: "queued" });
+  let status = await s.message({ type: "status" });
+  assert.equal(status.done, 0); assert.equal(status.percent, 0);
+  assert.equal(status.active, 1); assert.equal(status.pending, 1);
+  assert.equal(panel.querySelector(".progress-pending").hidden, false);
+  assert.match(panel.querySelector(".progress-activity").textContent, /処理中 1段落 · 未着手 1段落.*順番待ち/);
+  await s.message({ type: "translationProgress", requestId, completed: 0, total: 16, phase: "translating" });
+  assert.match(panel.querySelector(".progress-activity").textContent, /応答待ち/);
+  release(); await new Promise(r => setImmediate(r));
+  assert.equal(s.w.document.querySelector("p").textContent, "訳:First paragraph.");
+  status = await s.message({ type: "status" });
+  assert.equal(status.done, 1); assert.equal(status.running, true);
+  await s.message({ type: "stop" }); release();
+  assert.equal((await s.message({ type: "status" })).active, 0);
+  assert.equal(panel.querySelector(".progress-pending").hidden, true);
+  await s.message({ type: "translationProgress", requestId: s.calls[1].requestId, completed: 1, total: 1,
+    results: [{ index: 0, document: translateTree(s.calls[1].document) }] });
+  assert.equal(s.w.document.querySelectorAll("p")[1].textContent, "Second paragraph.");
+});
+
+test("validated batch paragraphs appear before the final response and are never applied twice", async t => {
+  const releases = [];
+  const s = setup('<p>First paragraph.</p><p>Second paragraph.</p><p>Third paragraph.</p>', tree => textOf(tree).startsWith("First") ? translateTree(tree)
+    : new Promise(resolve => releases.push(() => resolve(translateTree(tree)))), { batchTranslation: true });
+  t.after(() => s.dom.window.close());
+  await s.message({ type: "start", source: "en", target: "ja" }); await new Promise(r => setImmediate(r));
+  const request = s.calls[1], paragraphs = s.w.document.querySelectorAll("p");
+  const progress = { type: "translationProgress", requestId: request.requestId, completed: 0, total: 33,
+    results: [{ index: 0, document: translateTree(request.documents[0]) }] };
+  await s.message(progress);
+  assert.equal(paragraphs[1].textContent, "訳:Second paragraph.");
+  assert.equal(paragraphs[2].textContent, "Third paragraph.");
+  assert.equal((await s.message({ type: "status" })).done, 2);
+  await s.message(progress);
+  assert.equal((await s.message({ type: "status" })).done, 2);
+  releases.forEach(release => release()); const status = await s.settle();
+  assert.equal(status.done, 3); assert.equal(status.failed, 0);
+  await s.message({ type: "restore" }); assert.equal(paragraphs[1].textContent, "Second paragraph.");
 });
