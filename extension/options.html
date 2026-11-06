@@ -1,24 +1,56 @@
 <!doctype html>
 <html lang="ja">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>翻訳の設定</title><link rel="icon" href="icons/kotoba.svg" type="image/svg+xml"><link rel="stylesheet" href="ui.css"><script src="core.js" defer></script><script src="options.js" defer></script></head>
-<body class="settings"><main>
-  <header class="header"><h1>翻訳の設定</h1><a href="dictionary.html">翻訳辞書</a></header>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>設定 · 翻訳</title><link rel="icon" href="icons/kotoba.svg" type="image/svg+xml"><link rel="stylesheet" href="ui.css"><script src="core.js" defer></script><script src="options.js" defer></script></head>
+<body class="settings">
+<main>
+  <header class="page-header"><h1>設定</h1>
+    <nav class="page-nav" aria-label="拡張機能"><a href="options.html" aria-current="page">設定</a><a href="dictionary.html">辞書</a><a href="history.html">履歴</a><a href="errors.html">エラー記録</a></nav>
+  </header>
   <form id="settings" aria-busy="true" inert>
     <fieldset><legend>接続先</legend>
       <div class="row"><label>サーバURL<input name="endpoint" type="url" required placeholder="http://127.0.0.1" spellcheck="false"></label><label class="port">ポート<input name="port" inputmode="numeric" placeholder="8000"><small>空欄でURLの値</small></label></div>
-      <label>APIパス<input name="path" required placeholder="/v1/chat/completions" spellcheck="false"></label>
-      <label for="api-key">APIキー</label><div class="credential-row"><input id="api-key" name="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="認証なしの場合は空欄" aria-describedby="api-key-help"><button type="button" id="show-key" aria-label="APIキーを表示" aria-pressed="false" aria-controls="api-key">表示</button></div><small id="api-key-help">Bearer認証。設定はこのFirefoxに保存されます。</small>
+      <label for="api-key">APIキー</label>
+      <div class="credential-row"><input id="api-key" name="apiKey" type="password" autocomplete="off" spellcheck="false" aria-describedby="api-key-help"><button type="button" id="show-key" aria-label="APIキーを表示" aria-pressed="false" aria-controls="api-key">表示</button></div>
+      <small id="api-key-help">認証なしの場合は空欄。</small>
       <label>モデル<input name="model" required spellcheck="false"></label>
-      <label>API形式<select name="apiFormat"><option value="top-level">トップレベル</option><option value="template">chat_template_kwargs（MLX / llama.cpp / vLLM）</option></select><small>公式MLXモデルのserve.pyではchat_template_kwargsを使います。</small></label>
+      <details class="advanced"><summary>APIの詳細</summary>
+        <label>APIパス<input name="path" required placeholder="/v1/chat/completions" spellcheck="false"></label>
+        <label>API形式<select name="apiFormat"><option value="top-level">トップレベル</option><option value="template">chat_template_kwargs（MLX / llama.cpp / vLLM）</option></select><small>公式MLXモデルのserve.pyはchat_template_kwargsを選択。</small></label>
+      </details>
       <button type="button" id="test-connection">接続を確認</button>
       <p id="connection-status" role="status" aria-live="polite"></p>
-      <small>入力中の接続先へ短いテスト翻訳を送信します。設定は保存しません。</small>
+      <small>入力中の設定でテスト翻訳します。保存はしません。</small>
     </fieldset>
-    <fieldset><legend>既定の翻訳</legend>
+    <fieldset><legend>翻訳</legend>
       <div class="row"><label>原文<select name="source"></select></label><label>訳文<select name="target"></select></label></div>
       <label>日本語の文体<select name="form"><option value="">指定なし</option><option value="plain">常体（だ・である）</option><option value="polite">敬体（です・ます）</option></select></label>
+      <label class="switch-row">本文だけを翻訳<input name="mainContentOnly" type="checkbox" role="switch"></label>
+      <small>本文が見つからないページでは全体を翻訳します。次の翻訳から反映。</small>
     </fieldset>
-    <fieldset><legend>翻訳の処理</legend>
+    <fieldset><legend>操作と表示</legend>
+      <label class="switch-row">選択した文章の近くに翻訳ボタン<input name="selectionButton" type="checkbox" role="switch"></label>
+      <label class="switch-row">キーボードショートカット<input name="keyboardShortcuts" type="checkbox" role="switch"></label>
+      <label class="switch-row">原文・選択訳文のコピーボタン<input name="copyButton" type="checkbox" role="switch"></label>
+      <label class="switch-row">ホバーで原文を表示<input name="hoverEnabled" type="checkbox" role="switch"></label>
+      <label class="switch-row">リンクにキーボードで移動したときも原文を表示<input name="focusOriginal" type="checkbox" role="switch"></label>
+      <label class="switch-row">ページ内に進捗パネルを表示<input name="pageProgress" type="checkbox" role="switch"></label>
+      <label class="switch-row">進捗の区切りをスクリーンリーダーに通知<input name="announceProgress" type="checkbox" role="switch"></label>
+      <details class="help"><summary>操作方法</summary>
+        <small>選択翻訳ボタンは入力欄・編集可能領域には表示しません。</small>
+        <small>Alt+Shift+Y：ページ翻訳・停止、Alt+Shift+U：選択翻訳、Alt+Shift+O：原文に戻す。Firefoxの「拡張機能のショートカットを管理」で変更できます。</small>
+        <small>Tabで訳文中のリンクへ移動し、F2で原文パネルへ移動。Escapeでリンクに戻れます。</small>
+        <small>進捗パネルを非表示にしても、ツールバーから進捗確認と停止ができます。</small>
+        <small>スクリーンリーダーには開始・25%ごと・完了・停止を通知します。</small>
+      </details>
+    </fieldset>
+    <fieldset><legend>キャッシュ</legend>
+      <label>保存期間（分）<input name="cacheMinutes" type="number" min="0" max="1440" required><small>0で無効。再訪時に一致する段落の訳文を復元します。</small></label>
+      <button type="button" id="clear-cache">キャッシュと履歴を削除</button>
+      <details class="help"><summary>保存内容と削除について</summary>
+        <p><small>原文・訳文と履歴をメモリに最大約8MiB保存します。期限切れ・設定保存・Firefox終了・拡張の再読み込みで消えます。プライベートウィンドウでは保存しません。</small></p>
+      </details>
+    </fieldset>
+    <details class="advanced"><summary>翻訳処理の調整</summary>
       <label class="switch-row">複数の段落をまとめて翻訳<input name="batchTranslation" type="checkbox" role="switch"></label>
       <small>短い段落をまとめて送信し、APIの呼び出し回数を減らします。</small>
       <label>1回にまとめる最大段落数<input name="maxBatchItems" type="number" min="1" max="256" required><small>既定32。表のセルも1段落として数えます。入力トークン上限も適用します。</small></label>
@@ -40,10 +72,8 @@
       <small>同じ優先度の中で、画面内・近くの段落の順に処理します。</small>
       <label class="switch-row">本文をメニュー・サイドバーより先に翻訳<input name="prioritizeContent" type="checkbox" role="switch"></label>
       <small>メニュー・サイドバーを本文の後に処理します。「読み進める順」がオフの場合は、本文内の種類による優先度も使います。翻訳範囲は変わりません。</small>
-      <label class="switch-row">本文だけを翻訳<input name="mainContentOnly" type="checkbox" role="switch"></label>
-      <small>main・role="main"、なければarticle内を対象にします。見つからないページでは全体を翻訳します。次の翻訳開始から反映します。</small>
-    </fieldset>
-    <fieldset><legend>実験的な機能</legend>
+    </details>
+    <details class="advanced"><summary>実験的な機能</summary>
       <label class="switch-row">表示位置に合わせて未送信の段落を選び直す<input name="adaptiveScheduling" type="checkbox" role="switch"></label>
       <small>既定オン。大きくスクロールしたときに読み始める位置を選び直します。送信中の通信は中止しません。</small>
       <label class="switch-row">同じ処理中リクエストを共有<input name="shareInFlight" type="checkbox" role="switch"></label>
@@ -60,32 +90,8 @@
       <small>既定オフ。選択翻訳は受信中から表示し、ページ本文は構造の検証後に反映します。対応APIで使ってください。初回受信時間と参考の生成速度も履歴に記録します。</small>
       <label class="switch-row">一時的なサーバーエラーを自動で再試行<input name="retryTransient" type="checkbox" role="switch"></label>
       <small>HTTP 429・502・503・504のとき最大2回再試行します。待機中も停止できます。既定はオフです。</small>
-    </fieldset>
-    <fieldset><legend>操作と表示</legend>
-      <label class="switch-row">選択した文章の近くに翻訳ボタン<input name="selectionButton" type="checkbox" role="switch"></label>
-      <small>ボタンを押すと翻訳します。入力欄・編集可能領域では表示しません。</small>
-      <label class="switch-row">キーボードショートカット<input name="keyboardShortcuts" type="checkbox" role="switch"></label>
-      <small>Alt+Shift+Y：ページ翻訳／停止、Alt+Shift+U：選択翻訳、Alt+Shift+O：原文に戻す。Firefoxの「拡張機能のショートカットを管理」で変更できます。</small>
-      <label class="switch-row">原文・選択訳文のコピーボタン<input name="copyButton" type="checkbox" role="switch"></label>
-      <label class="switch-row">ホバーで原文を表示<input name="hoverEnabled" type="checkbox" role="switch"></label>
-      <label class="switch-row">リンクにキーボードで移動したときも原文を表示<input name="focusOriginal" type="checkbox" role="switch"></label>
-      <small>Tabで訳文中のリンクへ移動して確認。F2で原文パネルへ移動し、Escapeでリンクに戻れます。</small>
-      <label class="switch-row">ページ内に進捗パネルを表示<input name="pageProgress" type="checkbox" role="switch"></label>
-      <small>オフでもツールバーで進捗確認と停止ができます。</small>
-      <label class="switch-row">進捗の区切りをスクリーンリーダーに通知<input name="announceProgress" type="checkbox" role="switch"></label>
-      <small>開始・25%ごと・完了・停止を通知します。</small>
-    </fieldset>
-    <fieldset><legend>翻訳キャッシュ</legend>
-      <p><a href="history.html">翻訳の履歴と処理速度を見る</a></p>
-      <label>保存期間（分）<input name="cacheMinutes" type="number" min="0" max="1440" required><small>既定30分。0で無効。再訪時は一致する段落の訳文だけを復元します。</small></label>
-      <p><small>原文と訳文は拡張のメモリに最大約8MiB保持します。Firefox終了・拡張の再読み込みで消えます。プライベートウィンドウでは保存しません。設定の保存時にもキャッシュを削除します。</small></p>
-      <button type="button" id="clear-cache">キャッシュを削除</button>
-    </fieldset>
-    <fieldset><legend>エラー記録</legend>
-      <p><a href="errors.html">エラー記録を確認・JSON出力する</a></p>
-      <p><small>エラーの原文・応答・関連情報をローカルに保存します。キャッシュの保存期間・削除・設定保存とは独立し、Firefox再起動後も残ります。最大100件・4MiBで、超過時は古い記録から削除します。プライベートウィンドウと停止操作は記録しません。</small></p>
-    </fieldset>
-    <details class="advanced"><summary>詳細設定</summary>
+    </details>
+    <details class="advanced"><summary>リクエストとトークンの設定</summary>
       <div class="row"><label>同時リクエスト<input name="concurrency" type="number" min="1" max="8" required><small>全タブ共通</small></label><label>タイムアウト（秒）<input name="timeoutSeconds" type="number" min="10" max="1800" required></label></div>
       <label>サーバーのコンテキスト長<input name="contextTokens" type="number" min="8192" max="32768" required><small>入力＋出力の合計。サーバーの設定と合わせてください。拡張からサーバー設定は変更しません。</small></label>
       <label>入力上限（トークン）<input name="inputTokens" type="number" min="128" max="24000" required><small>既定6000。出力8096・辞書・制御情報を除いた残りに自動調整します。大きい入力は初回表示が遅くなる場合があります。</small></label>
@@ -94,4 +100,5 @@
     </details>
     <div class="save-row"><button type="submit" id="save" class="primary" disabled>保存</button><button type="button" id="discard" disabled>変更を破棄</button><p id="status" role="status" aria-live="polite">設定を読み込んでいます…</p></div>
   </form>
-</main></body></html>
+</main>
+</body></html>

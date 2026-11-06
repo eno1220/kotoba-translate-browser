@@ -76,3 +76,17 @@ test('batch controls save numeric tuning and independent switches, then restore 
   e.edit('maxBatchItems', 0); await e.submit(); assert.equal(e.writes(), 1);
   e.$('discard').click(); await e.flush(); assert.equal(e.field('maxBatchItems').value, '12');
 });
+
+test('invalid inputs reveal their collapsed settings sections', async t => {
+  const e = await options(); t.after(() => e.w.close());
+  const field = e.field('batchStartTokens');
+  const sections = [];
+  for (let node = field.parentElement; node; node = node.parentElement) {
+    if (node.tagName === 'DETAILS') sections.push(node);
+  }
+  assert.equal(sections.length, 2);
+  assert.ok(sections.every(section => !section.open));
+  e.edit('batchStartTokens', 0);
+  field.checkValidity();
+  assert.ok(sections.every(section => section.open));
+});

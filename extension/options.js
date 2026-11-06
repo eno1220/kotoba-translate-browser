@@ -80,7 +80,7 @@ document.getElementById("clear-cache").addEventListener("click", async () => {
   try {
     const result = await browser.runtime.sendMessage({ type: "clearCache" });
     if (result.error) throw new Error(result.error);
-    report("キャッシュを削除しました");
+    report("キャッシュと履歴を削除しました");
   } catch (error) { report(error.message, true); }
 });
 // Connect help text to controls without making the entire explanation their name.
@@ -91,3 +91,10 @@ for (const [index, help] of [...form.querySelectorAll("label > small,.switch-row
   }
   help.id = `field-help-${index}`; field?.setAttribute("aria-describedby", help.id);
 }
+
+// Reveal invalid controls before Firefox tries to focus them.
+form.addEventListener("invalid", event => {
+  for (let parent = event.target.parentElement; parent && parent !== form; parent = parent.parentElement) {
+    if (parent.tagName === "DETAILS") parent.open = true;
+  }
+}, true);

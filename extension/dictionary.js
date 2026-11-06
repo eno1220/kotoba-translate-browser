@@ -9,6 +9,9 @@ function dirty() { return JSON.stringify(entries) !== JSON.stringify(saved); }
 function update() {
   const count = entries.filter(e => e.domain === $("scope").value).length;
   $("count").textContent = `この範囲 ${count} / ${L.perScope}件 · 合計 ${entries.length} / ${L.entries}件`;
+  $("empty").hidden = count > 0 || !loaded;
+  $("remove-scope").disabled = !loaded || saving || count === 0 && !$("scope").value;
+  $("save").disabled = !loaded || saving || !dirty();
   $("add-entry").disabled = !loaded || count >= L.perScope || entries.length >= L.entries || saving;
   $("discard").disabled = !loaded || saving || !dirty() && scopes.size === new Set(saved.map(e => e.domain).filter(Boolean)).size;
 }
@@ -43,7 +46,7 @@ function render() {
       input.addEventListener("input", () => { entry[key] = input.value; report("未保存の変更があります"); update(); });
       label.append(input); terms.append(label);
     }
-    row.append(terms);
+    row.insertBefore(terms, langs);
     const remove = document.createElement("button"); remove.type = "button"; remove.textContent = "この用語を削除";
     remove.addEventListener("click", () => { entries.splice(entries.indexOf(entry), 1); render(); report("削除は保存後に反映します"); }); row.append(remove);
     $("entries").append(row);
@@ -97,6 +100,6 @@ async function load() {
     if (scopes.has(normalized) || scopes.size < L.domains) scopes.add(normalized);
     scopeOptions(normalized);
   } else scopeOptions();
-  loaded = true; $("save").disabled = false; render();
+  loaded = true; $("dictionary-form").inert = false; $("dictionary-form").setAttribute("aria-busy", "false"); render(); report("");
 }
 load().catch(error => report(error.message, true));

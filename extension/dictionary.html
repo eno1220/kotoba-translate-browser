@@ -1,20 +1,28 @@
 <!doctype html>
 <html lang="ja">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>翻訳辞書</title><link rel="icon" href="icons/kotoba.svg" type="image/svg+xml"><link rel="stylesheet" href="ui.css"><script src="core.js" defer></script><script src="dictionary.js" defer></script></head>
-<body><main>
-  <h1>翻訳辞書</h1>
-  <p><small>同じ原語はドメイン別を優先します。ドメインは完全一致（サブドメインは別）です。保存後のリクエストからページ・選択翻訳に適用します。</small></p>
-  <form id="dictionary-form">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>辞書 · 翻訳</title><link rel="icon" href="icons/kotoba.svg" type="image/svg+xml"><link rel="stylesheet" href="ui.css"><script src="core.js" defer></script><script src="dictionary.js" defer></script></head>
+<body class="dictionary">
+<main>
+  <header class="page-header"><h1>辞書</h1>
+    <nav class="page-nav" aria-label="拡張機能"><a href="options.html">設定</a><a href="dictionary.html" aria-current="page">辞書</a><a href="history.html">履歴</a><a href="errors.html">エラー記録</a></nav>
+  </header>
+  <form id="dictionary-form" inert aria-busy="true">
     <label>適用範囲<select id="scope"><option value="">全体共通</option></select></label>
-    <div class="row"><label>ドメインを追加<input id="domain" placeholder="example.com" spellcheck="false" aria-describedby="domain-help"><small id="domain-help">URLではなくホスト名を指定</small></label><button type="button" id="add-domain" class="row-button">追加</button></div>
-    <button type="button" id="remove-scope">この範囲の辞書を全件削除</button>
-    <p id="limits"><small>全体共通・各ドメイン100件、合計500件、20ドメインまで。原語・訳語は各100文字まで。同時に適用する辞書は6000 UTF-8バイトまで。</small></p>
+    <details class="help"><summary>ドメインを追加</summary>
+      <div class="row"><label>ドメインを追加<input id="domain" placeholder="example.com" spellcheck="false" aria-describedby="domain-help"><small id="domain-help">example.comのようにホスト名を指定。サブドメインは別に扱います。</small></label><button type="button" id="add-domain" class="row-button">追加</button></div>
+    </details>
     <p id="count" role="status"></p>
+    <p id="empty" hidden class="empty-state">この範囲に用語はありません。「用語を追加」から登録できます。</p>
     <div id="entries"></div>
     <button type="button" id="add-entry">用語を追加</button>
-    <small>原文の「すべて」は自動判定を含む全言語に適用。同じ範囲では原文言語を指定した用語を優先します。原語は大文字・小文字を区別します。</small>
-    <div class="save-row"><button type="submit" class="primary" id="save">保存</button><button type="button" id="discard">変更を破棄</button></div>
-    <p id="status" role="status" aria-live="polite"></p>
+    <details class="help"><summary>この範囲の用語をまとめて削除</summary>
+      <button type="button" id="remove-scope" class="danger">この範囲の用語を全件削除</button>
+    </details>
+    <details class="help"><summary>辞書の適用ルールと上限</summary>
+      <small>同じ原語はドメイン別の辞書を優先します。原文言語の「すべて」は自動判定を含む全言語が対象です。同じ範囲では言語指定を優先し、原語の大文字・小文字を区別します。保存後の翻訳から適用します。</small>
+      <p id="limits"><small>各範囲100件、合計500件、20ドメインまで。原語・訳語は各100文字、1回に適用する辞書は6000 UTF-8バイトまで。</small></p>
+    </details>
+    <div class="save-row"><button type="submit" class="primary" id="save">保存</button><button type="button" id="discard">変更を破棄</button><p id="status" role="status" aria-live="polite">辞書を読み込んでいます…</p></div>
   </form>
-  <p><a href="options.html">翻訳の設定</a></p>
-</main></body></html>
+</main>
+</body></html>

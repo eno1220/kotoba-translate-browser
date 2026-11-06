@@ -82,7 +82,7 @@ details.advanced fieldset { margin-top:16px; }
 .history main { max-width:1120px; }
 .history-actions { display:flex; align-items:center; flex-wrap:wrap; gap:10px; margin-block:20px; }
 #summary { color:var(--muted); font-size:12px; }
-.history-table { overflow:auto; border:1px solid var(--line); border-radius:8px; }
+.history-table { overflow:auto;border:1px solid var(--line);border-radius:6px; }
 .history-table:focus-visible { outline:2px solid var(--blue); outline-offset:3px; }
 table { width:100%; border-collapse:collapse; font-size:13px; font-variant-numeric:tabular-nums; }
 th,td { padding:12px; text-align:start; vertical-align:top; border-bottom:1px solid var(--line); }
@@ -93,7 +93,7 @@ td a { overflow-wrap:anywhere; }
 tr:last-child td { border-bottom:0; }
 time { white-space:nowrap; }
 .history-table small { margin-top:2px; }
-.dictionary-entry { padding:8px 12px 12px; border:1px solid var(--line); border-radius:6px; margin:12px 0; }
+.dictionary-entry { padding:12px 16px;border:1px solid var(--line);border-radius:6px;margin:16px 0;background:#fff; }
 #dictionary-form .save-row { flex-wrap:wrap; }
 .error-entry { margin-block:12px; padding:12px; border:1px solid var(--line); border-radius:6px; }
 .error-entry summary { cursor:pointer; overflow-wrap:anywhere; }
@@ -101,7 +101,52 @@ time { white-space:nowrap; }
 
 .history-totals { margin-block:20px; }
 .history-totals h2 { font-size:15px; }
-.history-totals dl { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:12px; }
-.history-totals dl > div { padding:12px; border:1px solid var(--line); border-radius:6px; background:#fff; }
+.history-totals dl { display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:0;border-block:1px solid var(--line);padding-block:12px; }
+.history-totals dl > div { padding:8px 16px 8px 0;border:0;border-radius:0;background:transparent; }
 .history-totals dt { color:var(--muted); font-size:12px; }
-.history-totals dd { margin:6px 0 0; font-size:20px; font-variant-numeric:tabular-nums; }
+.history-totals dd { margin:6px 0 0;font-size:18px;font-variant-numeric:tabular-nums;margin-top:2px; }
+
+/* Extension pages share navigation, section spacing and save actions. */
+.page-header { margin-bottom:28px; }
+.page-header h1 { font-size:22px; margin-bottom:18px; }
+.page-nav { display:flex; gap:4px 20px; flex-wrap:wrap; border-bottom:1px solid var(--line); }
+.page-nav a { display:block; padding:8px 0; color:var(--muted); text-decoration:none; border-bottom:2px solid transparent; margin-bottom:-1px; }
+.page-nav a:hover { color:var(--blue); }
+.page-nav a[aria-current="page"] { color:var(--blue); border-bottom-color:var(--blue); font-weight:600; }
+.page-header ~ form > fieldset:first-child { margin-top:0; }
+.settings fieldset { margin-top:28px; padding-top:12px; }
+.settings legend { font-size:15px; }
+.settings details.advanced { margin:0; padding:18px 0; border-top:0; }
+.settings form > details.advanced:first-of-type { margin-top:28px; border-top:1px solid var(--line); }
+.settings fieldset details.advanced { margin-top:16px; border-top:1px solid var(--line); }
+.help { margin-block:16px; color:var(--muted); font-size:12px; }
+.help > summary { cursor:pointer; width:fit-content; }
+.help[open] > summary { margin-bottom:12px; }
+.help label,.help input,.help button { font-size:14px; color:#20242b; }
+.help .row { align-items:end; }
+.help .row-button { align-self:auto; margin-bottom:12px; }
+.help p:last-child { margin-bottom:0; }
+.dictionary .save-row { position:sticky; bottom:0; z-index:1; padding-block:16px; border-top:1px solid var(--line); background:#fafafa; }
+.dictionary .save-row #status { flex:1 1 180px; }
+.dictionary-entry legend { padding-inline:4px; }
+.dictionary-entry .row label { margin:4px 0 12px; }
+.dictionary-entry .row + .row label { font-size:12px; color:var(--muted); }
+.dictionary-entry .row + .row select { color:#20242b; }
+.dictionary-entry button { min-height:30px; font-size:12px; padding:4px 8px; }
+.empty-state { padding:24px 16px; margin-block:20px; border:1px solid var(--line); border-radius:6px; color:var(--muted); text-align:center; }
+button.danger { color:#b42318; }
+.check-row { display:flex; align-items:center; gap:8px; font-weight:400; font-size:13px; margin-block:16px; cursor:pointer; }
+.check-row input { width:16px; height:16px; margin:0; }
+.history:not(:has(#show-metrics:checked)) :is(th,td):nth-child(n+6),
+.history:not(:has(#show-metrics:checked)) #totals > div:nth-child(n+5) { display:none; }
+.history table th { background:#f5f5f6; }
+.history td:nth-child(2) { min-width:150px; }
+.history #summary { margin-inline-start:auto; }
+@media(max-width:480px) {
+  .page-header { margin-bottom:24px; }
+  .page-nav { column-gap:18px; }
+  .save-row { gap:10px; }
+  .save-row #status { flex-basis:100%; }
+  .history #summary { margin-inline-start:0; flex-basis:100%; }
+  .help .row > label { flex-basis:140px; }
+}

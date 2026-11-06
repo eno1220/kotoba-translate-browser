@@ -1,16 +1,18 @@
 <!doctype html>
 <html lang="ja">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>翻訳の履歴</title><link rel="icon" href="icons/kotoba.svg" type="image/svg+xml"><link rel="stylesheet" href="ui.css"><script src="history.js" defer></script></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>履歴 · 翻訳</title><link rel="icon" href="icons/kotoba.svg" type="image/svg+xml"><link rel="stylesheet" href="ui.css"><script src="history.js" defer></script></head>
 <body class="history"><main>
-  <header class="header"><h1>翻訳の履歴</h1><a href="options.html">設定</a></header>
-  <p>現在のキャッシュに残っているページ翻訳です。復元だけの操作・選択翻訳は含みません。</p>
-  <div class="history-actions"><button id="refresh" type="button">更新</button><button id="clear-cache" type="button" disabled>キャッシュと履歴を削除</button><span id="summary" role="status"></span></div>
-  <section class="history-totals" aria-labelledby="totals-heading">
-    <h2 id="totals-heading">現在の履歴の合計</h2>
+  <header class="page-header"><h1>履歴</h1>
+    <nav class="page-nav" aria-label="拡張機能"><a href="options.html">設定</a><a href="dictionary.html">辞書</a><a href="history.html" aria-current="page">履歴</a><a href="errors.html">エラー記録</a></nav>
+  </header>
+  <p>キャッシュに残っているページ翻訳を表示します。</p>
+  <div class="history-actions"><button id="refresh" type="button">更新</button><button id="clear-cache" type="button" disabled="" class="danger">キャッシュと履歴を削除</button><span id="summary" role="status"></span></div>
+  <label class="check-row"><input type="checkbox" id="show-metrics">処理の詳細を表示</label><section class="history-totals" aria-labelledby="totals-heading">
+    <h2 id="totals-heading">合計</h2>
     <dl id="totals"></dl>
   </section>
   <p id="status" role="status" aria-live="polite">履歴を読み込んでいます…</p>
-  <p id="empty" hidden>キャッシュに残っている翻訳はありません。</p>
+  <p id="empty" hidden class="empty-state">キャッシュに残っている翻訳はありません。</p>
   <div id="results" hidden>
     <div class="history-table" tabindex="0" role="region" aria-label="翻訳履歴の一覧" aria-describedby="history-help">
       <table>
@@ -20,6 +22,10 @@
       </table>
     </div>
   </div>
-  <p id="history-help"><small>段落数・文字数はキャッシュの残存範囲、時間・API回数・速度は元の処理全体の記録です。API tok/sは出力トークン数÷表示中の処理時間（秒）です。並列API応答の時間を重複加算せず、解析・順番待ち・入力計測を含む翻訳全体の実効速度を示します。生成 tok/sはサーバーの計測値がある場合だけ表示します。合計の速度はトークン数の合計÷対応する時間の合計、初回受信はAPI応答ごとの加重平均です。合計の処理時間は各履歴行の時間の合算で、同時処理した時間も含みます。共有APIの応答は履歴行ごとに数えます。初回受信は送信〜最初の訳文までの平均です。取得できない値は「—」です。</small></p>
-  <p><small>履歴は本文と同じくメモリ内だけに保持し、キャッシュの期限切れ・削除・設定の保存・Firefox終了で消えます。表示中は5秒ごとに更新します。</small></p>
-</main></body></html>
+<details class="help"><summary>履歴の保存と数値について</summary>
+      <p><small>履歴はメモリ内だけに保存され、キャッシュの期限切れ・削除・設定保存・Firefox終了で消えます。選択翻訳やキャッシュの復元は含みません。表示中は5秒ごとに更新します。</small></p><div id="history-help">
+      <p><small>段落数・文字数は現在のキャッシュ内の値です。時間・API応答数・速度は翻訳時の処理全体の記録です。</small></p>
+      <p><small>API tok/sは出力トークン数÷処理時間です。解析・順番待ち・入力計測も含み、並列API応答の時間を重複加算しません。生成 tok/sはサーバーの計測値、初回受信は送信から最初の訳文までの平均です。取得できない値は「—」で表示します。</small></p>
+      <p><small>合計の速度はトークン数の合計÷対応する時間の合計、初回受信はAPI応答ごとの加重平均です。合計時間は各行の時間を合算するため、同時処理した時間も含みます。共有API応答も行ごとに数えます。</small></p>
+    </div></details>
+    </main></body></html>
