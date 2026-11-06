@@ -189,7 +189,7 @@ const parserWindow = new (require("jsdom").JSDOM)("").window;
         check((await send({type:'status'})).translated === 0, 'translated automatically');
         await inspect('window.testClicks = 0; document.querySelector("#link").addEventListener("click", e => {e.preventDefault();window.testClicks++})');
         await inspect('window.modernOriginal = document.querySelector("#modern").innerHTML; window.modernText = document.querySelector("#modern x-label").firstChild; window.articleRoot = document.querySelector("#component").attachShadow({mode:"open"}); window.articleRoot.innerHTML = "<section><slot name=body></slot><p>Shadow prose.</p></section>";');
-        await send({type:'start',source:'en',target:'ja'});
+        await pageAction('translate-page', tab, await getSettings());
         ${process.env.KOTOBA_HISTORY ? 'await browser.tabs.executeScript(tab.id,{code:"history.replaceState({test:true}, document.title, location.href)"});' : ''}
         let firstPaint;
         for (let i=0; i<100; i++) { firstPaint = await send({type:'status'}); if (firstPaint.done > 0) break; await wait(10); }
@@ -248,7 +248,7 @@ const parserWindow = new (require("jsdom").JSDOM)("").window;
         const keyboardOriginal = await inspect('(() => { document.querySelector("#link").blur(); document.querySelector("#link").focus(); document.querySelector("#link").dispatchEvent(new FocusEvent("focusin",{bubbles:true,composed:true})); const root = document.querySelector("[data-kotoba-ui]").shadowRoot; const tip = root.querySelector(".tooltip"); document.dispatchEvent(new KeyboardEvent("keydown",{key:"F2",bubbles:true})); const focused = root.activeElement === tip; document.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true})); return {text:tip?.querySelector(".original").textContent,focused,returned:document.activeElement.id === "link",closed:!root.querySelector(".tooltip")}; })()');
         check(keyboardOriginal.text === 'Read the documentation carefully.' && keyboardOriginal.focused && keyboardOriginal.returned && keyboardOriginal.closed, 'keyboard original dialog failed: '+JSON.stringify(keyboardOriginal));
         await fetch(base + '/screenshot', {method:'POST',body:JSON.stringify({name:'page',image:await browser.tabs.captureTab(tab.id,{format:'png'})})});
-        await send({type:'restore'});
+        await pageAction('restore-page', tab, await getSettings());
         check(await inspect('document.querySelector("#paragraph").textContent') === 'Read the documentation carefully.', 'restore failed');
         check(await inspect('document.querySelector("#modern").innerHTML === window.modernOriginal && document.querySelector("[slot=body]").textContent === "Slotted article." && window.articleRoot.querySelector("p").textContent === "Shadow prose."'), 'modern DOM restore failed');
         check(await inspect('document.querySelector("#inline-sentence a").id') === 'posts', 'original link order was not restored');

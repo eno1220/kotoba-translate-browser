@@ -15,6 +15,7 @@
   let appliedDirection = null;
   let panelKind, pageUI, pageDismissed = false, panelTimer, selectionCleanup;
   let showTimer, hideTimer, hoverCandidate, hoverAnchor, pinned = false, marks;
+  let hoverFrame = null, hoverPoint;
   let requestSequence = 0;
   const progressListeners = new Map();
   let scrollDirection = 1, previousScrollY = scrollY;
@@ -84,7 +85,8 @@
       progress::-moz-progress-bar { background:#0ba5ec; border-radius:3px; }
       .progress-track { position:relative; border-radius:3px; overflow:hidden; }
       .progress-pending { position:absolute; inset-block:0; pointer-events:none; background:repeating-linear-gradient(120deg,#bae6fd 0 4px,#e0f2fe 4px 8px); }
-      .progress-activity { display:flex; flex-wrap:wrap; justify-content:space-between; gap:2px 10px; margin-top:6px; color:#62626c; font-size:11px; font-variant-numeric:tabular-nums; }
+      .progress-activity { display:grid; grid-template-columns:minmax(0,1fr); grid-template-rows:repeat(2,1.65em); gap:2px; margin-top:6px; color:#62626c; font-size:11px; line-height:1.65; font-variant-numeric:tabular-nums; }
+      .progress-activity > span { min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
       details { font-size:12px; color:#71717a; } summary { cursor:pointer; } details p { color:#52525b; max-height:150px; overflow:auto; }
       .mark { position:fixed; pointer-events:none; border-radius:2px; background:#0ea5e91a; border-bottom:1px solid #0ea5e955; }
       .original { margin:0; font-size:14px; line-height:1.75; user-select:text; } .tooltip .heading { margin-bottom:6px; }
@@ -186,6 +188,7 @@
     if (!state.running) { clearInterval(panelTimer); panelTimer = null; }
   }
   function clearTooltip() {
+    cancelAnimationFrame(hoverFrame); hoverFrame = null; hoverPoint = null;
     clearTimeout(showTimer); clearTimeout(hideTimer); showTimer = null; hideTimer = null; hoverCandidate = null;
     const focused = tooltip?.contains(shadow.activeElement);
     tooltip?.remove(); marks?.remove(); tooltip = null; marks = null; lastHover = null; pinned = false;
@@ -429,6 +432,7 @@
     }
     if (scan.prioritizeVisible || scan.prioritizeContent || scan.semanticBatching || scan.adaptiveScheduling) {
       const ordered = [];
+      const figureComponents = new WeakMap();
       for (const group of groups) {
         if (scan.responsiveScan && ++visited % 80 === 0) await yieldToBrowser();
         if (run !== generation) throw new DOMException("キャンセルしました", "AbortError");
@@ -440,7 +444,15 @@
         const chrome = peripheral || (banner && (!article || !article.contains(banner)) ? banner : null);
         const table = context.closest('table,[role="table"],[role="grid"]');
         const figure = context.closest("figure");
-        const gallery = figure && (figure.previousElementSibling?.tagName === "FIGURE" || figure.nextElementSibling?.tagName === "FIGURE") ? figure.parentElement : null;
+        // Consecutive figures share the first figure as their boundary, not the
+        // enclosing article (which would also pull unrelated prose into it).
+        let gallery = figure;
+        while (gallery?.previousElementSibling?.tagName === "FIGURE") {
+          const previous = gallery.previousElementSibling;
+          gallery = figureComponents.get(previous) || previous;
+          if (figureComponents.has(previous)) break;
+        }
+        if (figure) figureComponents.set(figure, gallery);
         group.priority = chrome ? 3 : content ? (table || context.closest("summary") ? 1 : 0) : 2;
         group.component = table || chrome || gallery || context.closest('section,blockquote,figure,article,main,[role="main"],[role="article"],[role="list"],ul,ol,dl') || context.closest("div") || context.getRootNode().host || document.body;
         group.semanticUnit = context.closest('tr,li,figure,blockquote,[role="row"],[role="listitem"]');
@@ -565,7 +577,7 @@
   }
   async function translatePage(source, target) {
     currentPage();
-    if (state.running) return { ...state };
+    if (state.running) return pageState();
     if (appliedDirection && appliedDirection !== `${source}:${target}`) restore();
     state.source = source; state.target = target;
     const run = ++generation;
@@ -799,7 +811,7 @@
     if (record) return record;
     // caretPositionFromPoint may stop at a shadow host. The composed event path
     // still contains elements inside an open shadow root.
-    for (const element of event.composedPath()) {
+    for (const element of event.path) {
       if (element.nodeType !== Node.ELEMENT_NODE) continue;
       for (const node of element.childNodes) {
         if (node.nodeType === Node.TEXT_NODE) { const found = hit(node); if (found) return found; }
@@ -858,21 +870,43 @@
     tooltip.addEventListener("focusin", () => { clearTimeout(hideTimer); hideTimer = null; });
     tooltip.addEventListener("focusout", event => { if (!tooltip?.contains(event.relatedTarget)) scheduleHide(); });
   }
-  document.addEventListener("pointermove", event => {
-    if (event.composedPath().includes(host)) return;
-    if (!records.size) return;
-    if (!state.hoverEnabled || event.buttons || event.pointerType === "touch" || !getSelection()?.isCollapsed) { if (!pinned) scheduleHide(); return; }
-    if (pinned) return;
-    const match = hoverRecord(event);
+  function updateHover() {
+    hoverFrame = null;
+    const point = hoverPoint; hoverPoint = null;
+    if (!point || pinned || !records.size || !state.hoverEnabled) return;
+    const match = hoverRecord(point);
     if (!match) { scheduleHide(); return; }
     clearTimeout(hideTimer); hideTimer = null;
     if (lastHover === match.group || hoverCandidate === match.group) return;
     clearTimeout(showTimer); hoverCandidate = match.group; hoverAnchor = match.anchor;
     showTimer = setTimeout(() => showOriginal(match.group, hoverAnchor), 280);
+  }
+  document.addEventListener("pointermove", event => {
+    if (!records.size) return;
+    const path = event.composedPath();
+    if (path.includes(host)) {
+      cancelAnimationFrame(hoverFrame); hoverFrame = null; hoverPoint = null;
+      clearTimeout(showTimer); hoverCandidate = null;
+      return;
+    }
+    if (!state.hoverEnabled || event.buttons || event.pointerType === "touch" || !getSelection()?.isCollapsed) {
+      cancelAnimationFrame(hoverFrame); hoverFrame = null; hoverPoint = null;
+      if (!pinned) scheduleHide(); return;
+    }
+    if (pinned) return;
+    // Event paths disappear after dispatch. Keep just the latest hit-test input
+    // and measure text geometry once per frame, including in open shadow DOM.
+    hoverPoint = { clientX: event.clientX, clientY: event.clientY, path };
+    if (hoverFrame === null) hoverFrame = requestAnimationFrame(updateHover);
   }, { passive: true });
   document.addEventListener("pointerdown", event => { if (!event.composedPath().includes(host)) clearTooltip(); }, { passive: true });
   document.addEventListener("scroll", clearTooltip, { passive: true, capture: true });
-  document.addEventListener("pointerout", event => { if (!event.relatedTarget && !pinned) scheduleHide(); });
+  document.addEventListener("pointerout", event => {
+    if (!event.relatedTarget && !pinned) {
+      cancelAnimationFrame(hoverFrame); hoverFrame = null; hoverPoint = null;
+      scheduleHide();
+    }
+  });
   addEventListener("resize", clearTooltip);
   addEventListener("blur", clearTooltip);
   document.addEventListener("keydown", event => {
@@ -1038,6 +1072,7 @@
     node.tabIndex = -1; node.focus({ preventScroll: true });
     await run();
   }
+  function pageState() { return { ...state, translated: records.size }; }
   browser.runtime.onMessage.addListener(async message => {
     currentPage();
     try {
@@ -1049,19 +1084,19 @@
       if (message.type === "hover") {
         state.hoverEnabled = message.hoverEnabled !== false;
         if (!state.hoverEnabled) clearTooltip();
-        return { ...state };
+        return pageState();
       }
-      if (message.type === "status") return { ...state, translated: records.size };
+      if (message.type === "status") return pageState();
       if (message.type === "preferencesChanged") { applyPreferences(message.preferences); return { ok: true }; }
       if (message.type === "restoreCache") {
         await readPreferences();
         // A pending cache lookup must never override a manual action or a new URL.
-        if (message.url !== state.url || state.source || state.running || records.size) return { ...state };
+        if (message.url !== state.url || state.source || state.running || records.size) return pageState();
         state.source = message.source; state.target = message.target;
         const entries = new Map(message.entries.map(entry => [entry.input, entry.document]));
         const run = generation;
         const groups = await collect(run);
-        if (run !== generation) return { ...state };
+        if (run !== generation) return pageState();
         let restored = 0, restoredChars = 0;
         for (const group of groups) {
           const tree = entries.get(JSON.stringify(group.document));
@@ -1074,26 +1109,26 @@
           state.cacheRestored = true;
           state.message = "保存した訳文を復元しました";
         } else { state.source = null; state.target = null; }
-        return { ...state };
+        return pageState();
       }
       if (message.type === "configure") {
         if ((state.source && state.source !== message.source || state.target && state.target !== message.target) && records.size) restore();
         state.source = message.source; state.target = message.target;
-        return { ...state };
+        return pageState();
       }
       if (message.type === "start") {
         const beforePreferences = generation;
         const prefs = await readPreferences();
-        if (beforePreferences !== generation) return { ...state };
+        if (beforePreferences !== generation) return pageState();
         if (prefs.error) throw new Error(prefs.error);
         state.batchTranslation = prefs.batchTranslation === true;
         state.concurrency = prefs.concurrency || message.concurrency || 1;
         // Don't keep the popup alive for the whole page translation.
         translatePage(message.source, message.target).catch(error => { state.running = false; state.preparing = false; state.finishedAt = Date.now(); state.message = error.message; statusPanel(); });
-        return { ...state };
+        return pageState();
       }
-      if (message.type === "stop") { stop(); return { ...state }; }
-      if (message.type === "restore") { restore(); return { ...state }; }
+      if (message.type === "stop") { stop(); return pageState(); }
+      if (message.type === "restore") { restore(); return pageState(); }
       if (message.type === "selection") { selection(message).catch(error => { box("選択範囲を翻訳").append(document.createTextNode(error.message)); }); return { ok: true }; }
       throw new Error("不明な操作です。");
     } catch (error) { return { error: error.message }; }

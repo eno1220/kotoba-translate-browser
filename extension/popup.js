@@ -8,7 +8,7 @@ for (const id of ["source", "target"]) {
     $(id).append(option);
   }
 }
-let tabId, timer, ready = false;
+let tabId, timer, ready = false, polling = false, closed = false, revision = 0, lastState;
 function error(value) {
   $("status").textContent = value.message || String(value); $("status").classList.add("error");
   const stale = value.code === "stale_content";
@@ -25,6 +25,7 @@ async function page(action) {
   return result;
 }
 function render(state) {
+  lastState = state;
   running = state.running;
   $("status").classList.remove("error");
   $("status").textContent = state.cacheRestored ? "保存した訳文を復元しました" : state.running || state.total && !state.failed && !state.skipped ? "" : state.message || "";
@@ -42,15 +43,38 @@ function render(state) {
   $("counts").textContent = `${state.done} / ${state.total} 段落`;
   $("elapsed").textContent = state.startedAt ? `${Math.floor(((state.finishedAt || Date.now()) - state.startedAt) / 1000)}秒` : "";
   $("hover").checked = state.hoverEnabled !== false;
-  $("start").textContent = state.running ? "翻訳を停止" : state.failed ? "未翻訳部分を再試行" : state.total && percent < 100 ? "翻訳を再開" : "ページを翻訳";
+  $("start-label").textContent = state.running ? "翻訳を停止" : state.failed ? "未翻訳部分を再試行" : state.total && percent < 100 ? "翻訳を再開" : "ページを翻訳";
+  $("start").classList.toggle("running", state.running);
+  controls();
+}
+function controls() {
   $("start").disabled = !ready || busy;
   $("selection").disabled = !ready || busy;
-  $("restore").disabled = busy || !state.translated && !state.running;
-  $("source").disabled = state.running; $("target").disabled = state.running;
-  $("swap").disabled = state.running || $("source").value === "auto";
+  $("restore").disabled = !ready || busy || !lastState?.translated && !running;
+  $("source").disabled = !ready || busy || running; $("target").disabled = !ready || busy || running;
+  $("swap").disabled = !ready || busy || running || $("source").value === "auto";
+  $("hover").disabled = !ready || busy;
+}
+function scheduleRefresh() {
+  clearTimeout(timer);
+  if (ready && !closed && !document.hidden && !busy) timer = setTimeout(refresh, running ? 700 : 2500);
 }
 async function refresh() {
-  try { const state = await page("status"); render(state); } catch (e) { error(e); }
+  if (polling || closed || document.hidden || busy || !ready) return;
+  polling = true;
+  const version = revision;
+  try { const state = await page("status"); if (version === revision) render(state); }
+  catch (e) { if (version === revision) error(e); }
+  finally { polling = false; scheduleRefresh(); }
+}
+async function perform(action) {
+  if (!ready || busy) return;
+  busy = true; revision++; clearTimeout(timer); controls();
+  try {
+    const state = await page(action);
+    if (action === "selection") window.close(); else render(state);
+  } catch (e) { error(e); }
+  finally { busy = false; controls(); scheduleRefresh(); }
 }
 async function init() {
   try {
@@ -63,38 +87,31 @@ async function init() {
     if (!/^https?:\/\//.test(tab.url || "")) throw new Error("通常のWebページで開いてください。Firefoxの内部ページやPDFでは利用できません。");
     const state = await page("status");
     $("source").value = state.source || prefs.source; $("target").value = state.target || prefs.target;
-    ready = true; render(state); timer = setInterval(refresh, 700);
-  } catch (e) { error(e); }
+    ready = true; render(state); scheduleRefresh();
+  } catch (e) { error(e); controls(); }
 }
 for (const action of ["start", "restore", "selection"]) {
-  $(action).addEventListener("click", async () => {
-    try {
-      busy = true; $(action).disabled = true;
-      await page(action === "start" && running ? "stop" : action);
-      busy = false;
-      if (action === "selection") window.close(); else await refresh();
-    } catch (e) { busy = false; error(e); $(action).disabled = !ready; }
-  });
+  $(action).addEventListener("click", () => perform(action === "start" && running ? "stop" : action));
 }
-for (const id of ["source", "target"]) $(id).addEventListener("change", async () => {
-  try { await page("configure"); await refresh(); } catch (e) { error(e); }
-});
+for (const id of ["source", "target"]) $(id).addEventListener("change", () => perform("configure"));
 $("options").addEventListener("click", () => browser.runtime.openOptionsPage());
 $("history").addEventListener("click", async () => {
   try { await browser.tabs.create({ url: browser.runtime.getURL("history.html") }); window.close(); }
   catch (e) { error(e); }
 });
-$("swap").addEventListener("click", async () => {
+$("swap").addEventListener("click", () => {
   [$("source").value, $("target").value] = [$("target").value, $("source").value];
-  try { await page("configure"); await refresh(); } catch (e) { error(e); }
+  perform("configure");
 });
-$("hover").addEventListener("change", async () => {
-  try { await page("hover"); } catch (e) { error(e); }
-});
+$("hover").addEventListener("change", () => perform("hover"));
 $("reload").addEventListener("click", async () => {
   try { await browser.tabs.reload(tabId); window.close(); } catch (e) { error(e); }
 });
-addEventListener("unload", () => clearInterval(timer));
+document.addEventListener("visibilitychange", () => {
+  clearTimeout(timer);
+  if (!document.hidden) refresh();
+});
+addEventListener("unload", () => { closed = true; clearTimeout(timer); });
 init();
 
 for (const [id, key] of [["batch-translation", "batchTranslation"], ["main-content-only", "mainContentOnly"]]) $(id).addEventListener("change", async () => {

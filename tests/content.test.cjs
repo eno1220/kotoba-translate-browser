@@ -71,7 +71,9 @@ test("manual DOM translation preserves links and code, skips hidden/editable/tar
   assert.equal(a.getAttribute("href"), "/docs"); a.click(); assert.equal(clicks, 1);
   assert.equal(s.w.document.querySelector("pre").textContent, "do not translate code");
   assert.equal(s.w.document.querySelector('[lang="ja"]').textContent, "日本語です");
-  await s.message({ type: "restore" });
+  const stopped = await s.message({ type: "stop" });
+  assert.ok(stopped.translated > 0); assert.equal(stopped.running, false);
+  assert.equal((await s.message({ type: "restore" })).translated, 0);
   assert.equal(s.w.document.querySelector("#p").textContent, "Read the docs carefully.");
   s.dom.window.close();
 });
@@ -222,6 +224,30 @@ test("original hover waits, stays stable across inline nodes, and supports pinni
   move(); await new Promise(r => setTimeout(r, 310));
   assert.equal(s.shadow.querySelector(".tooltip"), null);
   s.dom.window.close();
+});
+
+test("hover coalesces pointer bursts, retains dispatched paths and cancels pending work on scroll", async t => {
+  const s = setup('<p>Read the documentation carefully.</p>');
+  t.after(() => s.dom.window.close());
+  await s.message({ type: "start", source: "en", target: "ja" }); await s.settle();
+  let frame, latestX, hits = 0;
+  s.w.requestAnimationFrame = fn => { frame = fn; return 1; };
+  s.w.cancelAnimationFrame = () => { frame = null; };
+  // Exercise the composed-path fallback after dispatch (e.g. a shadow host).
+  s.w.document.caretPositionFromPoint = x => { latestX = x; hits++; return null; };
+  const paragraph = s.w.document.querySelector("p");
+  const move = x => paragraph.dispatchEvent(new s.w.MouseEvent("pointermove", { clientX: x, clientY: 10, bubbles: true }));
+  for (let x = 1; x <= 60; x++) move(x);
+  assert.equal(hits, 0);
+  frame(); frame = null;
+  assert.equal(hits, 1); assert.equal(latestX, 60);
+  await new Promise(resolve => setTimeout(resolve, 300));
+  assert.equal(s.shadow.querySelector(".tooltip .original").textContent, "Read the documentation carefully.");
+  move(20); assert.ok(frame);
+  s.w.document.dispatchEvent(new s.w.Event("scroll"));
+  assert.equal(frame, null);
+  assert.equal(s.shadow.querySelector(".tooltip"), null);
+  assert.equal(hits, 1);
 });
 
 

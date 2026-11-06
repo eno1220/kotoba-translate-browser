@@ -689,12 +689,31 @@ browser.tabs.onUpdated.addListener((tabId, change, tab) => {
   if (tab && /^https?:/.test(change.url)) restoreCachedPage({ tab, url: change.url, frameId: 0 }).catch(() => {});
 });
 browser.contextMenus.create({ id: "kotoba-selection", title: "選択したテキストを翻訳", contexts: ["selection"], documentUrlPatterns: ["http://*/*", "https://*/*"] });
+browser.contextMenus.create({ id: "kotoba-page", title: "ページ翻訳／停止", contexts: ["page"], documentUrlPatterns: ["http://*/*", "https://*/*"] });
+browser.contextMenus.create({ id: "kotoba-restore", title: "原文に戻す", contexts: ["page"], documentUrlPatterns: ["http://*/*", "https://*/*"] });
+async function pageAction(command, tab, s) {
+  await ensureContent(tab.id);
+  const state = await browser.tabs.sendMessage(tab.id, { type: "status" }, { frameId: 0 });
+  const type = command === "translate-page" ? state.running ? "stop" : "start"
+    : command === "translate-selection" ? "selection" : "restore";
+  const result = await browser.tabs.sendMessage(tab.id, { type, source: state.source || s.source, target: state.target || s.target }, { frameId: 0 });
+  if (result?.error) throw new Error(result.error);
+  await browser.browserAction.setBadgeText({ tabId: tab.id, text: "" });
+  await browser.browserAction.setTitle({ tabId: tab.id, title: "Kotoba 翻訳" });
+}
 browser.contextMenus.onClicked.addListener(async (info, tab) => {
-  if (info.menuItemId !== "kotoba-selection") return;
+  if (!["kotoba-selection", "kotoba-page", "kotoba-restore"].includes(info.menuItemId) || !tab?.id || !/^https?:/.test(tab.url || "")) return;
   try {
-    await ensureContent(tab.id, info.frameId || 0);
     const s = await getSettings();
-    await browser.tabs.sendMessage(tab.id, { type: "selection", text: info.selectionText, defaults: { source: s.source, target: s.target }, concurrency: s.concurrency }, { frameId: info.frameId || 0 });
+    if (info.menuItemId !== "kotoba-selection") {
+      await pageAction(info.menuItemId === "kotoba-page" ? "translate-page" : "restore-page", tab, s);
+      return;
+    }
+    await ensureContent(tab.id, info.frameId || 0);
+    const result = await browser.tabs.sendMessage(tab.id, { type: "selection", text: info.selectionText, defaults: { source: s.source, target: s.target }, concurrency: s.concurrency }, { frameId: info.frameId || 0 });
+    if (result?.error) throw new Error(result.error);
+    await browser.browserAction.setBadgeText({ tabId: tab.id, text: "" });
+    await browser.browserAction.setTitle({ tabId: tab.id, title: "Kotoba 翻訳" });
   } catch (error) {
     // Firefox's restricted pages reject injection. Keep a visible indication.
     await browser.browserAction.setBadgeText({ tabId: tab.id, text: "!" });
@@ -703,13 +722,10 @@ browser.contextMenus.onClicked.addListener(async (info, tab) => {
 });
 browser.commands.onCommand.addListener(async (command, tab) => {
   try {
+    if (!["translate-page", "translate-selection", "restore-page"].includes(command)) return;
     const s = await getSettings();
     if (!s.keyboardShortcuts || !tab?.id || !/^https?:/.test(tab.url || "")) return;
-    await ensureContent(tab.id);
-    const state = await browser.tabs.sendMessage(tab.id, { type: "status" }, { frameId: 0 });
-    const type = command === "translate-page" ? state.running ? "stop" : "start"
-      : command === "translate-selection" ? "selection" : command === "restore-page" ? "restore" : null;
-    if (type) await browser.tabs.sendMessage(tab.id, { type, source: state.source || s.source, target: state.target || s.target }, { frameId: 0 });
+    await pageAction(command, tab, s);
   } catch (error) {
     if (tab?.id) {
       await browser.browserAction.setBadgeText({ tabId: tab.id, text: "!" });

@@ -3,11 +3,12 @@ const assert = require("node:assert/strict");
 const vm = require("node:vm");
 const { readFileSync } = require("node:fs");
 function background(responder, settings = {}, storage = {}) {
-  let listener, commandListener, settingsChanged, active = 0, maximum = 0, reads = 0;
+  let listener, commandListener, menuListener, settingsChanged, active = 0, maximum = 0, reads = 0, pageState = {};
   let now = Date.now();
   const calls = [];
   const progress = [];
   const clipboard = [];
+  const menus = [], pageMessages = [], badges = [];
   const event = { addListener() {} };
   const context = vm.createContext({
     console, URL, TextEncoder, TextDecoder, AbortController, DOMException, setTimeout, clearTimeout, setInterval() {}, Date: class extends Date { static now() { return now; } }, DOMParser: new (require("jsdom").JSDOM)("").window.DOMParser,
@@ -15,8 +16,9 @@ function background(responder, settings = {}, storage = {}) {
     browser: {
       runtime: { getManifest: () => ({ version: "0.1.3" }), id: "test", getURL: path => `moz-extension://test/${path}`, onMessage: { addListener: fn => listener = fn } },
       storage: { local: { get: async key => { reads++; return key === "settings" ? { settings } : structuredClone(storage); }, set: async values => Object.assign(storage, structuredClone(values)) }, onChanged: { addListener: fn => settingsChanged = fn } },
-      tabs: { onRemoved: event, onUpdated: event, query: async () => [], sendMessage: async (_tab, message) => { progress.push(message); return { protocol: 5 }; } },
-      commands: { onCommand: { addListener: fn => commandListener = fn } }, contextMenus: { create() {}, onClicked: event }
+      tabs: { onRemoved: event, onUpdated: event, query: async () => [], sendMessage: async (tabId, message, options) => { progress.push(message); pageMessages.push({ tabId, message, options }); return message.type === "status" ? pageState : { protocol: 5 }; } },
+      browserAction: { setBadgeText: async value => badges.push(value), setTitle: async () => {} },
+      commands: { onCommand: { addListener: fn => commandListener = fn } }, contextMenus: { create: value => menus.push(value), onClicked: { addListener: fn => menuListener = fn } }
     },
     fetch: async (url, options) => {
       active++; maximum = Math.max(maximum, active);
@@ -31,7 +33,9 @@ function background(responder, settings = {}, storage = {}) {
   });
   for (const file of ["core.js", "background.js"]) vm.runInContext(readFileSync(require.resolve(`../extension/${file}`), "utf8"), context);
   return {
-    calls, progress, clipboard, max: () => maximum, reads: () => reads,
+    calls, progress, clipboard, menus, pageMessages, badges, max: () => maximum, reads: () => reads,
+    pageState: value => pageState = value,
+    menu: (info, tab = { id: 1, url: "https://example.org" }) => menuListener(info, tab),
     command: (name, tab = { id: 1, url: "https://example.org" }) => commandListener(name, tab),
     content: message => listener(message, { id: "test", tab: { id: 1 }, frameId: 0, url: "http://example.org" }),
     tick: milliseconds => now += milliseconds,
@@ -42,6 +46,29 @@ function background(responder, settings = {}, storage = {}) {
   };
 }
 const completion = text => ({ choices: [{ message: { content: text }, finish_reason: "stop" }] });
+
+test("context menu starts and stops the top page with its languages, restores it and keeps selection frames", async () => {
+  const b = background(() => assert.fail("menu control must not call the model"), { keyboardShortcuts: false });
+  assert.equal(b.menus.length, 3);
+  b.pageState({ source: "de", target: "en", running: false });
+  await b.menu({ menuItemId: "kotoba-page", frameId: 7 });
+  assert.equal(b.pageMessages.at(-1).message.type, "start");
+  assert.equal(b.pageMessages.at(-1).message.source, "de");
+  assert.equal(b.pageMessages.at(-1).message.target, "en");
+  assert.equal(b.pageMessages.at(-1).options.frameId, 0);
+  b.pageState({ source: "de", target: "en", running: true });
+  await b.menu({ menuItemId: "kotoba-page" });
+  assert.equal(b.progress.at(-1).type, "stop");
+  await b.menu({ menuItemId: "kotoba-restore" });
+  assert.equal(b.progress.at(-1).type, "restore");
+  await b.menu({ menuItemId: "kotoba-selection", selectionText: "Selected frame text", frameId: 7 });
+  assert.equal(b.pageMessages.at(-1).message.text, "Selected frame text");
+  assert.equal(b.pageMessages.at(-1).options.frameId, 7);
+  assert.equal(b.badges.at(-1).text, "");
+  const count = b.pageMessages.length;
+  await b.menu({ menuItemId: "kotoba-page" }, { id: 1, url: "about:config" });
+  assert.equal(b.pageMessages.length, count);
+});
 
 test("copy is allowed only when enabled and shortcuts respect their switch and restricted pages", async () => {
   const b = background(() => assert.fail("control actions must not call the model"), { copyButton: false, keyboardShortcuts: false, apiKey: "secret" });
