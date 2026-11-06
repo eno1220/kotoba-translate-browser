@@ -52,6 +52,24 @@ function setup(html, translator = translateTree, preferences = {}) {
   return { dom, w, calls, copied, message, settle, get shadow() { return shadow; } };
 }
 
+test("easy Japanese translates Japanese page text and is available for selection translation", async () => {
+  const s = setup('<html lang="ja"><body><p>日本語の文章です。</p></body></html>');
+  await s.message({ type: "start", source: "ja", target: "ja(easy)" }); await s.settle();
+  assert.equal(s.calls[0].target, "ja(easy)");
+  assert.equal(textOf(s.calls[0].document), "日本語の文章です。");
+  await s.message({ type: "restore" });
+  const range = s.w.document.createRange(); range.selectNodeContents(s.w.document.querySelector('p'));
+  s.w.getSelection().addRange(range);
+  await s.message({ type: "selection", source: "ja", target: "ja(easy)" });
+  await new Promise(setImmediate);
+  const target = s.shadow.querySelectorAll('.languages select')[1];
+  assert.equal(target.value, "ja(easy)");
+  assert.equal(target.selectedOptions[0].textContent, "やさしい日本語");
+  assert.equal(s.shadow.querySelector('.result').lang, "ja");
+  assert.equal(s.calls.at(-1).target, "ja(easy)");
+  s.w.close();
+});
+
 test("manual DOM translation preserves links and code, skips hidden/editable/target-language text", async () => {
   const s = setup(`<html lang="en"><body><p id="p">Read <a href="/docs">the docs</a> carefully.</p>
     <pre>do not translate code</pre><p><code>let value = 1</code></p>

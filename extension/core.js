@@ -19,7 +19,7 @@ globalThis.Kotoba = (() => {
   function contentPreferences(s) {
     return Object.fromEntries(["concurrency", "inputTokens", "tokenizer", "maxBatchItems", "batchStartItems", "batchStartTokens", "batchGrowthFactor", "batchTargetSeconds", ...FEATURES.filter(key => !["retryTransient", "streamTranslation", "shareInFlight", "relevantGlossary"].includes(key))].map(key => [key, s[key]]));
   }
-  const LANGUAGES = "ja en zh-hans zh-hant ko ar az be bg bn ca ceb de es et eu fa fr gu he hi hr hu hy id it jv ka kk km lt lv ml mr ms my ne nl pa pl ru si sk sl sr sw ta te th tl ur uz vi".split(" ");
+  const LANGUAGES = "ja ja(easy) en zh-hans zh-hant ko ar az be bg bn ca ceb de es et eu fa fr gu he hi hr hu hy id it jv ka kk km lt lv ml mr ms my ne nl pa pl ru si sk sl sr sw ta te th tl ur uz vi".split(" ");
   function settings(raw = {}) {
     const s = { ...DEFAULTS, ...raw };
     const url = new URL(s.endpoint);

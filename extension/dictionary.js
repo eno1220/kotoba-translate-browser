@@ -23,7 +23,7 @@ function scopeOptions(selected = $("scope").value) {
 function languageSelect(value, source, change) {
   const select = document.createElement("select");
   select.setAttribute("aria-label", source ? "原文言語" : "訳文言語");
-  for (const code of [...(source ? ["auto"] : []), ...Kotoba.LANGUAGES]) select.append(new Option(code === "auto" ? "すべて" : names.of(code), code));
+  for (const code of [...(source ? ["auto"] : []), ...Kotoba.LANGUAGES]) select.append(new Option(code === "auto" ? "すべて" : code === "ja(easy)" ? "やさしい日本語" : names.of(code), code));
   select.value = value;
   select.addEventListener("change", () => { change(select.value); report("未保存の変更があります"); update(); });
   return select;

@@ -4,6 +4,16 @@ require("../extension/core.js");
 globalThis.DOMParser = new (require("jsdom").JSDOM)("").window.DOMParser;
 const K = globalThis.Kotoba;
 
+test("easy Japanese is accepted and sent unchanged in both API formats", () => {
+  for (const apiFormat of ["top-level", "template"]) {
+    const s = K.settings({ apiFormat, target: "ja(easy)" });
+    const body = K.body(s, "日本語の文章です。", { source: "ja", target: s.target, domain: "https://example.com" });
+    const options = apiFormat === "template" ? body.chat_template_kwargs : body;
+    assert.equal(options.source_lang, "ja");
+    assert.equal(options.target_lang, "ja(easy)");
+  }
+});
+
 test("feature switches are booleans and content preferences never expose connection settings", () => {
   for (const key of K.FEATURES) {
     assert.equal(K.settings({ [key]: false })[key], false);

@@ -47,6 +47,19 @@ function background(responder, settings = {}, storage = {}) {
 }
 const completion = text => ({ choices: [{ message: { content: text }, finish_reason: "stop" }] });
 
+test("background accepts easy Japanese settings and translation requests", async () => {
+  for (const apiFormat of ["top-level", "template"]) {
+    const b = background(() => completion("やさしい日本語です。"), { target: "ja(easy)", apiFormat });
+    const preferences = await b.control({ type: "preferences" });
+    assert.equal(preferences.target, "ja(easy)");
+    const result = await b.send(["日本語の文章です。"], { source: "ja", target: "ja(easy)" });
+    assert.equal(result.error, undefined);
+    assert.equal(result.parts[0], "やさしい日本語です。");
+    const options = apiFormat === "template" ? b.calls[0].body.chat_template_kwargs : b.calls[0].body;
+    assert.equal(options.target_lang, "ja(easy)");
+  }
+});
+
 test("context menu starts and stops the top page with its languages, restores it and keeps selection frames", async () => {
   const b = background(() => assert.fail("menu control must not call the model"), { keyboardShortcuts: false });
   assert.equal(b.menus.length, 3);

@@ -40,7 +40,7 @@ function render(data) {
     const site = document.createElement('div'), url = new URL(entry.url);
     const link = document.createElement('a'); link.textContent = url.hostname; link.title = url.href;
     if (/^https?:$/.test(url.protocol)) { link.href = url.href; link.target = '_blank'; link.rel = 'noopener noreferrer'; }
-    const languages = document.createElement('small'); languages.textContent = `${entry.source === 'auto' ? '自動判定' : names.of(entry.source)} → ${names.of(entry.target)}`;
+    const languages = document.createElement('small'); languages.textContent = `${entry.source === 'auto' ? '自動判定' : entry.source === 'ja(easy)' ? 'やさしい日本語' : names.of(entry.source)} → ${entry.target === 'ja(easy)' ? 'やさしい日本語' : names.of(entry.target)}`;
     site.append(link, languages); cell(row, 1, site);
     cell(row, 2, number.format(entry.paragraphs)); cell(row, 3, number.format(entry.characters));
     cell(row, 4, `${(entry.milliseconds / 1000).toFixed(1)}秒`);

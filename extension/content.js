@@ -895,7 +895,7 @@
     pin.className = "icon"; pin.setAttribute("aria-pressed", "false");
     if (preferences.copyButton) tools.append(copyButton(() => group.originalBlock));
     tools.append(pin, closeButton(clearTooltip)); header.append(label, tools);
-    const text = document.createElement("p"); text.className = "original"; text.dir = "auto"; text.lang = group.source === "auto" ? "" : group.source || ""; text.textContent = group.originalBlock;
+    const text = document.createElement("p"); text.className = "original"; text.dir = "auto"; text.lang = group.source === "auto" ? "" : (group.source === "ja(easy)" ? "ja" : group.source) || ""; text.textContent = group.originalBlock;
     tooltip.append(header, text); shadow.append(tooltip);
     positionNear(tooltip, anchor);
     tooltip.addEventListener("pointerenter", () => { clearTimeout(hideTimer); hideTimer = null; clearTimeout(showTimer); });
@@ -1034,11 +1034,11 @@
     const node = box("選択範囲を翻訳");
     const languages = document.createElement("div"); languages.className = "languages"; node.append(languages);
     const names = new Intl.DisplayNames(["ja"], { type: "language" });
-    const languageCodes = "ja en zh-hans zh-hant ko ar az be bg bn ca ceb de es et eu fa fr gu he hi hr hu hy id it jv ka kk km lt lv ml mr ms my ne nl pa pl ru si sk sl sr sw ta te th tl ur uz vi".split(" ");
+    const languageCodes = "ja ja(easy) en zh-hans zh-hant ko ar az be bg bn ca ceb de es et eu fa fr gu he hi hr hu hy id it jv ka kk km lt lv ml mr ms my ne nl pa pl ru si sk sl sr sw ta te th tl ur uz vi".split(" ");
     function select(label, value, codes) {
       const wrapper = document.createElement("label"); wrapper.textContent = label + " ";
       const control = document.createElement("select");
-      for (const code of codes) { const option = document.createElement("option"); option.value = code; option.textContent = code === "auto" ? "自動判定" : names.of(code); control.append(option); }
+      for (const code of codes) { const option = document.createElement("option"); option.value = code; option.textContent = code === "auto" ? "自動判定" : code === "ja(easy)" ? "やさしい日本語" : names.of(code); control.append(option); }
       control.value = value; wrapper.append(control); languages.append(wrapper); return control;
     }
     const source = select("原文", state.source, ["auto", ...languageCodes]);
@@ -1077,7 +1077,7 @@
       busy = true; source.disabled = true; target.disabled = true; swap.disabled = true;
       state.source = source.value; state.target = target.value;
       copy.disabled = true; copy.textContent = "コピー";
-      originalText.lang = source.value === "auto" ? "" : source.value; result.lang = target.value;
+      originalText.lang = source.value === "auto" ? "" : source.value === "ja(easy)" ? "ja" : source.value; result.lang = target.value === "ja(easy)" ? "ja" : target.value;
       result.hidden = true; result.textContent = ""; result.classList.remove("error"); result.setAttribute("aria-live", "off"); result.setAttribute("aria-busy", "true"); progress.node.hidden = false;
       progress.bar.value = 0; progress.percent.textContent = "0%"; progress.count.textContent = "";
       progress.label.textContent = "翻訳中";

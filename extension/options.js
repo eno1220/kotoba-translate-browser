@@ -7,7 +7,7 @@ let baseline, loaded = false, saving = false;
 for (const key of ["source", "target"]) {
   for (const code of [...(key === "source" ? ["auto"] : []), ...Kotoba.LANGUAGES]) {
     const option = document.createElement("option"); option.value = code;
-    option.textContent = code === "auto" ? "自動判定" : displayNames.of(code);
+    option.textContent = code === "auto" ? "自動判定" : code === "ja(easy)" ? "やさしい日本語" : displayNames.of(code);
     form.elements.namedItem(key).append(option);
   }
 }

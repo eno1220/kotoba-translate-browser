@@ -408,7 +408,7 @@ async function translatePlain(s, text, page, signal, count, limit = s.inputToken
   }
   // Keep explicit original whitespace. If a forced boundary had no whitespace,
   // insert a separator for languages whose words are separated by spaces.
-  return result.map((part, i) => i && !["ja", "zh-hans", "zh-hant", "th", "km", "my"].includes(page.target) && !/\s$/.test(result[i - 1]) && !/^\s|^[,.;:!?、。]/.test(part) ? " " + part : part).join("");
+  return result.map((part, i) => i && !["ja", "ja(easy)", "zh-hans", "zh-hant", "th", "km", "my"].includes(page.target) && !/\s$/.test(result[i - 1]) && !/^\s|^[,.;:!?、。]/.test(part) ? " " + part : part).join("");
 }
 async function translateDocument(s, document, page, signal, advance, limit = s.inputTokens, depth = 0, count = counter(s, signal, page.notify)) {
   const chunks = await K.splitDocument(document, limit, count);
