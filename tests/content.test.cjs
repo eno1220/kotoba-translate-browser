@@ -27,7 +27,7 @@ function setup(html, translator = translateTree, preferences = {}) {
   w.browser = { runtime: {
     onMessage: { addListener: fn => listener = fn },
     sendMessage: async msg => {
-      if (msg.type === "contentPreferences") return { concurrency: 1, prioritizeContent: false, semanticBatching: false, ...preferences };
+      if (msg.type === "contentPreferences") return { concurrency: 1, prioritizeContent: false, semanticBatching: false, adaptiveScheduling: false, ...preferences };
       if (msg.type === "translate") {
         calls.push(msg);
         if (msg.parts) return { parts: msg.parts.map(text => `訳:${text}`) };
@@ -653,5 +653,127 @@ test('prose and link density prioritize a div-based article without excluding an
   const texts = s.calls.flatMap(call => (call.documents || [call.document]).map(textOf));
   assert.equal(texts[0], article); assert.equal(texts[1], 'Other short label');
   assert.deepEqual(texts.slice(2), ['Menu one', 'Menu two', 'Menu three']);
+  s.w.close();
+});
+
+function place(element, top) { element.getBoundingClientRect = () => ({ top, bottom: top + 30, left: 0, right: 100, width: 100, height: 30 }); }
+
+test('adaptive scheduler prioritizes the nearby reading window and follows scroll without cancelling the active request', async () => {
+  let release;
+  const s = setup('<nav><p>Menu.</p></nav><article><p id="a">Reading now.</p><p id="b">Far article.</p><p id="c">Scroll destination.</p></article>', tree => textOf(tree) === 'Reading now.'
+    ? new Promise(resolve => release = () => resolve(translateTree(tree))) : translateTree(tree),
+    { adaptiveScheduling: true, prioritizeVisible: true, prioritizeContent: true, semanticBatching: true, batchTranslation: true });
+  const doc = s.w.document;
+  place(doc.querySelector('nav p'), 20); place(doc.querySelector('#a'), 10); place(doc.querySelector('#b'), 9000); place(doc.querySelector('#c'), 16000);
+  let cancellations = 0;
+  const send = s.w.browser.runtime.sendMessage;
+  s.w.browser.runtime.sendMessage = message => { if (message.type === 'cancel') cancellations++; return send(message); };
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await new Promise(setImmediate);
+  assert.equal(s.calls.length, 1); assert.equal(textOf(s.calls[0].document), 'Reading now.');
+  place(doc.querySelector('#a'), -16000); place(doc.querySelector('nav p'), -16000); place(doc.querySelector('#b'), -7000); place(doc.querySelector('#c'), 10);
+  s.w.scrollY = 16000; doc.dispatchEvent(new s.w.Event('scroll'));
+  assert.equal(cancellations, 0); assert.equal(s.calls.length, 1);
+  release(); await s.settle();
+  assert.equal(textOf(s.calls[1].document), 'Scroll destination.');
+  assert.equal((await s.message({ type: 'status' })).done, 4);
+  s.w.close();
+});
+
+test('nearby menu is processed before distant article text, with the remaining page still translated', async () => {
+  const s = setup('<nav><p>Visible menu.</p></nav><article><p>Distant article.</p></article>', translateTree,
+    { adaptiveScheduling: true, prioritizeVisible: true, prioritizeContent: true });
+  place(s.w.document.querySelector('nav p'), 0); place(s.w.document.querySelector('article p'), 20000);
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await s.settle();
+  assert.deepEqual(s.calls.map(call => textOf(call.document)), ['Visible menu.', 'Distant article.']);
+  s.w.close();
+});
+
+test('adaptive batches respect heading sections and keep heading with its first paragraph', async () => {
+  const s = setup('<article><h2>First heading.</h2><p>First paragraph.</p><h2>Second heading.</h2><p>Second paragraph.</p></article>', translateTree,
+    { adaptiveScheduling: true, prioritizeVisible: true, prioritizeContent: true, semanticBatching: true, batchTranslation: true });
+  place(s.w.document.querySelector('h2'), -10);
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await s.settle();
+  assert.deepEqual(s.calls.map(call => Array.from(call.documents, textOf)), [['First heading.', 'First paragraph.'], ['Second heading.', 'Second paragraph.']]);
+  s.w.close();
+});
+
+test('updated or hidden unsent paragraphs are removed before API submission', async () => {
+  let release;
+  const s = setup('<p id="first">First request.</p><p id="changed">Old text.</p><p id="hidden">Will hide.</p><p id="last">Remaining text.</p>', tree => textOf(tree) === 'First request.'
+    ? new Promise(resolve => release = () => resolve(translateTree(tree))) : translateTree(tree), { adaptiveScheduling: true });
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await new Promise(setImmediate);
+  s.w.document.querySelector('#changed').textContent = 'Fresh site text.';
+  s.w.document.querySelector('#hidden').style.display = 'none';
+  release(); const state = await s.settle();
+  assert.deepEqual(s.calls.map(call => textOf(call.document)), ['First request.', 'Remaining text.']);
+  assert.equal(state.skipped, 2); assert.equal(state.total, 2); assert.equal(state.done, 2);
+  assert.equal(s.w.document.querySelector('#changed').textContent, 'Fresh site text.');
+  s.w.close();
+});
+
+test('concurrent adaptive planners reserve different paragraphs and never translate their own output again', async () => {
+  const s = setup('<article>' + '<p>Distinct paragraph.</p>'.repeat(12) + '</article>', async tree => { await new Promise(setImmediate); return translateTree(tree); },
+    { adaptiveScheduling: true, semanticBatching: true, batchTranslation: true, prioritizeContent: true, concurrency: 3 });
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await s.settle();
+  assert.equal(s.calls.reduce((n, call) => n + (call.documents?.length || 1), 0), 12);
+  assert.ok([...s.w.document.querySelectorAll('p')].every(node => node.textContent === '訳:Distinct paragraph.'));
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await s.settle();
+  assert.equal(s.calls.reduce((n, call) => n + (call.documents?.length || 1), 0), 12);
+  s.w.close();
+});
+
+test('manual rescan translates a site update to the same Text node but not an attribute-only update', async () => {
+  const s = setup('<p><a href="/old">Original article.</a></p>', translateTree, { adaptiveScheduling: true });
+  const link = s.w.document.querySelector('a'), text = link.firstChild;
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await s.settle();
+  link.setAttribute('href', '/new');
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await s.settle();
+  assert.equal(s.calls.length, 1);
+  text.data = 'Site replaced this article.';
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await s.settle();
+  assert.equal(s.calls.length, 2);
+  assert.ok(link.textContent.includes('Site replaced this article.'));
+  await s.message({ type: 'restore' });
+  assert.equal(link.textContent, 'Site replaced this article.'); assert.equal(link.getAttribute('href'), '/new');
+  s.w.close();
+});
+
+test('sidebar articles and a main banner remain auxiliary while article headers stay with the body', async () => {
+  const s = setup('<main><header><p>Site banner.</p></header><article><header><h1>Article title.</h1></header><p>Article body.</p></article></main><aside><article><p>Sidebar article.</p></article></aside>', translateTree,
+    { adaptiveScheduling: true, prioritizeContent: true, semanticBatching: true, batchTranslation: true });
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await s.settle();
+  const texts = s.calls.flatMap(call => (call.documents || [call.document]).map(textOf));
+  assert.deepEqual(texts, ['Article title.', 'Article body.', 'Site banner.', 'Sidebar article.']);
+  s.w.close();
+});
+
+test('CSS block spans and flex links inside an explicit paragraph never split the surrounding sentence', async () => {
+  const html = '<p><span style="display:block">Read </span><a href="/docs" style="display:flex"><strong>the docs</strong></a><span style="display:block"> carefully.</span></p>';
+  const s = setup(html, translateTree, { adaptiveScheduling: true });
+  const link = s.w.document.querySelector('a'); let clicks = 0;
+  link.addEventListener('click', event => { event.preventDefault(); clicks++; });
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await s.settle();
+  assert.equal(s.calls.length, 1); assert.equal(textOf(s.calls[0].document), 'Read the docs carefully.');
+  assert.equal(s.w.document.querySelector('a'), link); link.click(); assert.equal(clicks, 1);
+  await s.message({ type: 'restore' }); assert.equal(s.w.document.body.innerHTML, html);
+  s.w.close();
+});
+
+test('short regional headings travel with their details and complete peer regions share a batch', async () => {
+  const s = setup('<article><p>Intro.</p><h3>First region.</h3><details><summary>Area one.</summary><p>Hidden store.</p></details><h3>Second region.</h3><details><summary>Area two.</summary><p>Hidden store.</p></details></article>', translateTree,
+    { adaptiveScheduling: true, prioritizeContent: true, semanticBatching: true, batchTranslation: true });
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await s.settle();
+  assert.deepEqual(s.calls.map(call => Array.from(call.documents || [call.document], textOf)), [['Intro.'], ['First region.', 'Area one.', 'Second region.', 'Area two.']]);
+  s.w.close();
+});
+
+test('adjacent figures share their gallery context without moving their caption nodes', async () => {
+  const s = setup('<article><p>Intro.</p><figure><figcaption>Caption one.</figcaption></figure><figure><figcaption>Caption two.</figcaption></figure></article>', translateTree,
+    { adaptiveScheduling: true, prioritizeContent: true, semanticBatching: true, batchTranslation: true });
+  const captions = [...s.w.document.querySelectorAll('figcaption')];
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await s.settle();
+  assert.equal(s.calls.length, 2);
+  assert.deepEqual(Array.from(s.calls[1].documents, textOf), ['Caption one.', 'Caption two.']);
+  assert.deepEqual([...s.w.document.querySelectorAll('figcaption')], captions);
   s.w.close();
 });

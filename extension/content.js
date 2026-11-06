@@ -1,6 +1,6 @@
 /* global browser */
 (() => {
-  const PROTOCOL = 4;
+  const PROTOCOL = 5;
   if (globalThis.__kotobaLoaded) return;
   globalThis.__kotobaLoaded = true;
   const SKIP = new Set("SCRIPT STYLE NOSCRIPT TEMPLATE PRE CODE KBD SAMP VAR TEXTAREA INPUT SELECT OPTION BUTTON SVG MATH CANVAS VIDEO AUDIO IFRAME OBJECT EMBED".split(" "));
@@ -17,6 +17,11 @@
   let showTimer, hideTimer, hoverCandidate, hoverAnchor, pinned = false, marks;
   let requestSequence = 0;
   const progressListeners = new Map();
+  let scrollDirection = 1, previousScrollY = scrollY;
+  document.addEventListener("scroll", () => {
+    if (Math.abs(scrollY - previousScrollY) >= 4) scrollDirection = scrollY > previousScrollY ? 1 : -1;
+    previousScrollY = scrollY;
+  }, { passive: true, capture: true });
   function yieldToBrowser() {
     // Posted tasks yield to input/paint without the background-tab timer clamp.
     if (typeof MessageChannel === "function") return new Promise(resolve => {
@@ -26,7 +31,7 @@
     });
     return new Promise(resolve => setTimeout(resolve, 0));
   }
-  const preferences = { responsiveScan: true, prioritizeVisible: true, prioritizeContent: true, semanticBatching: true, inputTokens: 6000, tokenizer: "bytes", mainContentOnly: false, selectionButton: false,
+  const preferences = { responsiveScan: true, prioritizeVisible: true, prioritizeContent: true, semanticBatching: true, adaptiveScheduling: true, inputTokens: 6000, tokenizer: "bytes", mainContentOnly: false, selectionButton: false,
     keyboardShortcuts: true, copyButton: true, focusOriginal: true, pageProgress: true, announceProgress: true, hoverEnabled: true };
   let announcer, announcementKey, launcher, launcherTimer, originalFocus;
   function applyPreferences(value) {
@@ -173,7 +178,7 @@
     pageUI.phase.textContent = phase ? `${phase}${state.phase === "receiving" && state.receivedCharacters ? ` · ${state.receivedCharacters}文字` : ""} ${Math.floor((Date.now() - state.phaseStartedAt) / 1000)}秒` : "";
     pageUI.count.textContent = `${state.done} / ${state.total} 段落`;
     pageUI.elapsed.textContent = state.startedAt ? `${Math.floor(((state.finishedAt || Date.now()) - state.startedAt) / 1000)}秒` : "";
-    pageUI.message.textContent = state.failed || !state.total ? state.message : "";
+    pageUI.message.textContent = state.failed || state.skipped || !state.total ? state.message : "";
     pageUI.message.classList.toggle("error", state.failed > 0);
     pageUI.action.textContent = state.running ? "停止" : state.failed ? "再試行" : "再開";
     pageUI.action.hidden = !state.running && (!state.total || state.percent === 100 && !state.failed);
@@ -267,18 +272,22 @@
   function attributesMatch(node, attributes) {
     return attributes.length === node.attributes.length && attributes.every(([name, value]) => node.getAttribute(name) === value);
   }
-  function snapshotMatches(items) {
+  function snapshotMatches(items, checkAttributes = true) {
     return items.every(item => item.node.isConnected && (item.children
       ? item.children.length === item.node.childNodes.length && item.children.every((child, i) => child === item.node.childNodes[i])
-      : item.data === undefined || item.node.data === item.data) && (!item.attributes || attributesMatch(item.node, item.attributes)));
+      : item.data === undefined || item.node.data === item.data) && (!checkAttributes || !item.attributes || attributesMatch(item.node, item.attributes)));
   }
   function contiguous(roots, parent) {
     return roots.length && roots.every((node, i) => node.parentNode === parent && (!i || roots[i - 1].nextSibling === node));
   }
-  async function collect(run = generation) {
+  async function collect(run = generation, scanPreferences = preferences) {
+    const scan = { ...scanPreferences };
     // Release detached SPA paragraphs when another manual scan starts.
     for (const [node] of records) if (!node.isConnected) records.delete(node);
-    for (const unit of transactions) if (!unit.appliedRoots.some(node => node.isConnected)) transactions.delete(unit);
+    for (const unit of transactions) if (!snapshotMatches(unit.appliedSnapshot, false) || !contiguous(unit.appliedRoots, unit.parent)) {
+      transactions.delete(unit);
+      for (const item of unit.appliedSnapshot) if (item.data !== undefined && records.get(item.node)?.translated === item.data) records.delete(item.node);
+    }
     const groups = [], cache = new WeakMap(), blockCache = new WeakMap(), omissionCache = new WeakMap(), languageCache = new WeakMap();
     const getLanguage = element => {
       const path = [];
@@ -290,7 +299,7 @@
       return lang;
     };
     const computed = el => { if (!cache.has(el)) cache.set(el, getComputedStyle(el)); return cache.get(el); };
-    const isBlock = el => /^(block|flow-root|flex|grid|list-item|table(?:-.+)?)(?:\s|$)/.test(computed(el).display) || /^(P|H[1-6]|LI|DT|DD|TD|TH|BLOCKQUOTE|FIGCAPTION|SUMMARY|HR)$/.test(el.tagName);
+    const isBlock = el => /^(block|flow-root|flex|grid|list-item|table(?:-.+)?)(?:\s|$)/.test(computed(el).display) || /^(P|H[1-6]|LI|DT|DD|TD|TH|BLOCKQUOTE|FIGCAPTION|SUMMARY|HR)$/.test(el.tagName) || el.getAttribute("role") === "heading";
     const hidden = el => {
       const disclosure = el.closest("details:not([open])");
       if (disclosure && el !== disclosure) {
@@ -354,14 +363,14 @@
       const tree = roots.flatMap(node => build(node));
       if (!eligible || !length) return;
       const context = parentElement(roots[0]);
-      groups.push({ roots: [...roots], parent, elements, extras, document: tree, length, originalBlock, textBindings, opaque,
+      groups.push({ order: groups.length, roots: [...roots], parent, elements, extras, document: tree, length, originalBlock, textBindings, opaque,
         originalSnapshot: snapshot(roots, opaque), context, contextLanguage: getLanguage(context),
         contextAttributes: [...context.attributes].map(attr => [attr.name, attr.value]) });
     }
     let visited = 0;
     function checkpoint() {
       if (run !== generation || state.url !== pageURL()) throw new DOMException("キャンセルしました", "AbortError");
-      if (preferences.responsiveScan && ++visited % 80 === 0) return yieldToBrowser();
+      if (scan.responsiveScan && ++visited % 80 === 0) return yieldToBrowser();
     }
     // Post-order indexing avoids recursive look-ahead into huge SPA subtrees.
     async function indexBlocks(root) {
@@ -385,6 +394,13 @@
       const children = container.tagName === "DETAILS" && !container.open
         ? [...container.children].filter(child => child.tagName === "SUMMARY").slice(0, 1)
         : assigned.length ? assigned : [...container.childNodes];
+      // CSS flex/block on a link or span does not turn it into a separate
+      // linguistic paragraph. Keep explicit paragraph containers intact.
+      if (scan.adaptiveScheduling && blockCache.get(container) && /^(P|H[1-6]|TD|TH|DT|DD|SUMMARY|FIGCAPTION)$/.test(container.tagName) &&
+        !children.some(node => applied.has(node)) && !container.querySelector('p,h1,h2,h3,h4,h5,h6,li,dt,dd,table,[role="heading"],[role="listitem"],[role="row"]') &&
+        ![...container.querySelectorAll("*")].some(node => node.shadowRoot || node.tagName === "SLOT")) {
+        makeUnit(children); return;
+      }
       for (const node of children) {
         const pause = checkpoint(); if (pause) await pause;
         if (applied.has(node)) { flush(); continue; }
@@ -402,8 +418,8 @@
       }
       flush();
     }
-    let scopes = preferences.mainContentOnly ? [...document.querySelectorAll('main,[role="main"]')] : [];
-    if (preferences.mainContentOnly && !scopes.length) scopes = [...document.querySelectorAll("article")];
+    let scopes = scan.mainContentOnly ? [...document.querySelectorAll('main,[role="main"]')] : [];
+    if (scan.mainContentOnly && !scopes.length) scopes = [...document.querySelectorAll("article")];
     if (!scopes.length && document.body) scopes = [document.body];
     scopes = scopes.filter(node => !scopes.some(other => other !== node && other.contains(node)));
     for (const scope of scopes) {
@@ -411,22 +427,43 @@
       for (let el = scope; el; el = parentElement(el)) if (omitted(el)) { blocked = true; break; }
       if (!blocked) await walk(scope);
     }
-    if (preferences.prioritizeVisible || preferences.prioritizeContent || preferences.semanticBatching) {
+    if (scan.prioritizeVisible || scan.prioritizeContent || scan.semanticBatching || scan.adaptiveScheduling) {
       const ordered = [];
       for (const group of groups) {
-        if (preferences.responsiveScan && ++visited % 80 === 0) await yieldToBrowser();
+        if (scan.responsiveScan && ++visited % 80 === 0) await yieldToBrowser();
         if (run !== generation) throw new DOMException("キャンセルしました", "AbortError");
         const context = group.context;
         const content = context.closest('article,main,[role="main"],[role="article"]');
+        const article = context.closest('article,[role="article"]');
         const peripheral = context.closest('nav,aside,footer,[role="navigation"],[role="complementary"],[role="contentinfo"],.sidebar,.widget-area');
-        const chrome = peripheral && (!content || content.contains(peripheral)) ? peripheral : !content && context.closest('header,[role="banner"]');
-        const table = context.closest("table");
+        const banner = context.closest('header,[role="banner"]');
+        const chrome = peripheral || (banner && (!article || !article.contains(banner)) ? banner : null);
+        const table = context.closest('table,[role="table"],[role="grid"]');
+        const figure = context.closest("figure");
+        const gallery = figure && (figure.previousElementSibling?.tagName === "FIGURE" || figure.nextElementSibling?.tagName === "FIGURE") ? figure.parentElement : null;
         group.priority = chrome ? 3 : content ? (table || context.closest("summary") ? 1 : 0) : 2;
-        group.component = table || chrome || context.closest('section,blockquote,figure,article,main,[role="main"],[role="article"],ul,ol,dl') || context.closest("div") || document.body;
-        group.semanticUnit = context.closest("tr,li,figure,blockquote");
-        ordered.push({ group, distance: preferences.prioritizeVisible ? viewportDistance(group) : 0 });
+        group.component = table || chrome || gallery || context.closest('section,blockquote,figure,article,main,[role="main"],[role="article"],[role="list"],ul,ol,dl') || context.closest("div") || context.getRootNode().host || document.body;
+        group.semanticUnit = context.closest('tr,li,figure,blockquote,[role="row"],[role="listitem"]');
+        group.heading = /^H[1-6]$/.test(context.tagName) || context.getAttribute("role") === "heading";
+        ordered.push({ group, distance: scan.prioritizeVisible ? viewportDistance(group) : 0 });
       }
-      if (preferences.prioritizeContent) {
+      const sections = new Map();
+      for (let index = 0; index < ordered.length; index++) {
+        const group = ordered[index].group;
+        const next = ordered[index + 1]?.group;
+        if (group.heading && group.priority < 3 && next?.priority === 1 && next.context.closest('summary,table,[role="table"],[role="grid"]')) {
+          // A regional/table heading belongs with its supplemental content,
+          // rather than being sent alone ahead of every other section.
+          group.priority = 1; group.component = next.component;
+          if (!group.semanticUnit && next.semanticUnit) group.semanticUnit = next.semanticUnit;
+        }
+        if (group.heading) sections.set(group.component, group.context);
+        group.section = sections.get(group.component) || group.component;
+        if (group.heading && !group.semanticUnit && next && !next.heading && !next.semanticUnit && next.component === group.component && next.priority === group.priority) {
+          group.semanticUnit = group.context; next.semanticUnit = group.context;
+        }
+      }
+      if (scan.prioritizeContent) {
         // Some sites use only divs. Infer priority conservatively from complete
         // prose and link density; this changes ordering, never the target scope.
         const stats = new Map();
@@ -444,22 +481,35 @@
           else if (item.units >= 3 && density >= 0.8) group.priority = 3;
         }
       }
-      return ordered.sort((a, b) => (preferences.prioritizeContent ? a.group.priority - b.group.priority : 0) || a.distance - b.distance).map(item => item.group);
+      return ordered.sort((a, b) => (scan.prioritizeContent ? a.group.priority - b.group.priority : 0) || a.distance - b.distance).map(item => item.group);
     }
     return groups;
   }
   function viewportDistance(group) {
-    if (!group.parent.isConnected || !contiguous(group.roots, group.parent)) return Infinity;
-    const range = document.createRange(); range.setStartBefore(group.roots[0]); range.setEndAfter(group.roots.at(-1));
-    const rect = range.getBoundingClientRect?.() || group.parent.getBoundingClientRect?.();
-    if (!rect) return 0;
-    return Math.max(0, -rect.bottom, rect.top - innerHeight, -rect.right || 0, rect.left - innerWidth || 0);
+    return viewportPosition(group).distance;
   }
-  function applyDocument(unit, tree) {
+  function viewportPosition(group) {
+    if (!group.parent.isConnected || !contiguous(group.roots, group.parent)) return { distance: Infinity, behind: false };
+    const range = document.createRange(); range.setStartBefore(group.roots[0]); range.setEndAfter(group.roots.at(-1));
+    let rect = range.getBoundingClientRect?.() || group.parent.getBoundingClientRect?.();
+    if (rect && !(rect.width || rect.right - rect.left || rect.height || rect.bottom - rect.top)) rect = [...(range.getClientRects?.() || [])].find(item => item.width || item.height);
+    if (!rect) return { distance: Infinity, behind: false };
+    return { distance: Math.max(0, -rect.bottom, rect.top - innerHeight, -rect.right || 0, rect.left - innerWidth || 0),
+      behind: scrollDirection > 0 ? rect.bottom < 0 : rect.top > innerHeight };
+  }
+  function unitStillMatches(unit) {
     if (!snapshotMatches(unit.originalSnapshot) || !contiguous(unit.roots, unit.parent) || !attributesMatch(unit.context, unit.contextAttributes) || language(unit.context) !== unit.contextLanguage) return false;
     for (let el = unit.context; el; el = parentElement(el)) {
-      if (el.matches('[hidden],[inert],[aria-hidden="true"],[translate="no"],.notranslate,[contenteditable]:not([contenteditable="false"]),[role="textbox"],[role="searchbox"],[role="combobox"]')) return false;
+      if (el.matches('[hidden],[inert],[aria-hidden="true"],[translate="no"],.notranslate,.sr-only,.visually-hidden,.screen-reader-text,[data-kotoba-ui],[contenteditable]:not([contenteditable="false"]),[role="textbox"],[role="searchbox"],[role="combobox"]')) return false;
+      if (el.tagName === "DETAILS" && !el.open && ![...el.children].find(child => child.tagName === "SUMMARY")?.contains(unit.context)) return false;
+      const style = getComputedStyle(el);
+      if (style.display === "none" || style.contentVisibility === "hidden" || style.visibility && style.visibility !== "visible" || style.opacity === "0") return false;
+      if (/absolute|fixed/.test(style.position) && parseFloat(style.width) <= 1 && parseFloat(style.height) <= 1 && (style.overflow === "hidden" || style.clipPath?.includes("inset(50%"))) return false;
     }
+    return true;
+  }
+  function applyDocument(unit, tree) {
+    if (!unitStillMatches(unit)) return false;
     // When inline order is unchanged, update Text.data only. Frameworks keep their
     // text-node references, focus stays put, and no child-list mutations are needed.
     const edits = [];
@@ -519,21 +569,24 @@
     if (appliedDirection && appliedDirection !== `${source}:${target}`) restore();
     state.source = source; state.target = target;
     const run = ++generation;
-    state.running = true; state.preparing = true; state.done = 0; state.total = 0; state.failed = 0; state.cacheRestored = false;
+    state.running = true; state.preparing = true; state.done = 0; state.total = 0; state.failed = 0; state.skipped = 0; state.cacheRestored = false;
     state.percent = 0; state.startedAt = Date.now(); state.finishedAt = 0;
     state.message = ""; clearActivity();
     if (panelKind === "selection") closePanel();
     pageDismissed = false; clearTooltip();
     statusPanel();
+    const scheduling = { ...preferences };
     let groups;
-    try { groups = await collect(run); }
+    try { groups = await collect(run, scheduling); }
     catch (error) { if (run !== generation) return; throw error; }
     if (run !== generation) return;
     if (state.url !== pageURL()) { currentPage(); return; }
     state.preparing = false; state.total = groups.length;
     state.message = groups.length ? "" : "翻訳対象がありません";
-    const totalChars = groups.reduce((sum, group) => sum + group.length, 0);
+    let totalChars = groups.reduce((sum, group) => sum + group.length, 0);
     let completedChars = 0, cursor = 0, batchingAvailable = true;
+    const unsent = new Set(groups), sourceOrder = [...groups].sort((a, b) => a.order - b.order);
+    let planning = Promise.resolve();
     const activeProgress = new Map();
     const updateProgress = () => {
       if (run !== generation) return;
@@ -541,7 +594,7 @@
       const processed = active.reduce((sum, item) => sum + Math.max(item.completed, item.deliveredChars), 0);
       state.percent = totalChars ? Math.min(100, Math.floor((completedChars + processed) / totalChars * 100)) : 0;
       state.active = active.reduce((sum, item) => sum + item.remaining.size, 0);
-      state.pending = groups.length - cursor;
+      state.pending = unsent.size;
       state.activePercent = totalChars ? Math.max(0, (active.reduce((sum, item) => sum + item.length, 0) - processed) / totalChars * 100) : 0;
       const current = active.find(item => item.phase === "receiving" || item.phase === "translating") || active.find(item => item.phase === "tokenizing") || active[0];
       state.phase = current?.phase || ""; state.phaseStartedAt = current?.since || 0;
@@ -549,15 +602,93 @@
       statusPanel();
     };
     updateProgress();
+    async function adaptiveBatch() {
+      const candidates = sourceOrder.filter(group => {
+        if (!unsent.has(group)) return false;
+        if (!snapshotMatches(group.originalSnapshot) || !contiguous(group.roots, group.parent) || !attributesMatch(group.context, group.contextAttributes) || language(group.context) !== group.contextLanguage) {
+          unsent.delete(group); state.total--; totalChars -= group.length; state.skipped = (state.skipped || 0) + 1; return false;
+        }
+        return true;
+      });
+      const blocks = [];
+      for (let index = 0; index < candidates.length; index++) {
+        if (run !== generation) return [];
+        if (scheduling.responsiveScan && index && index % 80 === 0) await yieldToBrowser();
+        const group = candidates[index], previous = blocks.at(-1);
+        const position = scheduling.prioritizeVisible ? viewportPosition(group) : { distance: 0, behind: false };
+        group.wireBytes ??= wireSize(group.document) + 18;
+        if (group.semanticUnit && previous?.unit === group.semanticUnit && previous.component === group.component && previous.section === group.section && previous.priority === (group.priority || 0) && previous.groups.at(-1).order + 1 === group.order) {
+          previous.groups.push(group);
+          if (position.distance < previous.position.distance) previous.position = position;
+        } else blocks.push({ groups: [group], unit: group.semanticUnit, component: group.component, section: group.section, priority: group.priority || 0, position });
+      }
+      const horizon = Math.max(1, innerHeight) * 1.5;
+      const score = block => [block.position.distance <= horizon ? 0 : 1, scheduling.prioritizeContent ? block.priority : 0,
+        block.position.distance === 0 ? 0 : 1, block.position.behind ? 1 : 0, block.position.distance, block.groups[0].order];
+      for (const block of blocks) block.score = score(block);
+      const compare = (a, b) => { for (let i = 0; i < a.score.length; i++) if (a.score[i] !== b.score[i]) return a.score[i] < b.score[i] ? -1 : 1; return 0; };
+      let best = 0;
+      for (let i = 1; i < blocks.length; i++) if (compare(blocks[i], blocks[best]) < 0) best = i;
+      const first = blocks[best];
+      if (!first || run !== generation) return [];
+      const near = first.position.distance <= horizon, warmup = cursor === 0;
+      const batching = scheduling.semanticBatching && state.batchTranslation && batchingAvailable;
+      const limit = Math.min(scheduling.inputTokens, warmup ? 1200 : near ? 2400 : scheduling.inputTokens);
+      const maxItems = batching ? warmup ? 4 : near ? 16 : 64 : 1;
+      const size = group => scheduling.tokenizer === "bytes" ? group.wireBytes : group.wireBytes / 3;
+      const selected = [];
+      let bytes = 0;
+      for (let index = best; index < blocks.length; index++) {
+        const block = blocks[index], last = selected.at(-1);
+        if (selected.length && (block.component !== first.component || block.priority !== first.priority ||
+          (block.position.distance <= horizon) !== near || last.order + 1 !== block.groups[0].order)) break;
+        if (selected.length && block.section !== last.section) {
+          // Small complete peer sections in a table/list can share a request.
+          // Article sections stay separate, and never join after a heading was
+          // omitted by viewport prioritization or an earlier translation.
+          if (first.priority !== 1 || !block.groups[0].heading) break;
+          let sectionSize = 0, sectionItems = 0;
+          for (let end = index; end < blocks.length && blocks[end].section === block.section; end++) {
+            sectionItems += blocks[end].groups.length;
+            sectionSize += blocks[end].groups.reduce((sum, group) => sum + size(group), 0);
+          }
+          if (bytes + sectionSize > limit || selected.length + sectionItems > maxItems) break;
+        }
+        const blockSize = block.groups.reduce((sum, group) => sum + size(group), 0);
+        if (selected.length && (bytes + blockSize > limit || selected.length + block.groups.length > maxItems)) break;
+        const blockMax = batching && !selected.length && blockSize <= limit ? Math.min(64, Math.max(maxItems, block.groups.length)) : maxItems;
+        for (const group of block.groups) {
+          if (selected.length && (selected.length >= blockMax || bytes + size(group) > limit)) break;
+          if (!unitStillMatches(group)) {
+            unsent.delete(group); state.total--; totalChars -= group.length; state.skipped = (state.skipped || 0) + 1;
+            continue;
+          }
+          selected.push(group); bytes += size(group);
+          if (!batching) break;
+        }
+        if (selected.length >= maxItems || !batching || selected.length < block.groups.length) break;
+      }
+      for (const group of selected) unsent.delete(group);
+      cursor += selected.length;
+      return selected;
+    }
+    function chooseBatch() {
+      if (!scheduling.adaptiveScheduling) {
+        const batch = nextBatch(); for (const group of batch) unsent.delete(group); return Promise.resolve(batch);
+      }
+      const next = planning.then(adaptiveBatch);
+      planning = next.then(() => {}, () => {});
+      return next;
+    }
     function nextBatch() {
       if (!batchingAvailable) return [groups[cursor++]];
-      if (preferences.semanticBatching && state.batchTranslation) {
+      if (scheduling.semanticBatching && state.batchTranslation) {
         const first = groups[cursor], batch = [];
-        const limit = cursor === 0 ? Math.min(1800, preferences.inputTokens) : preferences.inputTokens;
+        const limit = cursor === 0 ? Math.min(1800, scheduling.inputTokens) : scheduling.inputTokens;
         const maxItems = cursor === 0 ? 8 : 64;
         const estimateSize = group => {
           group.wireBytes ??= wireSize(group.document) + 18;
-          return preferences.tokenizer === "bytes" ? group.wireBytes : group.wireBytes / 3;
+          return scheduling.tokenizer === "bytes" ? group.wireBytes : group.wireBytes / 3;
         };
         let bytes = 0;
         while (cursor < groups.length && batch.length < maxItems) {
@@ -588,8 +719,10 @@
       return batch;
     }
     async function worker() {
-      while (run === generation && cursor < groups.length) {
-        const batch = nextBatch();
+      while (run === generation && unsent.size) {
+        const batch = await chooseBatch();
+        if (run !== generation) return;
+        if (!batch.length) { updateProgress(); continue; }
         const requestId = `page-${run}-${++requestSequence}`;
         const length = batch.reduce((sum, group) => sum + group.length, 0);
         const progress = { length, completed: 0, deliveredChars: 0, remaining: new Set(batch.map((_, index) => index)), phase: "preparing", since: Date.now() };
@@ -643,7 +776,7 @@
     if (run === generation) {
       state.running = false; clearActivity();
       state.finishedAt = Date.now();
-      state.message = state.failed ? "一部の段落を適用できませんでした" : groups.length ? "" : "翻訳対象がありません";
+      state.message = state.failed ? "一部の段落を適用できませんでした" : state.skipped ? `更新・非表示の${state.skipped}段落を見送りました` : groups.length ? "" : "翻訳対象がありません";
       statusPanel();
     }
   }

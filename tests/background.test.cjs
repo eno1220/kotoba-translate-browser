@@ -15,7 +15,7 @@ function background(responder, settings = {}) {
     browser: {
       runtime: { id: "test", getURL: path => `moz-extension://test/${path}`, onMessage: { addListener: fn => listener = fn } },
       storage: { local: { get: async () => { reads++; return { settings }; } }, onChanged: { addListener: fn => settingsChanged = fn } },
-      tabs: { onRemoved: event, onUpdated: event, query: async () => [], sendMessage: async (_tab, message) => { progress.push(message); return { protocol: 4 }; } },
+      tabs: { onRemoved: event, onUpdated: event, query: async () => [], sendMessage: async (_tab, message) => { progress.push(message); return { protocol: 5 }; } },
       commands: { onCommand: { addListener: fn => commandListener = fn } }, contextMenus: { create() {}, onClicked: event }
     },
     fetch: async (url, options) => {
@@ -38,7 +38,7 @@ function background(responder, settings = {}) {
     configure: values => { settings = { ...settings, ...values }; settingsChanged({ settings: { newValue: settings } }, "local"); },
     control: message => listener(message, { id: "test" }),
     extension: message => listener(message, { id: "test", tab: { id: 20 }, url: "moz-extension://test/options.html" }),
-    send: (parts, overrides = {}, tabId = 1, sender = {}) => listener({ type: "translate", protocol: 4, parts, source: "en", target: "ja", ...overrides }, { id: "test", tab: { id: tabId }, frameId: 0, url: "https://example.org/private?q=secret", ...sender })
+    send: (parts, overrides = {}, tabId = 1, sender = {}) => listener({ type: "translate", protocol: 5, parts, source: "en", target: "ja", ...overrides }, { id: "test", tab: { id: tabId }, frameId: 0, url: "https://example.org/private?q=secret", ...sender })
   };
 }
 const completion = text => ({ choices: [{ message: { content: text }, finish_reason: "stop" }] });
@@ -459,4 +459,81 @@ test('stream receive speed is explicitly a reference value when the MLX response
   assert.equal(row.generationSpeedSource, 'stream');
   assert.ok(row.generationTokensPerSecond > 0);
   assert.ok(row.firstTokenMilliseconds > 0);
+});
+
+test('identical in-flight completions share one call and stopping one tab keeps the other request alive', async () => {
+  let release;
+  const b = background(() => new Promise(resolve => release = () => resolve(completion('Shared translation.'))), { cacheMinutes: 0 });
+  const first = b.send(['Same paragraph.'], { requestId: 'share-1' }, 1);
+  for (let i = 0; i < 20 && !release; i++) await new Promise(setImmediate);
+  const second = b.send(['Same paragraph.'], { requestId: 'share-2' }, 2);
+  for (let i = 0; i < 5; i++) await new Promise(setImmediate);
+  assert.equal(b.calls.length, 1);
+  await b.content({ type: 'cancel' });
+  assert.match((await first).error, /キャンセル/);
+  assert.equal(b.calls[0].options.signal.aborted, false);
+  release(); assert.equal((await second).parts[0], 'Shared translation.');
+  const third = b.send(['Same paragraph.'], {}, 3);
+  for (let i = 0; i < 20 && b.calls.length < 2; i++) await new Promise(setImmediate);
+  release(); await third;
+  assert.equal(b.calls.length, 2);
+});
+
+test('sharing respects origin, private windows, and its setting; cache records shared usage', async () => {
+  for (const scenario of ['origin', 'private', 'disabled']) {
+    const releases = [];
+    const b = background(() => new Promise(resolve => releases.push(() => resolve(completion('Translated.')))), { shareInFlight: scenario !== 'disabled', concurrency: 2, cacheMinutes: 0 });
+    const first = b.send(['Equal text.'], {}, 1);
+    const second = b.send(['Equal text.'], {}, 2, scenario === 'origin' ? { url: 'https://other.example/page' } : scenario === 'private' ? { tab: { id: 2, incognito: true } } : {});
+    for (let i = 0; i < 20 && releases.length < 2; i++) await new Promise(setImmediate);
+    assert.equal(b.calls.length, 2, scenario);
+    releases.forEach(release => release()); await Promise.all([first, second]);
+  }
+  let release;
+  const b = background(() => new Promise(resolve => release = () => resolve(completion('訳文'))));
+  const document = [{ text: 'Same paragraph.' }];
+  const first = b.send([], { document }, 1);
+  const second = b.send([], { document }, 2, { url: 'https://example.org/another-page' });
+  for (let i = 0; i < 10; i++) await new Promise(setImmediate);
+  assert.equal(b.calls.length, 1); release(); await Promise.all([first, second]);
+  const rows = (await b.extension({ type: 'cacheHistory' })).rows;
+  assert.equal(rows.length, 2); assert.equal(rows.reduce((sum, row) => sum + row.sharedRequests, 0), 1);
+});
+
+test('cancelling every shared subscriber aborts the underlying model call', async () => {
+  const b = background(({ options }) => new Promise((_, reject) => options.signal.addEventListener('abort', () => reject(new DOMException('cancelled', 'AbortError')), { once: true })));
+  const first = b.send(['Equal text.'], {}, 1), second = b.send(['Equal text.'], {}, 1);
+  for (let i = 0; i < 10; i++) await new Promise(setImmediate);
+  assert.equal(b.calls.length, 1);
+  await b.content({ type: 'cancel' });
+  assert.ok((await first).error); assert.ok((await second).error);
+  assert.equal(b.calls[0].options.signal.aborted, true);
+});
+
+test('glossary filtering uses original HTML text rather than marker attributes', async () => {
+  const dictionary = ['A&B', 'Absent', 'span'].map(source => ({ domain: '', sourceLang: 'en', targetLang: 'ja', source, target: '訳語' }));
+  const b = background(({ body }) => completion(body.messages[0].content), { dictionary });
+  await b.send([], { document: [{ tag: 'span', id: 'k0', children: [{ text: 'A&B' }] }] });
+  assert.deepEqual(b.calls[0].body.glossary.map(term => term.source), ['A&B']);
+});
+
+test('late stream subscriber receives the existing prefix and survives the first subscriber stopping', async () => {
+  let controller;
+  const b = background(({ options }) => new Response(new ReadableStream({ start(value) {
+    controller = value;
+    controller.enqueue(new TextEncoder().encode(sse({ choices: [{ delta: { content: 'First ' } }] })));
+    options.signal.addEventListener('abort', () => controller.error(new DOMException('cancelled', 'AbortError')), { once: true });
+  } }), { headers: { 'Content-Type': 'text/event-stream' } }), { streamTranslation: true });
+  const first = b.send(['Same selection.'], { requestId: 'first-stream' }, 1);
+  for (let i = 0; i < 20 && !b.progress.some(p => p.preview); i++) await new Promise(setImmediate);
+  const second = b.send(['Same selection.'], { requestId: 'second-stream' }, 2);
+  for (let i = 0; i < 20 && !b.progress.some(p => p.requestId === 'second-stream' && p.preview); i++) await new Promise(setImmediate);
+  assert.equal(b.progress.find(p => p.requestId === 'second-stream' && p.preview).preview, 'First ');
+  assert.equal(b.calls.length, 1);
+  await b.content({ type: 'cancel' }); assert.ok((await first).error);
+  assert.equal(b.calls[0].options.signal.aborted, false);
+  b.tick(200);
+  controller.enqueue(new TextEncoder().encode(sse({ choices: [{ delta: { content: 'last.' }, finish_reason: 'stop' }] }) + sse({ choices: [], usage: { completion_tokens: 10 } }) + 'data: [DONE]\n\n'));
+  controller.close();
+  assert.equal((await second).parts[0], 'First last.');
 });

@@ -139,3 +139,12 @@ test('extended context budgets reserve output, instructions and glossary instead
   assert.throws(() => K.inputBudget(K.settings({ contextTokens: 8192 }), page), /コンテキスト長/);
   assert.throws(() => K.settings({ inputTokens: 24001 }));
 });
+
+test('only source-present glossary terms are sent, without reducing the reserved context budget', () => {
+  const dictionary = ['File', 'Absent', 'file'].map(source => ({ domain: '', sourceLang: 'en', targetLang: 'ja', source, target: '訳語' }));
+  const s = K.settings({ dictionary, inputTokens: 24000 });
+  const page = { source: 'en', target: 'ja', domain: 'https://example.org' };
+  assert.deepEqual(K.body(s, 'Open File.', page).glossary.map(term => term.source), ['File']);
+  assert.deepEqual(K.body({ ...s, relevantGlossary: false }, 'Open File.', page).glossary.map(term => term.source), ['File', 'Absent', 'file']);
+  assert.equal(K.inputBudget(s, page), K.inputBudget({ ...s, relevantGlossary: false }, page));
+});

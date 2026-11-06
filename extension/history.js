@@ -28,6 +28,9 @@ function render(data) {
     cell(row, 2, number.format(entry.paragraphs)); cell(row, 3, number.format(entry.characters));
     cell(row, 4, `${(entry.milliseconds / 1000).toFixed(1)}秒`);
     const requests = cell(row, 5, number.format(entry.requests));
+    if (entry.sharedRequests) {
+      const shared = document.createElement('small'); shared.textContent = `うち共有 ${entry.sharedRequests}回`; requests.append(shared);
+    }
     if (entry.batchFallbacks || entry.structureRetries || entry.truncations) {
       const retry = document.createElement('details'), summary = document.createElement('summary'); summary.textContent = '再処理'; retry.append(summary);
       for (const [label, count] of [['バッチ', entry.batchFallbacks], ['構造', entry.structureRetries], ['再分割', entry.truncations]]) {

@@ -2,7 +2,8 @@
 const K = Kotoba;
 const queue = new K.Queue(1); // Shared by every tab and by /tokenize requests.
 const jobs = new Map();
-const METRIC_TOTALS = ["requests", "responseMilliseconds", "outputTokens", "serverTokens", "serverMilliseconds", "serverRequests", "firstTokenMilliseconds", "streamRequests", "streamTokens", "streamMilliseconds", "batchFallbacks", "structureRetries", "truncations"];
+const inFlightCompletions = new Map();
+const METRIC_TOTALS = ["requests", "sharedRequests", "responseMilliseconds", "outputTokens", "serverTokens", "serverMilliseconds", "serverRequests", "firstTokenMilliseconds", "streamRequests", "streamTokens", "streamMilliseconds", "batchFallbacks", "structureRetries", "truncations"];
 function measurements() { return { ...Object.fromEntries(METRIC_TOTALS.map(key => [key, 0])), tokensKnown: true }; }
 function documentURL(value) { const url = new URL(value); url.hash = ""; return url.href; }
 
@@ -24,7 +25,7 @@ function pruneCache() {
 }
 setInterval(pruneCache, 60000);
 function cacheSignature(s) {
-  if (!signatures.has(s)) signatures.set(s, JSON.stringify([K.endpoint(s), s.apiKey, s.model, s.apiFormat, s.form, s.inputTokens, s.contextTokens, s.tokenizer, s.tokenizePath, s.batchTranslation, s.dictionary]));
+  if (!signatures.has(s)) signatures.set(s, JSON.stringify([K.endpoint(s), s.apiKey, s.model, s.apiFormat, s.form, s.inputTokens, s.contextTokens, s.tokenizer, s.tokenizePath, s.batchTranslation, s.relevantGlossary, s.dictionary]));
   return signatures.get(s);
 }
 function cacheKey(url, source, target, input) { return JSON.stringify([url, source, target, input]); }
@@ -59,6 +60,7 @@ function cacheHistory() {
     if (!h) continue;
     if (!rows.has(h)) rows.set(h, { url: h.url, source: h.source, target: h.target, startedAt: h.startedAt, finishedAt: h.finishedAt,
       milliseconds: h.finishedAt - h.startedAt, paragraphs: 0, characters: 0, requests: h.requests,
+      sharedRequests: h.sharedRequests,
       batchFallbacks: h.batchFallbacks, structureRetries: h.structureRetries, truncations: h.truncations,
       outputTokens: h.tokensKnown ? h.outputTokens : null,
       firstTokenMilliseconds: h.streamRequests ? h.firstTokenMilliseconds / h.streamRequests : null,
@@ -240,20 +242,57 @@ function counter(s, signal, notify) {
     return count;
   };
 }
+function completionRequest(s, payload, signal, notify = () => {}, onDelta = () => {}, privateContext = false) {
+  if (signal.aborted) return Promise.reject(new Error("キャンセルしました。"));
+  const url = K.endpoint(s);
+  const key = s.shareInFlight ? JSON.stringify([cacheRevision, url, s.apiKey.replace(/^Bearer\s+/i, "").trim(), s.timeoutSeconds, s.retryTransient, privateContext, payload]) : null;
+  let flight = key && inFlightCompletions.get(key);
+  const shared = !!flight;
+  if (!flight) {
+    flight = { controller: new AbortController(), listeners: new Set(), phase: "queued", output: "", milliseconds: 0 };
+    if (key) inFlightCompletions.set(key, flight);
+  }
+  const remove = () => { if (key && inFlightCompletions.get(key) === flight) inFlightCompletions.delete(key); };
+  return new Promise((resolve, reject) => {
+    const listener = { notify, onDelta };
+    const detach = () => { flight.listeners.delete(listener); signal.removeEventListener("abort", abort); };
+    const abort = () => {
+      detach();
+      // A stopped tab must not kill a worker still serving another tab.
+      if (!flight.listeners.size) { remove(); flight.controller.abort(); }
+      reject(new Error("キャンセルしました。"));
+    };
+    flight.listeners.add(listener); signal.addEventListener("abort", abort, { once: true });
+    notify(flight.phase); if (flight.output) onDelta(flight.output);
+    if (signal.aborted) { abort(); return; }
+    if (!flight.promise) {
+      flight.promise = post(s, url, payload, flight.controller.signal, phase => {
+        flight.phase = phase;
+        for (const item of flight.listeners) item.notify(phase);
+      }, "translating", milliseconds => { flight.milliseconds = milliseconds; }, output => {
+        flight.output = output;
+        for (const item of flight.listeners) item.onDelta(output);
+      });
+      flight.promise.then(remove, remove);
+    }
+    flight.promise.then(result => { detach(); if (!signal.aborted) resolve({ result, milliseconds: flight.milliseconds, shared }); }, error => { detach(); reject(error); });
+  });
+}
 async function generate(s, text, page, signal) {
   let lastUpdate = 0;
-  const result = await post(s, K.endpoint(s), K.body(s, text, page), signal, page.notify, "translating", milliseconds => {
-    if (page.metrics) page.metrics.responseMilliseconds += milliseconds;
-  }, output => {
+  const response = await completionRequest(s, K.body(s, text, page), signal, page.notify, output => {
     const now = Date.now();
     if (!lastUpdate || now - lastUpdate >= 120) {
       lastUpdate = now;
       if (page.preview) page.preview(output);
       else page.notify?.("receiving", undefined, { receivedCharacters: output.length });
     }
-  });
+  }, page.private);
+  const result = response.result;
   if (page.metrics) {
     page.metrics.requests++;
+    page.metrics.sharedRequests += response.shared ? 1 : 0;
+    page.metrics.responseMilliseconds += response.milliseconds;
     const tokens = result.usage?.completion_tokens;
     if (Number.isSafeInteger(tokens) && tokens >= 0) page.metrics.outputTokens += tokens;
     else page.metrics.tokensKnown = false;
@@ -309,7 +348,7 @@ async function translateDocument(s, document, page, signal, advance, limit = s.i
     let accepted = null;
     for (let attempt = 0; attempt < 2; attempt++) {
       if (attempt && page.metrics) page.metrics.structureRetries++;
-      const output = await generate(s, K.serializeDocument(chunk), { ...page, html: true, retry: attempt > 0 }, signal);
+      const output = await generate(s, K.serializeDocument(chunk), { ...page, html: true, retry: attempt > 0, glossaryText: glossarySource(chunk) }, signal);
       if (output.truncated) {
         if (depth >= 5) break;
         accepted = await translateDocument(s, chunk, page, signal, advance, Math.max(64, Math.floor(limit / 2)), depth + 1, count);
@@ -336,6 +375,9 @@ async function translateDocument(s, document, page, signal, advance, limit = s.i
   }
 }
 // Each marker scopes inline IDs to its own paragraph, so IDs can repeat across items.
+function glossarySource(nodes) {
+  return nodes.map(node => node.protected ? "" : node.text !== undefined ? node.text : glossarySource(node.children)).join("");
+}
 function serializeBatch(documents) {
   return documents.map((document, i) => `<p id="b${i}">${K.serializeDocument(document)}</p>`).join("\n");
 }
@@ -367,7 +409,7 @@ async function translateDocuments(s, documents, page, signal, advance, deliver =
         const middle = Math.ceil(batch.length / 2);
         await flush(batch.slice(0, middle)); await flush(batch.slice(middle)); return;
       }
-      const output = await generate(s, serializeBatch(batch), { ...page, html: true, batch: true }, signal);
+      const output = await generate(s, serializeBatch(batch), { ...page, html: true, batch: true, glossaryText: batch.map(glossarySource).join("\n") }, signal);
       if (!output.truncated) {
         let accepted;
         try { accepted = parseBatch(output.text, batch); } catch { /* Retry whole paragraphs below. */ }
@@ -438,7 +480,7 @@ async function translate(message, sender) {
     const revision = cacheRevision;
     const saved = await getSettings();
     const s = { ...saved, inputTokens: K.inputBudget(saved, { source: message.source, target: message.target, domain: pageURL.origin }) };
-    const page = { source: message.source, target: message.target, domain: pageURL.origin, notify,
+    const page = { source: message.source, target: message.target, domain: pageURL.origin, private: sender.tab.incognito === true, notify,
       metrics: measurements() };
     if (!inputs) page.preview = preview => notify("receiving", undefined, { preview, receivedCharacters: preview.length });
     if (inputs) {

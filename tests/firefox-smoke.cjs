@@ -328,7 +328,7 @@ const parserWindow = new (require("jsdom").JSDOM)("").window;
     assert.ok(response.ok, response.error + (process.env.KOTOBA_PAGE_URL ? JSON.stringify(response.events) : ""));
     assert.equal(maximum, 1);
     if (response.articleFixture) {
-      if (!process.env.KOTOBA_BASELINE) assert.ok(requests.length < 40);
+      if (!process.env.KOTOBA_BASELINE) assert.ok(requests.length < 40, JSON.stringify({ requests: requests.length, samples: requests.slice(0, 25).map(request => ({ length: request.body.messages[0].content.length, items: (request.body.messages[0].content.match(/<p id="b/g) || []).length, first: request.body.messages[0].content.slice(0, 45) })) }));
       console.log(JSON.stringify({ articleFixture: true, baseline: !!process.env.KOTOBA_BASELINE, blocks: response.state.total, requests: requests.length, milliseconds: response.state.finishedAt - response.state.startedAt, characters: requests.reduce((sum, request) => sum + request.body.messages[0].content.length, 0) }));
       return;
     }

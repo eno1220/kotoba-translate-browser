@@ -31,6 +31,12 @@
       <small>main・role="main"、なければarticle内を対象にします。見つからないページでは全体を翻訳します。次の翻訳開始から反映します。</small>
     </fieldset>
     <fieldset><legend>実験的な機能</legend>
+      <label class="switch-row">表示位置に合わせて未送信の段落を選び直す<input name="adaptiveScheduling" type="checkbox" role="switch"></label>
+      <small>既定オン。画面内と約1.5画面先までを優先し、見出しの境界も保ちます。遠い文章はその後に処理し、スクロールで通信を中止しません。</small>
+      <label class="switch-row">同じ処理中リクエストを共有<input name="shareInFlight" type="checkbox" role="switch"></label>
+      <small>既定オン。本文・言語・Context・辞書・接続設定が一致する通信を全タブで共有します。一方の停止で他方は止めません。プライベートウィンドウは通常のタブと分けます。</small>
+      <label class="switch-row">原文に現れる辞書項目だけを送信<input name="relevantGlossary" type="checkbox" role="switch"></label>
+      <small>既定オン。大文字・小文字を区別して、今回の文章に含まれる原語だけを送ります。オフでは適用範囲・言語に合う全項目を送信します。</small>
       <label class="switch-row">同じ記事・表・メニューの段落をまとめる<input name="semanticBatching" type="checkbox" role="switch"></label>
       <small>既定オン。「複数の段落をまとめて翻訳」と併用し、同じコンポーネントの段落を入力上限までまとめます。オフで従来の小分けに戻ります。</small>
       <label class="switch-row">訳文をストリーミングで受信<input name="streamTranslation" type="checkbox" role="switch"></label>
