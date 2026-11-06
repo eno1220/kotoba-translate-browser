@@ -389,6 +389,9 @@ test('cache history groups a page run, measures API speed, and shrinks with live
   assert.equal(data.rows[0].outputTokens, 20);
   assert.equal(data.rows[0].tokensPerSecond, 50);
   assert.equal(data.rows[0].requests, 2);
+  assert.equal(data.totals.pages, 1);
+  assert.equal(data.totals.outputTokens, 20);
+  assert.equal(data.totals.tokensPerSecond, 50);
   assert.ok(!JSON.stringify(data).includes('never-expose-me'));
   assert.ok(!JSON.stringify(data).includes('First paragraph.'));
   assert.ok((await b.content({ type: 'cacheHistory' })).error);
@@ -399,8 +402,13 @@ test('cache history groups a page run, measures API speed, and shrinks with live
   data = await b.control({ type: 'cacheHistory' });
   assert.equal(data.rows[0].paragraphs, 1);
   assert.equal(data.rows[0].characters, 17);
+  assert.equal(data.totals.paragraphs, 1);
+  assert.equal(data.totals.characters, 17);
   b.tick(200);
-  assert.equal((await b.control({ type: 'cacheHistory' })).rows.length, 0);
+  data = await b.control({ type: 'cacheHistory' });
+  assert.equal(data.rows.length, 0);
+  assert.equal(data.totals.pages, 0);
+  assert.equal(data.totals.tokensPerSecond, null);
 });
 
 test('history excludes private, selection, disabled and failed translations and clears with the cache', async () => {
@@ -486,14 +494,15 @@ test('remote tokenizer measures one fitting semantic batch instead of every grow
   assert.equal(b.calls.filter(call => !call.url.endsWith('/tokenize')).length, 1);
 });
 
-test('stream receive speed is explicitly a reference value when the MLX response has no server timings', async () => {
+test('batched stream content cannot provide generation speed without server timings', async () => {
   const b = background(() => sseResponse(sse({ choices: [{ delta: { content: 'First fragment. '.repeat(8) } }] }) +
     sse({ choices: [{ delta: { content: 'Last fragment. '.repeat(8) }, finish_reason: 'stop' }] }) +
     sse({ choices: [], usage: { completion_tokens: 120 } }) + 'data: [DONE]\n\n', () => b.tick(100)), { streamTranslation: true });
   await b.send([], { document: [{ text: 'Original paragraph.' }] });
   const row = (await b.extension({ type: 'cacheHistory' })).rows[0];
-  assert.equal(row.generationSpeedSource, 'stream');
-  assert.ok(row.generationTokensPerSecond > 0);
+  assert.equal(row.generationSpeedSource, null);
+  assert.equal(row.generationTokensPerSecond, null);
+  assert.ok(row.tokensPerSecond > 0);
   assert.ok(row.firstTokenMilliseconds > 0);
 });
 
@@ -633,4 +642,38 @@ test("diagnostics preserve malformed JSON and stream output and evict by bytes w
   const response = JSON.parse(storage.translationErrors[0].response);
   assert.equal(response.partialOutput, '途中の訳');
   assert.equal(response.invalidEvent, '{broken');
+});
+
+
+test('history totals weight speeds by measured time and keep missing metrics unknown', async () => {
+  let index = 0;
+  const responses = [
+    { tokens: 100, milliseconds: 1000, generation: 500 },
+    { tokens: 150, milliseconds: 3000, generation: 2500 },
+    { milliseconds: 1000 }
+  ];
+  const b = background(() => {
+    const sample = responses[index++]; b.tick(sample.milliseconds);
+    return { ...completion('訳文'), ...(sample.tokens ? { usage: { completion_tokens: sample.tokens },
+      timings: { predicted_n: sample.tokens, predicted_ms: sample.generation } } : {}) };
+  });
+  await b.send([], { document: [{ text: 'First paragraph.' }] });
+  await b.send([], { document: [{ text: 'Second paragraph.' }] });
+  let totals = (await b.control({ type: 'cacheHistory' })).totals;
+  assert.equal(totals.pages, 2);
+  assert.equal(totals.requests, 2);
+  assert.equal(totals.outputTokens, 250);
+  assert.equal(totals.milliseconds, 4000);
+  assert.equal(totals.tokensPerSecond, 62.5);
+  assert.equal(totals.generationTokensPerSecond, 250 / 3);
+  await b.send([], { document: [{ text: 'Unknown metrics.' }] });
+  totals = (await b.control({ type: 'cacheHistory' })).totals;
+  assert.equal(totals.outputTokens, null);
+  assert.equal(totals.tokensPerSecond, null);
+  assert.equal(totals.generationTokensPerSecond, null);
+  await b.control({ type: 'clearCache' });
+  totals = (await b.control({ type: 'cacheHistory' })).totals;
+  assert.equal(totals.pages, 0);
+  assert.equal(totals.outputTokens, 0);
+  assert.equal(totals.generationTokensPerSecond, null);
 });

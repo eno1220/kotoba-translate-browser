@@ -3,7 +3,7 @@ const K = Kotoba;
 const queue = new K.Queue(1); // Shared by every tab and by /tokenize requests.
 const jobs = new Map();
 const inFlightCompletions = new Map();
-const METRIC_TOTALS = ["requests", "sharedRequests", "responseMilliseconds", "outputTokens", "serverTokens", "serverMilliseconds", "serverRequests", "firstTokenMilliseconds", "streamRequests", "streamTokens", "streamMilliseconds", "batchFallbacks", "structureRetries", "truncations"];
+const METRIC_TOTALS = ["requests", "sharedRequests", "responseMilliseconds", "outputTokens", "serverTokens", "serverMilliseconds", "serverRequests", "firstTokenMilliseconds", "streamRequests", "batchFallbacks", "structureRetries", "truncations"];
 function measurements() { return { ...Object.fromEntries(METRIC_TOTALS.map(key => [key, 0])), tokensKnown: true }; }
 function documentURL(value) { const url = new URL(value); url.hash = ""; return url.href; }
 
@@ -98,25 +98,35 @@ function cacheParagraph(s, url, source, target, original, document, history) {
   if (history) { history.cached++; histories.set(history.key, history); }
   cacheBytes += size;
 }
+function historyMetrics(h) {
+  const server = h.requests > 0 && h.serverRequests === h.requests && h.serverMilliseconds > 0;
+  return { requests: h.requests, sharedRequests: h.sharedRequests,
+    batchFallbacks: h.batchFallbacks, structureRetries: h.structureRetries, truncations: h.truncations,
+    outputTokens: h.tokensKnown ? h.outputTokens : null,
+    firstTokenMilliseconds: h.streamRequests ? h.firstTokenMilliseconds / h.streamRequests : null,
+    generationTokensPerSecond: server ? h.serverTokens / (h.serverMilliseconds / 1000) : null,
+    generationSpeedSource: server ? "server" : null,
+    tokensPerSecond: h.requests > 0 && h.tokensKnown && h.responseMilliseconds > 0 ? h.outputTokens / (h.responseMilliseconds / 1000) : null };
+}
 function cacheHistory() {
   pruneCache();
-  const rows = new Map();
+  const rows = new Map(), totals = { ...measurements(), pages: 0, paragraphs: 0, characters: 0, milliseconds: 0 };
   for (const entry of translationCache.values()) {
     const h = entry.history;
     if (!h) continue;
-    if (!rows.has(h)) rows.set(h, { url: h.url, source: h.source, target: h.target, startedAt: h.startedAt, finishedAt: h.finishedAt,
-      milliseconds: h.finishedAt - h.startedAt, paragraphs: 0, characters: 0, requests: h.requests,
-      sharedRequests: h.sharedRequests,
-      batchFallbacks: h.batchFallbacks, structureRetries: h.structureRetries, truncations: h.truncations,
-      outputTokens: h.tokensKnown ? h.outputTokens : null,
-      firstTokenMilliseconds: h.streamRequests ? h.firstTokenMilliseconds / h.streamRequests : null,
-      generationTokensPerSecond: h.serverRequests === h.requests && h.serverMilliseconds > 0 ? h.serverTokens / (h.serverMilliseconds / 1000)
-        : h.streamTokens >= 32 && h.streamMilliseconds >= 1000 ? h.streamTokens / (h.streamMilliseconds / 1000) : null,
-      generationSpeedSource: h.serverRequests === h.requests && h.serverMilliseconds > 0 ? "server" : h.streamTokens >= 32 && h.streamMilliseconds >= 1000 ? "stream" : null,
-      tokensPerSecond: h.tokensKnown && h.responseMilliseconds > 0 ? h.outputTokens / (h.responseMilliseconds / 1000) : null });
+    if (!rows.has(h)) {
+      rows.set(h, { url: h.url, source: h.source, target: h.target, startedAt: h.startedAt, finishedAt: h.finishedAt,
+        milliseconds: h.finishedAt - h.startedAt, paragraphs: 0, characters: 0, ...historyMetrics(h) });
+      totals.pages++; totals.milliseconds += h.finishedAt - h.startedAt;
+      for (const name of METRIC_TOTALS) totals[name] += h[name];
+      totals.tokensKnown &&= h.tokensKnown;
+    }
     const row = rows.get(h); row.paragraphs++; row.characters += entry.characters;
+    totals.paragraphs++; totals.characters += entry.characters;
   }
-  return { rows: [...rows.values()].sort((a, b) => b.finishedAt - a.finishedAt), bytes: cacheBytes, maxBytes: CACHE_BYTES };
+  return { rows: [...rows.values()].sort((a, b) => b.finishedAt - a.finishedAt),
+    totals: { pages: totals.pages, paragraphs: totals.paragraphs, characters: totals.characters, milliseconds: totals.milliseconds, ...historyMetrics(totals) },
+    bytes: cacheBytes, maxBytes: CACHE_BYTES };
 }
 async function restoreCachedPage(sender) {
   if (!sender.tab || sender.frameId !== 0) return {};
@@ -228,7 +238,7 @@ async function postOnce(s, url, data, signal, notify, phase, onResponse, onDelta
 async function readCompletionStream(response, signal, onDelta = () => {}, startedAt = Date.now()) {
   const reader = response.body.getReader(), decoder = new TextDecoder();
   let buffer = "", data = [], output = "", finishReason, usage, timings, done = false;
-  let firstContentAt, lastContentAt, contentEvents = 0;
+  let firstContentAt;
   function event() {
     if (!data.length) return;
     const raw = data.join("\n"); data = [];
@@ -244,7 +254,7 @@ async function readCompletionStream(response, signal, onDelta = () => {}, starte
     if (choice.finish_reason) finishReason = choice.finish_reason;
     const text = choice.delta?.content;
     if (typeof text === "string" && text.length) {
-      const now = Date.now(); firstContentAt ??= now; lastContentAt = now; contentEvents++;
+      firstContentAt ??= Date.now();
       output += text;
       if (output.length > 2000000) throw new Error("ストリーミング応答が200万文字を超えました。");
       onDelta(output);
@@ -275,8 +285,7 @@ async function readCompletionStream(response, signal, onDelta = () => {}, starte
     }
     if (!finishReason) throw new Error("ストリーミング応答が完了前に途切れました。原文を保持します。");
     return { choices: [{ message: { content: output }, finish_reason: finishReason }], usage, timings,
-      streamMetrics: { firstTokenMilliseconds: firstContentAt === undefined ? null : firstContentAt - startedAt,
-        generationMilliseconds: contentEvents > 1 ? lastContentAt - firstContentAt : 0 } };
+      streamMetrics: { firstTokenMilliseconds: firstContentAt === undefined ? null : firstContentAt - startedAt } };
   } catch (error) {
     error.response = { partialOutput: output, pendingEvent: [...data, buffer].join("\n"), ...error.response };
     throw error;
@@ -374,9 +383,6 @@ async function generateOnce(s, text, page, signal) {
     const stream = result.streamMetrics;
     if (Number.isFinite(stream?.firstTokenMilliseconds)) {
       page.metrics.firstTokenMilliseconds += stream.firstTokenMilliseconds; page.metrics.streamRequests++;
-      if (Number.isSafeInteger(tokens) && tokens > 1 && stream.generationMilliseconds > 0) {
-        page.metrics.streamTokens += tokens - 1; page.metrics.streamMilliseconds += stream.generationMilliseconds;
-      }
     }
   }
   const choice = result.choices?.[0];

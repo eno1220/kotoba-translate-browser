@@ -14,6 +14,23 @@ function render(data) {
   const next = JSON.stringify(data);
   if (version === next) return;
   version = next;
+  const totals = data.totals;
+  const stats = document.createDocumentFragment();
+  for (const [label, value] of [
+    ['翻訳回数', `${number.format(totals.pages)}回`],
+    ['残存段落', number.format(totals.paragraphs)],
+    ['原文文字数', number.format(totals.characters)],
+    ['累計処理時間', `${(totals.milliseconds / 1000).toFixed(1)}秒`],
+    ['API応答数', number.format(totals.requests)],
+    ['出力トークン', totals.outputTokens == null ? '—' : number.format(totals.outputTokens)],
+    ['API tok/s', totals.tokensPerSecond == null ? '—' : totals.tokensPerSecond.toFixed(1)],
+    ['生成 tok/s', totals.generationTokensPerSecond == null ? '—' : totals.generationTokensPerSecond.toFixed(1)],
+    ['平均初回受信', totals.firstTokenMilliseconds == null ? '—' : `${(totals.firstTokenMilliseconds / 1000).toFixed(2)}秒`]
+  ]) {
+    const item = document.createElement('div'), name = document.createElement('dt'), valueNode = document.createElement('dd');
+    name.textContent = label; valueNode.textContent = value; item.append(name, valueNode); stats.append(item);
+  }
+  $('totals').replaceChildren(stats);
   const focusedURL = document.activeElement?.closest('#entries a')?.href;
   const fragment = document.createDocumentFragment();
   for (const entry of data.rows) {
@@ -42,7 +59,7 @@ function render(data) {
     cell(row, 7, entry.tokensPerSecond === null ? '—' : entry.tokensPerSecond.toFixed(1));
     const speed = cell(row, 8, entry.generationTokensPerSecond == null ? '—' : entry.generationTokensPerSecond.toFixed(1));
     if (entry.generationSpeedSource) {
-      const label = document.createElement('small'); label.textContent = entry.generationSpeedSource === 'server' ? 'サーバー値' : '受信の参考値'; speed.append(label);
+      const label = document.createElement('small'); label.textContent = 'サーバー値'; speed.append(label);
     }
     cell(row, 9, entry.firstTokenMilliseconds == null ? '—' : `${(entry.firstTokenMilliseconds / 1000).toFixed(2)}秒`);
     fragment.append(row);
