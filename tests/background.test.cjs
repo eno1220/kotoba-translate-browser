@@ -677,3 +677,24 @@ test('history totals weight speeds by measured time and keep missing metrics unk
   assert.equal(totals.outputTokens, 0);
   assert.equal(totals.generationTokensPerSecond, null);
 });
+
+
+test('page API throughput divides tokens by elapsed time without counting concurrent responses repeatedly', async () => {
+  const releases = [];
+  const b = background(() => new Promise(resolve => releases.push(resolve)), { concurrency: 6 });
+  const pending = Array.from({ length: 6 }, (_, i) => b.send([], {
+    document: [{ text: `Concurrent paragraph ${i}.` }], sessionId: 'parallel-page'
+  }));
+  for (let i = 0; i < 20 && releases.length < 6; i++) await new Promise(setImmediate);
+  assert.equal(releases.length, 6);
+  b.tick(43600);
+  releases.forEach((resolve, i) => resolve({ ...completion('訳文'), usage: { completion_tokens: i === 0 ? 806 : 807 } }));
+  await Promise.all(pending);
+  const data = await b.control({ type: 'cacheHistory' });
+  assert.equal(data.rows.length, 1);
+  const row = data.rows[0];
+  assert.equal(row.milliseconds, 43600);
+  assert.equal(row.outputTokens, 4841);
+  assert.equal(row.tokensPerSecond.toFixed(1), '111.0');
+  assert.equal(data.totals.tokensPerSecond, row.tokensPerSecond);
+});

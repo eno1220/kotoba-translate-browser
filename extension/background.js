@@ -98,7 +98,7 @@ function cacheParagraph(s, url, source, target, original, document, history) {
   if (history) { history.cached++; histories.set(history.key, history); }
   cacheBytes += size;
 }
-function historyMetrics(h) {
+function historyMetrics(h, milliseconds) {
   const server = h.requests > 0 && h.serverRequests === h.requests && h.serverMilliseconds > 0;
   return { requests: h.requests, sharedRequests: h.sharedRequests,
     batchFallbacks: h.batchFallbacks, structureRetries: h.structureRetries, truncations: h.truncations,
@@ -106,7 +106,7 @@ function historyMetrics(h) {
     firstTokenMilliseconds: h.streamRequests ? h.firstTokenMilliseconds / h.streamRequests : null,
     generationTokensPerSecond: server ? h.serverTokens / (h.serverMilliseconds / 1000) : null,
     generationSpeedSource: server ? "server" : null,
-    tokensPerSecond: h.requests > 0 && h.tokensKnown && h.responseMilliseconds > 0 ? h.outputTokens / (h.responseMilliseconds / 1000) : null };
+    tokensPerSecond: h.requests > 0 && h.tokensKnown && milliseconds > 0 ? h.outputTokens / (milliseconds / 1000) : null };
 }
 function cacheHistory() {
   pruneCache();
@@ -116,7 +116,7 @@ function cacheHistory() {
     if (!h) continue;
     if (!rows.has(h)) {
       rows.set(h, { url: h.url, source: h.source, target: h.target, startedAt: h.startedAt, finishedAt: h.finishedAt,
-        milliseconds: h.finishedAt - h.startedAt, paragraphs: 0, characters: 0, ...historyMetrics(h) });
+        milliseconds: h.finishedAt - h.startedAt, paragraphs: 0, characters: 0, ...historyMetrics(h, h.finishedAt - h.startedAt) });
       totals.pages++; totals.milliseconds += h.finishedAt - h.startedAt;
       for (const name of METRIC_TOTALS) totals[name] += h[name];
       totals.tokensKnown &&= h.tokensKnown;
@@ -125,7 +125,7 @@ function cacheHistory() {
     totals.paragraphs++; totals.characters += entry.characters;
   }
   return { rows: [...rows.values()].sort((a, b) => b.finishedAt - a.finishedAt),
-    totals: { pages: totals.pages, paragraphs: totals.paragraphs, characters: totals.characters, milliseconds: totals.milliseconds, ...historyMetrics(totals) },
+    totals: { pages: totals.pages, paragraphs: totals.paragraphs, characters: totals.characters, milliseconds: totals.milliseconds, ...historyMetrics(totals, totals.milliseconds) },
     bytes: cacheBytes, maxBytes: CACHE_BYTES };
 }
 async function restoreCachedPage(sender) {
