@@ -41,7 +41,7 @@ function diagnosticRecorder(s, page, signal) {
       error: { name: error.name, message: error.message, code: error.code, stack: error.stack },
       original, response: response === undefined || typeof response === "string" ? response : JSON.stringify(response), ...details,
       endpoint: K.endpoint(s), maxTokens: K.MAX_TOKENS,
-      settings: Object.fromEntries(["model", "apiFormat", "inputTokens", "contextTokens", "timeoutSeconds", "tokenizer", "batchTranslation", "streamTranslation", "retryTransient", "form"].map(key => [key, s[key]])) });
+      settings: Object.fromEntries(["model", "apiFormat", "inputTokens", "contextTokens", "timeoutSeconds", "tokenizer", "batchTranslation", "maxBatchItems", "batchStartItems", "batchStartTokens", "batchGrowthFactor", "batchTargetSeconds", "readingOrder", "progressiveBatching", "batchRecovery", "mergeSections", "deduplicateRepetitions", "streamTranslation", "retryTransient", "form"].map(key => [key, s[key]])) });
     try {
       await errorOperation(async () => {
         const { translationErrors = [] } = await browser.storage.local.get("translationErrors");
@@ -425,7 +425,7 @@ async function translateDocument(s, document, page, signal, advance, limit = s.i
     let accepted = null;
     for (let attempt = 0; attempt < 2; attempt++) {
       if (attempt && page.metrics) page.metrics.structureRetries++;
-      const output = await generate(s, K.serializeDocument(chunk), { ...page, html: true, retry: attempt > 0, glossaryText: glossarySource(chunk) }, signal);
+      const output = await generate(s, K.serializeDocument(chunk), { ...page, html: true, glossaryText: glossarySource(chunk) }, signal);
       if (output.truncated) {
         if (depth >= 5) break;
         accepted = await translateDocument(s, chunk, page, signal, advance, Math.max(64, Math.floor(limit / 2)), depth + 1, count);
@@ -477,12 +477,41 @@ function parseBatch(text, documents) {
   if (result.filter(Boolean).length !== documents.length) throw new Error("Missing batch marker");
   return result;
 }
-async function translateDocuments(s, documents, page, signal, advance, deliver = () => {}) {
+async function translateDocuments(s, documents, page, signal, advance, deliver = () => {}, repetitive = false) {
+  if (repetitive && s.batchTranslation && s.deduplicateRepetitions) {
+    // Only coalesce identical cells/items within this request, including their
+    // inline IDs and protected content. Each DOM destination is still applied
+    // and restored independently. Nothing is retained for another request.
+    const unique = [], copies = [], keys = new Map(), expanded = new Array(documents.length);
+    documents.forEach((document, index) => {
+      const key = K.serializeDocument(document);
+      if (!keys.has(key)) { keys.set(key, unique.length); unique.push(document); copies.push([]); }
+      copies[keys.get(key)].push(index);
+    });
+    if (unique.length < documents.length) {
+      await translateDocuments(s, unique, page, signal, advance, (index, result) => {
+        for (const destination of copies[index]) { expanded[destination] = result; deliver(destination, result); }
+        advance((copies[index].length - 1) * K.documentLength(unique[index]));
+      });
+      return expanded;
+    }
+  }
   const count = counter(s, signal, page.notify), results = [];
   let batchAllowed = s.batchTranslation;
+  let batchLimit = s.maxBatchItems;
   function accept(result) { const index = results.length; results.push(result); deliver(index, result); }
+  async function shrink(batch) {
+    batchLimit = Math.max(1, Math.min(batchLimit, Math.floor(batch.length / 2)));
+    const middle = batchLimit;
+    page.batchLimit = Math.min(page.batchLimit || s.maxBatchItems, batchLimit);
+    await flush(batch.slice(0, middle)); await flush(batch.slice(middle));
+  }
   async function flush(batch) {
     if (signal.aborted) throw new DOMException("キャンセルしました。", "AbortError");
+    if (batch.length > batchLimit) {
+      const middle = batchLimit;
+      await flush(batch.slice(0, middle)); await flush(batch.slice(middle)); return;
+    }
     if (batch.length > 1 && batchAllowed) {
       // A remote tokenizer measures a whole candidate once, rather than every
       // growing prefix. Oversized candidates split at paragraph boundaries.
@@ -490,8 +519,20 @@ async function translateDocuments(s, documents, page, signal, advance, deliver =
         const middle = Math.ceil(batch.length / 2);
         await flush(batch.slice(0, middle)); await flush(batch.slice(middle)); return;
       }
-      const output = await generate(s, serializeBatch(batch), { ...page, html: true, batch: true, glossaryText: batch.map(glossarySource).join("\n") }, signal);
-      if (!output.truncated) {
+      let output;
+      try { output = await generate(s, serializeBatch(batch), { ...page, html: true, batch: true, glossaryText: batch.map(glossarySource).join("\n") }, signal); }
+      catch (error) {
+        // Retry smaller only for size-related API failures. Authentication,
+        // unavailable servers and cancellation keep their existing behavior.
+        const tooLarge = error.httpStatus === 413 || error.httpStatus === 400 && /context.{0,40}(?:length|limit|exceed)|too many tokens|maximum.{0,30}tokens/i.test(String(error.response));
+        if (!s.batchRecovery || !tooLarge || signal.aborted) throw error;
+        await shrink(batch); return;
+      }
+      if (output.truncated) {
+        // Hitting the output limit is a size problem, not broken paragraph
+        // structure. Retain batching while shrinking this candidate.
+        await shrink(batch); return;
+      } else {
         let accepted;
         try { accepted = parseBatch(output.text, batch); }
         catch (error) { await page.record?.(error, "batch-structure", serializeBatch(batch), output.text); }
@@ -502,6 +543,7 @@ async function translateDocuments(s, documents, page, signal, advance, deliver =
         }
       }
       if (page.metrics) page.metrics.batchFallbacks++;
+      if (s.batchRecovery) { await shrink(batch); return; }
       batchAllowed = false;
     }
     for (const document of batch) {
@@ -530,7 +572,7 @@ async function translate(message, sender) {
   if (message.protocol !== K.CONTENT_PROTOCOL) throw staleContent();
   const document = message.document;
   const documents = message.documents;
-  if (documents !== undefined && (!Array.isArray(documents) || !documents.length || documents.length > 64)) throw new Error("翻訳の段落数が不正です。");
+  if (documents !== undefined && (!Array.isArray(documents) || !documents.length || documents.length > 256)) throw new Error("翻訳の段落数が不正です。");
   const inputs = documents || (document !== undefined ? [document] : null);
   if (inputs) {
     for (const document of inputs) {
@@ -575,12 +617,21 @@ async function translate(message, sender) {
         if (hit) advance(K.documentLength(input));
         return hit ? { document: hit } : null;
       });
-      results.forEach((result, index) => { if (result) notify("preparing", { index, ...result }); });
+      let nextDelivery = 0;
+      const ready = new Map();
+      const deliver = (index, result) => {
+        if (!s.readingOrder) { notify("preparing", { index, ...result }); return; }
+        ready.set(index, result);
+        while (ready.has(nextDelivery)) {
+          notify("preparing", { index: nextDelivery, ...ready.get(nextDelivery) }); ready.delete(nextDelivery++);
+        }
+      };
+      results.forEach((result, index) => { if (result) deliver(index, result); });
       const missingIndices = inputs.flatMap((_, index) => results[index] ? [] : [index]);
       const missing = missingIndices.map(index => inputs[index]);
       if (missing.length) {
         const fresh = documents ? await translateDocuments(s, missing, page, job.controller.signal, advance,
-          (index, result) => notify("preparing", { index: missingIndices[index], ...result })) : [{ document: await translateDocument(s, document, page, job.controller.signal, advance) }];
+          (index, result) => deliver(missingIndices[index], result), message.repetitive === true) : [{ document: await translateDocument(s, document, page, job.controller.signal, advance) }];
         if (job.controller.signal.aborted) throw new DOMException("キャンセルしました。", "AbortError");
         let history;
         if (useCache && revision === cacheRevision) {
@@ -599,7 +650,7 @@ async function translate(message, sender) {
           if (useCache && revision === cacheRevision && results[i].document) cacheParagraph(saved, url, page.source, page.target, inputs[i], results[i].document, history);
         }
       }
-      return documents ? { documents: results, batchFallback: page.metrics.batchFallbacks > 0 } : results[0];
+      return documents ? { documents: results, batchFallback: page.metrics.batchFallbacks > 0, ...(page.batchLimit ? { batchLimit: page.batchLimit } : {}) } : results[0];
     }
     return { parts: [await translatePlain(s, message.parts[0], page, job.controller.signal, counter(s, job.controller.signal, notify), s.inputTokens, 0, advance)] };
   } catch (error) {

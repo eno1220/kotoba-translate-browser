@@ -16,7 +16,7 @@ function background(responder, settings = {}, storage = {}) {
     browser: {
       runtime: { getManifest: () => ({ version: "0.1.3" }), id: "test", getURL: path => `moz-extension://test/${path}`, onMessage: { addListener: fn => listener = fn } },
       storage: { local: { get: async key => { reads++; return key === "settings" ? { settings } : structuredClone(storage); }, set: async values => Object.assign(storage, structuredClone(values)) }, onChanged: { addListener: fn => settingsChanged = fn } },
-      tabs: { onRemoved: event, onUpdated: event, query: async () => [], sendMessage: async (tabId, message, options) => { progress.push(message); pageMessages.push({ tabId, message, options }); return message.type === "status" ? pageState : { protocol: 5 }; } },
+      tabs: { onRemoved: event, onUpdated: event, query: async () => [], sendMessage: async (tabId, message, options) => { progress.push(message); pageMessages.push({ tabId, message, options }); return message.type === "status" ? pageState : { protocol: 6 }; } },
       browserAction: { setBadgeText: async value => badges.push(value), setTitle: async () => {} },
       commands: { onCommand: { addListener: fn => commandListener = fn } }, contextMenus: { create: value => menus.push(value), onClicked: { addListener: fn => menuListener = fn } }
     },
@@ -42,7 +42,7 @@ function background(responder, settings = {}, storage = {}) {
     configure: values => { settings = { ...settings, ...values }; settingsChanged({ settings: { newValue: settings } }, "local"); },
     control: message => listener(message, { id: "test" }),
     extension: message => listener(message, { id: "test", tab: { id: 20 }, url: "moz-extension://test/options.html" }),
-    send: (parts, overrides = {}, tabId = 1, sender = {}) => listener({ type: "translate", protocol: 5, parts, source: "en", target: "ja", ...overrides }, { id: "test", tab: { id: tabId }, frameId: 0, url: "https://example.org/private?q=secret", ...sender })
+    send: (parts, overrides = {}, tabId = 1, sender = {}) => listener({ type: "translate", protocol: 6, parts, source: "en", target: "ja", ...overrides }, { id: "test", tab: { id: tabId }, frameId: 0, url: "https://example.org/private?q=secret", ...sender })
   };
 }
 const completion = text => ({ choices: [{ message: { content: text }, finish_reason: "stop" }] });
@@ -144,7 +144,8 @@ test("broken inline structure retries the complete paragraph and never translate
   assert.equal(response.errorCode, "structure");
   assert.equal(b.calls.length, 2);
   assert.equal(b.calls[0].body.messages[0].content, b.calls[1].body.messages[0].content);
-  assert.ok(b.calls[1].body.context.includes("previous response"));
+  assert.equal(b.calls[1].body.context, b.calls[0].body.context);
+  assert.doesNotMatch(b.calls[1].body.context, /preserve|return only|never|check every/i);
 });
 
 
@@ -206,6 +207,108 @@ test("batch packing includes marker overhead in the token budget and disabling s
     assert.equal(result.documents.length, 5);
     assert.equal(b.calls.length, batchTranslation ? 2 : 5);
   }
+});
+
+test('repetitive batches translate exact structures once and deliver every original index without a cache', async () => {
+  const variants = [
+    [{ text: 'City.' }],
+    [{ tag: 'a', id: 'k0', children: [{ text: 'Store.' }] }],
+    [{ tag: 'a', id: 'k1', children: [{ text: 'Store.' }] }],
+    [{ tag: 'span', id: 'k0', protected: true, children: [{ text: 'Brand' }] }, { text: ' store.' }]
+  ];
+  const documents = Array.from({ length: 256 }, (_, i) => variants[i % variants.length]);
+  const b = background(({ body }) => {
+    const input = body.messages[0].content;
+    assert.equal((input.match(/<p id="b/g) || []).length, 4);
+    assert.ok(Buffer.byteLength(input) <= 512);
+    return completion(input.replaceAll('City.', '都市。').replaceAll('Store.', '店舗。').replaceAll(' store.', ' 店舗。'));
+  }, { inputTokens: 512, cacheMinutes: 0 });
+  const result = await b.send([], { documents, repetitive: true, requestId: 'repeated-table' });
+  assert.equal(b.calls.length, 1); assert.equal(result.documents.length, 256);
+  for (let index = 0; index < 256; index++) {
+    const tree = result.documents[index].document;
+    if (index % 4 === 0) assert.equal(tree[0].text, '都市。');
+    else if (index % 4 === 3) { assert.equal(tree[0].children[0].text, 'Brand'); assert.equal(tree[1].text, ' 店舗。'); }
+    else { assert.equal(tree[0].id, variants[index % 4][0].id); assert.equal(tree[0].children[0].text, '店舗。'); }
+  }
+  const deliveries = b.progress.flatMap(value => value.results || []);
+  assert.equal(deliveries.length, 256); assert.equal(new Set(deliveries.map(value => value.index)).size, 256);
+  assert.deepEqual(deliveries.map(value => value.index), Array.from({ length: 256 }, (_, i) => i));
+  const last = b.progress.at(-1);
+  assert.equal(last.completed, last.total);
+  assert.ok(b.progress.every(value => value.completed <= value.total));
+  await b.send([], { documents, repetitive: true }); assert.equal(b.calls.length, 2);
+});
+
+test('ordinary paragraph batches keep repeated text in its own paragraph contexts', async () => {
+  const b = background(({ body }) => {
+    assert.equal((body.messages[0].content.match(/<p id="b/g) || []).length, 3);
+    return completion('<p id="b0">First context.</p><p id="b1">Second context.</p><p id="b2">Third context.</p>');
+  }, { cacheMinutes: 0 });
+  const result = await b.send([], { documents: Array.from({ length: 3 }, () => [{ text: 'Repeated prose.' }]) });
+  assert.deepEqual(Array.from(result.documents, item => item.document[0].text), ['First context.', 'Second context.', 'Third context.']);
+});
+
+test('output-limited batches split into smaller batches without disabling further batching', async () => {
+  const documents = Array.from({ length: 8 }, (_, i) => [{ text: `Paragraph ${i}.` }]);
+  const b = background(({ body }) => {
+    const input = body.messages[0].content;
+    const paragraphs = (input.match(/<p id="b/g) || []).length;
+    if (paragraphs > 4) return { choices: [{ message: { content: 'unfinished' }, finish_reason: 'length' }] };
+    assert.equal(paragraphs, 4);
+    return completion(input.replaceAll('Paragraph', '段落'));
+  });
+  const result = await b.send([], { documents, requestId: 'split-batch' });
+  assert.equal(b.calls.length, 3); assert.equal(result.batchFallback, false);
+  assert.deepEqual(Array.from(result.documents, item => item.document[0].text), Array.from({ length: 8 }, (_, i) => `段落 ${i}.`));
+  assert.equal(b.progress.at(-1).completed, b.progress.at(-1).total);
+  const history = await b.control({ type: 'cacheHistory' });
+  assert.equal(history.rows[0].truncations, 1); assert.equal(history.rows[0].batchFallbacks, 0);
+});
+
+test('broken link markup reduces batches and completes their paragraphs in order', async () => {
+  const sizes = [];
+  const b = background(({ body }) => {
+    const input = body.messages[0].content, count = (input.match(/<p id="b/g) || []).length; sizes.push(count);
+    // Like the supplied log: an anchor's closing tag disappears in a batch.
+    return completion(count > 2 ? input.replace('</a>', '') : input.replaceAll('Read', '読む'));
+  }, { cacheMinutes: 0 });
+  const documents = Array.from({ length: 8 }, (_, i) => [{ text: `Read ${i} ` }, { tag: 'a', id: 'k0', children: [{ text: 'the docs' }] }]);
+  const result = await b.send([], { documents, requestId: 'broken-batch' });
+  assert.deepEqual(sizes, [8, 4, 2, 2, 2, 2]);
+  assert.equal(result.batchLimit, 2); assert.equal(result.batchFallback, true);
+  assert.deepEqual(Array.from(result.documents, item => item.document[0].text), Array.from({ length: 8 }, (_, i) => `読む ${i} `));
+  assert.deepEqual(b.progress.flatMap(value => value.results || []).map(value => value.index), [0, 1, 2, 3, 4, 5, 6, 7]);
+  assert.equal(b.progress.at(-1).completed, b.progress.at(-1).total);
+});
+
+test('size-related API errors split batches while authentication errors stop without extra calls', async () => {
+  const documents = Array.from({ length: 4 }, (_, i) => [{ text: `Paragraph ${i}.` }]);
+  for (const status of [413, 400, 401]) {
+    const b = background(({ body }) => {
+      const input = body.messages[0].content;
+      if ((input.match(/<p id="b/g) || []).length > 2) return new Response('input exceeds the context length', { status });
+      return completion(input);
+    });
+    const result = await b.send([], { documents });
+    if (status === 401) { assert.match(result.error, /401/); assert.equal(b.calls.length, 1); }
+    else { assert.equal(result.documents.length, 4); assert.equal(result.batchLimit, 2); assert.equal(b.calls.length, 3); }
+  }
+});
+
+test('reading order buffers later cache hits until earlier fresh paragraphs are ready', async () => {
+  let release;
+  const b = background(({ body }) => body.messages[0].content === 'Earlier.'
+    ? new Promise(resolve => release = () => resolve(completion('先。'))) : completion('後。'));
+  const later = [{ text: 'Later.' }];
+  await b.send([], { document: later });
+  const pending = b.send([], { documents: [[{ text: 'Earlier.' }], later], requestId: 'ordered-cache' });
+  for (let i = 0; i < 20 && !release; i++) await new Promise(setImmediate);
+  assert.ok(release);
+  assert.ok(b.progress.filter(value => value.requestId === 'ordered-cache').every(value => !value.results));
+  release(); const result = await pending;
+  assert.deepEqual(b.progress.filter(value => value.requestId === 'ordered-cache').flatMap(value => value.results || []).map(value => value.index), [0, 1]);
+  assert.equal(result.documents[0].document[0].text, '先。'); assert.equal(result.documents[1].document[0].text, '後。');
 });
 
 test("page cache reuses validated paragraphs across tabs and mixed batches without renewing expiry", async () => {
@@ -486,7 +589,7 @@ test('selection streams preview as text and Stop aborts a live stream without ca
 });
 
 test('remote tokenizer measures one fitting semantic batch instead of every growing prefix', async () => {
-  const b = background(({ url, body }) => url.endsWith('/tokenize') ? { count: 100 } : completion(body.messages[0].content), { tokenizer: 'llama' });
+  const b = background(({ url, body }) => url.endsWith('/tokenize') ? { count: 100 } : completion(body.messages[0].content), { tokenizer: 'llama', maxBatchItems: 64 });
   const documents = Array.from({ length: 64 }, (_, i) => [{ text: `Short paragraph ${i}.` }]);
   const result = await b.send([], { documents });
   assert.equal(result.documents.length, 64);

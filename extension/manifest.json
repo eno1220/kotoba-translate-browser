@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Kotoba",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "ローカル翻訳サーバでページと選択範囲を翻訳します。",
   "icons": {"48": "icons/kotoba.svg", "96": "icons/kotoba.svg"},
   "browser_specific_settings": {"gecko": {"id": "kotoba-local@eno1220.local", "strict_min_version": "128.0"}},

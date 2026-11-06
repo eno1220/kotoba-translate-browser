@@ -1,6 +1,6 @@
 /* global browser */
 (() => {
-  const PROTOCOL = 5;
+  const PROTOCOL = 6;
   if (globalThis.__kotobaLoaded) return;
   globalThis.__kotobaLoaded = true;
   const SKIP = new Set("SCRIPT STYLE NOSCRIPT TEMPLATE PRE CODE KBD SAMP VAR TEXTAREA INPUT SELECT OPTION BUTTON SVG MATH CANVAS VIDEO AUDIO IFRAME OBJECT EMBED".split(" "));
@@ -18,9 +18,10 @@
   let hoverFrame = null, hoverPoint;
   let requestSequence = 0;
   const progressListeners = new Map();
-  let scrollDirection = 1, previousScrollY = scrollY;
+  let scrollDirection = 1, previousScrollY = scrollY, readingWindow = 0, windowScrollY = scrollY;
   document.addEventListener("scroll", () => {
     if (Math.abs(scrollY - previousScrollY) >= 4) scrollDirection = scrollY > previousScrollY ? 1 : -1;
+    if (Math.abs(scrollY - windowScrollY) >= Math.max(80, innerHeight / 2)) { readingWindow++; windowScrollY = scrollY; }
     previousScrollY = scrollY;
   }, { passive: true, capture: true });
   function yieldToBrowser() {
@@ -33,6 +34,8 @@
     return new Promise(resolve => setTimeout(resolve, 0));
   }
   const preferences = { responsiveScan: true, prioritizeVisible: true, prioritizeContent: true, semanticBatching: true, adaptiveScheduling: true, inputTokens: 6000, tokenizer: "bytes", mainContentOnly: false, selectionButton: false,
+    readingOrder: true, progressiveBatching: true, batchRecovery: true, mergeSections: true, deduplicateRepetitions: true,
+    maxBatchItems: 32, batchStartItems: 4, batchStartTokens: 1200, batchGrowthFactor: 2, batchTargetSeconds: 8,
     keyboardShortcuts: true, copyButton: true, focusOriginal: true, pageProgress: true, announceProgress: true, hoverEnabled: true };
   let announcer, announcementKey, launcher, launcherTimer, originalFocus;
   function applyPreferences(value) {
@@ -399,7 +402,7 @@
         : assigned.length ? assigned : [...container.childNodes];
       // CSS flex/block on a link or span does not turn it into a separate
       // linguistic paragraph. Keep explicit paragraph containers intact.
-      if (scan.adaptiveScheduling && blockCache.get(container) && /^(P|H[1-6]|TD|TH|DT|DD|SUMMARY|FIGCAPTION)$/.test(container.tagName) &&
+      if (blockCache.get(container) && /^(P|A|H[1-6]|TD|TH|DT|DD|SUMMARY|FIGCAPTION)$/.test(container.tagName) &&
         !children.some(node => applied.has(node)) && !container.querySelector('p,h1,h2,h3,h4,h5,h6,li,dt,dd,table,[role="heading"],[role="listitem"],[role="row"]') &&
         ![...container.querySelectorAll("*")].some(node => node.shadowRoot || node.tagName === "SLOT")) {
         makeUnit(children); return;
@@ -453,8 +456,12 @@
           if (figureComponents.has(previous)) break;
         }
         if (figure) figureComponents.set(figure, gallery);
-        group.priority = chrome ? 3 : content ? (table || context.closest("summary") ? 1 : 0) : 2;
+        group.priority = chrome ? 3 : content ? (table || figure || context.closest("summary") ? 1 : 0) : 2;
         group.component = table || chrome || gallery || context.closest('section,blockquote,figure,article,main,[role="main"],[role="article"],[role="list"],ul,ol,dl') || context.closest("div") || context.getRootNode().host || document.body;
+        group.repetition = table || context.closest('ul,ol,dl,[role="list"]');
+        // First preserve rows/items, then pack peer sections within their article.
+        // Tables, galleries and peripheral components retain their own boundary.
+        group.batchScope = table || gallery || group.repetition || chrome || article || content || group.component;
         group.semanticUnit = context.closest('tr,li,figure,blockquote,[role="row"],[role="listitem"]');
         group.heading = /^H[1-6]$/.test(context.tagName) || context.getAttribute("role") === "heading";
         ordered.push({ group, distance: scan.prioritizeVisible ? viewportDistance(group) : 0 });
@@ -466,7 +473,8 @@
         if (group.heading && group.priority < 3 && next?.priority === 1 && next.context.closest('summary,table,[role="table"],[role="grid"]')) {
           // A regional/table heading belongs with its supplemental content,
           // rather than being sent alone ahead of every other section.
-          group.priority = 1; group.component = next.component;
+          group.priority = 1; group.component = next.component; group.batchScope = next.batchScope;
+          group.repetition = next.repetition;
           if (!group.semanticUnit && next.semanticUnit) group.semanticUnit = next.semanticUnit;
         }
         if (group.heading) sections.set(group.component, group.context);
@@ -493,7 +501,9 @@
           else if (item.units >= 3 && density >= 0.8) group.priority = 3;
         }
       }
-      return ordered.sort((a, b) => (scan.prioritizeContent ? a.group.priority - b.group.priority : 0) || a.distance - b.distance).map(item => item.group);
+      return ordered.sort((a, b) => scan.readingOrder
+        ? (scan.prioritizeContent ? Number(a.group.priority === 3) - Number(b.group.priority === 3) : 0) || a.group.order - b.group.order
+        : (scan.prioritizeContent ? a.group.priority - b.group.priority : 0) || a.distance - b.distance).map(item => item.group);
     }
     return groups;
   }
@@ -596,7 +606,10 @@
     state.preparing = false; state.total = groups.length;
     state.message = groups.length ? "" : "翻訳対象がありません";
     let totalChars = groups.reduce((sum, group) => sum + group.length, 0);
-    let completedChars = 0, cursor = 0, batchingAvailable = true;
+    let completedChars = 0, cursor = 0, batchingAvailable = true, previewedWindow = -1;
+    let readingCursor = null;
+    let batchItems = scheduling.progressiveBatching ? Math.min(scheduling.batchStartItems, scheduling.maxBatchItems) : scheduling.maxBatchItems;
+    let batchTokens = scheduling.progressiveBatching ? Math.min(scheduling.batchStartTokens, scheduling.inputTokens) : scheduling.inputTokens;
     const unsent = new Set(groups), sourceOrder = [...groups].sort((a, b) => a.order - b.order);
     let planning = Promise.resolve();
     const activeProgress = new Map();
@@ -627,65 +640,81 @@
         if (run !== generation) return [];
         if (scheduling.responsiveScan && index && index % 80 === 0) await yieldToBrowser();
         const group = candidates[index], previous = blocks.at(-1);
-        const position = scheduling.prioritizeVisible ? viewportPosition(group) : { distance: 0, behind: false };
-        group.wireBytes ??= wireSize(group.document) + 18;
+        const position = scheduling.prioritizeVisible
+          ? scheduling.adaptiveScheduling ? viewportPosition(group) : group.schedulingPosition ??= viewportPosition(group)
+          : { distance: 0, behind: false };
+        group.wireBytes ??= wireSize(group.document) + 20;
+        if (group.repetition) group.repeatKey ??= JSON.stringify(group.document);
         if (group.semanticUnit && previous?.unit === group.semanticUnit && previous.component === group.component && previous.section === group.section && previous.priority === (group.priority || 0) && previous.groups.at(-1).order + 1 === group.order) {
           previous.groups.push(group);
           if (position.distance < previous.position.distance) previous.position = position;
         } else blocks.push({ groups: [group], unit: group.semanticUnit, component: group.component, section: group.section, priority: group.priority || 0, position });
       }
       const horizon = Math.max(1, innerHeight) * 1.5;
-      const score = block => [block.position.distance <= horizon ? 0 : 1, scheduling.prioritizeContent ? block.priority : 0,
+      const score = block => [scheduling.prioritizeContent && block.priority === 3 ? 1 : 0,
+        block.position.distance <= horizon ? 0 : 1, scheduling.prioritizeContent ? block.priority : 0,
         block.position.distance === 0 ? 0 : 1, block.position.behind ? 1 : 0, block.position.distance, block.groups[0].order];
       for (const block of blocks) block.score = score(block);
       const compare = (a, b) => { for (let i = 0; i < a.score.length; i++) if (a.score[i] !== b.score[i]) return a.score[i] < b.score[i] ? -1 : 1; return 0; };
       let best = 0;
       for (let i = 1; i < blocks.length; i++) if (compare(blocks[i], blocks[best]) < 0) best = i;
+      const newWindow = scheduling.adaptiveScheduling && scheduling.prioritizeVisible && previewedWindow !== -1 && previewedWindow !== readingWindow;
+      if (scheduling.readingOrder && blocks.length) {
+        const tier = block => scheduling.prioritizeContent && block.priority === 3 ? 1 : 0;
+        const firstTier = blocks.some(block => tier(block) === 0) ? 0 : 1;
+        const peers = blocks.map((block, index) => ({ block, index })).filter(item => tier(item.block) === firstTier);
+        const forward = readingCursor !== null && !newWindow && peers.find(item => item.block.groups[0].order >= readingCursor);
+        // Once a reading position is chosen, continue by source order. Distance,
+        // heading/table priority and completed layout changes cannot skip a gap.
+        const anchor = forward || (readingCursor !== null && !newWindow ? peers[0]
+          : peers.find(item => item.block.position.distance === 0) || peers.find(item => !item.block.position.behind && item.block.position.distance <= horizon) || peers[0]);
+        best = anchor.index;
+      }
       const first = blocks[best];
       if (!first || run !== generation) return [];
-      const near = first.position.distance <= horizon, warmup = cursor === 0;
+      if (newWindow && scheduling.progressiveBatching) {
+        batchItems = Math.min(scheduling.batchStartItems, scheduling.maxBatchItems);
+        batchTokens = Math.min(scheduling.batchStartTokens, scheduling.inputTokens);
+      }
+      const near = first.position.distance <= horizon;
       const batching = scheduling.semanticBatching && state.batchTranslation && batchingAvailable;
-      const limit = Math.min(scheduling.inputTokens, warmup ? 1200 : near ? 2400 : scheduling.inputTokens);
-      const maxItems = batching ? warmup ? 4 : near ? 16 : 64 : 1;
+      const budget = batchTokens;
+      const maxItems = batching ? Math.min(scheduling.maxBatchItems, batchItems) : 1;
       const size = group => scheduling.tokenizer === "bytes" ? group.wireBytes : group.wireBytes / 3;
       const selected = [];
+      const repeats = new Set();
+      const repetition = scheduling.deduplicateRepetitions && first.groups[0].repetition;
+      const cost = (group, seen) => repetition && group.repetition === repetition && seen.has(group.repeatKey) ? 0 : size(group);
+      const remember = (group, seen) => { if (repetition && group.repetition === repetition) seen.add(group.repeatKey); };
       let bytes = 0;
       for (let index = best; index < blocks.length; index++) {
         const block = blocks[index], last = selected.at(-1);
-        if (selected.length && (block.component !== first.component || block.priority !== first.priority ||
-          (block.position.distance <= horizon) !== near || last.order + 1 !== block.groups[0].order)) break;
-        if (selected.length && block.section !== last.section) {
-          // Small complete peer sections in a table/list can share a request.
-          // Article sections stay separate, and never join after a heading was
-          // omitted by viewport prioritization or an earlier translation.
-          if (first.priority !== 1 || !block.groups[0].heading) break;
-          let sectionSize = 0, sectionItems = 0;
-          for (let end = index; end < blocks.length && blocks[end].section === block.section; end++) {
-            sectionItems += blocks[end].groups.length;
-            sectionSize += blocks[end].groups.reduce((sum, group) => sum + size(group), 0);
-          }
-          if (bytes + sectionSize > limit || selected.length + sectionItems > maxItems) break;
-        }
-        const blockSize = block.groups.reduce((sum, group) => sum + size(group), 0);
-        if (selected.length && (bytes + blockSize > limit || selected.length + block.groups.length > maxItems)) break;
-        const blockMax = batching && !selected.length && blockSize <= limit ? Math.min(64, Math.max(maxItems, block.groups.length)) : maxItems;
+        if (selected.length && (block.groups[0].batchScope !== first.groups[0].batchScope ||
+          (!scheduling.mergeSections && block.section !== last.section) ||
+          (scheduling.readingOrder ? scheduling.prioritizeContent && (block.priority === 3) !== (first.priority === 3) : block.priority !== first.priority || (block.position.distance <= horizon) !== near) ||
+          last.order + 1 !== block.groups[0].order)) break;
+        const trial = new Set(repeats);
+        const blockSize = block.groups.reduce((sum, group) => { const n = cost(group, trial); remember(group, trial); return sum + n; }, 0);
+        if (selected.length && (bytes + blockSize > budget || selected.length + block.groups.length > maxItems)) break;
+        const blockMax = batching && !selected.length && blockSize <= budget ? Math.min(scheduling.maxBatchItems, Math.max(maxItems, block.groups.length)) : maxItems;
         for (const group of block.groups) {
-          if (selected.length && (selected.length >= blockMax || bytes + size(group) > limit)) break;
+          if (selected.length && (selected.length >= blockMax || bytes + cost(group, repeats) > budget)) break;
           if (!unitStillMatches(group)) {
             unsent.delete(group); state.total--; totalChars -= group.length; state.skipped = (state.skipped || 0) + 1;
             continue;
           }
-          selected.push(group); bytes += size(group);
+          selected.push(group); bytes += cost(group, repeats); remember(group, repeats);
           if (!batching) break;
         }
         if (selected.length >= maxItems || !batching || selected.length < block.groups.length) break;
       }
       for (const group of selected) unsent.delete(group);
+      if (selected.length) { previewedWindow = readingWindow; readingCursor = selected.at(-1).order + 1; }
       cursor += selected.length;
       return selected;
     }
     function chooseBatch() {
-      if (!scheduling.adaptiveScheduling) {
+      if (!scheduling.adaptiveScheduling && !scheduling.readingOrder && !scheduling.progressiveBatching) {
         const batch = nextBatch(); for (const group of batch) unsent.delete(group); return Promise.resolve(batch);
       }
       const next = planning.then(adaptiveBatch);
@@ -696,8 +725,8 @@
       if (!batchingAvailable) return [groups[cursor++]];
       if (scheduling.semanticBatching && state.batchTranslation) {
         const first = groups[cursor], batch = [];
-        const limit = cursor === 0 ? Math.min(1800, scheduling.inputTokens) : scheduling.inputTokens;
-        const maxItems = cursor === 0 ? 8 : 64;
+        const limit = Math.min(batchTokens, cursor === 0 ? 1800 : scheduling.inputTokens);
+        const maxItems = Math.min(scheduling.maxBatchItems, batchItems, cursor === 0 ? 8 : 64);
         const estimateSize = group => {
           group.wireBytes ??= wireSize(group.document) + 18;
           return scheduling.tokenizer === "bytes" ? group.wireBytes : group.wireBytes / 3;
@@ -708,7 +737,7 @@
           // Remote tokenizers do the exact packing in the background. This is
           // only a planning estimate; the bytes mode is a conservative bound.
           const estimate = estimateSize(group);
-          if (batch.length && (group.component !== first.component || group.priority !== first.priority || bytes + estimate > limit)) break;
+          if (batch.length && (group.component !== first.component || group.priority !== first.priority || !scheduling.mergeSections && group.section !== batch.at(-1).section || bytes + estimate > limit)) break;
           if (batch.length && group.semanticUnit && group.semanticUnit !== batch.at(-1).semanticUnit) {
             let end = cursor, unitSize = 0;
             while (end < groups.length && end - cursor <= 64 && groups[end].semanticUnit === group.semanticUnit) unitSize += estimateSize(groups[end++]);
@@ -720,7 +749,7 @@
         return batch;
       }
       const visible = viewportDistance(groups[cursor]) === 0;
-      const limit = !state.batchTranslation || cursor === 0 ? 1 : cursor < 3 ? 2 : visible ? 4 : 16;
+      const limit = Math.min(scheduling.maxBatchItems, batchItems, !state.batchTranslation || cursor === 0 ? 1 : cursor < 3 ? 2 : visible ? 4 : 16);
       const batch = [];
       let size = 0;
       while (cursor < groups.length && batch.length < limit) {
@@ -764,14 +793,26 @@
         });
         updateProgress();
         try {
-          const response = await browser.runtime.sendMessage({ type: "translate", protocol: PROTOCOL, requestId, sessionId: `${run}-${state.startedAt}`, sessionStartedAt: state.startedAt, ...(batch.length > 1 ? { documents: batch.map(group => group.document) } : { document: batch[0].document }), source, target });
+          const sentAt = Date.now();
+          const repetitive = scheduling.semanticBatching && scheduling.deduplicateRepetitions && batch[0].repetition && batch.every(group => group.repetition === batch[0].repetition);
+          const response = await browser.runtime.sendMessage({ type: "translate", protocol: PROTOCOL, requestId, sessionId: `${run}-${state.startedAt}`, sessionStartedAt: state.startedAt, ...(batch.length > 1 ? { documents: batch.map(group => group.document), repetitive: !!repetitive } : { document: batch[0].document }), source, target });
           if (state.url !== pageURL()) { currentPage(); return; }
           if (run !== generation) return;
           if (response.error && (batch.length > 1 || response.errorCode !== "structure")) throw new Error(response.error);
-          if (response.batchFallback) batchingAvailable = false;
+          if (response.batchFallback && !scheduling.batchRecovery) batchingAvailable = false;
           const responses = batch.length > 1 ? response.documents : [response];
           if (!responses || responses.length !== batch.length) throw new Error("翻訳結果が不正です。");
           responses.forEach((result, index) => accept(index, result));
+          const failed = response.batchFallback || response.batchLimit || responses.some(result => result.error);
+          if (failed && scheduling.batchRecovery) {
+            batchItems = Math.max(1, Math.min(batchItems, response.batchLimit || Math.floor(batch.length / 2)));
+            batchTokens = Math.max(128, Math.floor(batchTokens / 2));
+          } else if (scheduling.progressiveBatching && !failed) {
+            const seconds = Math.max(0.001, (Date.now() - sentAt) / 1000);
+            const factor = seconds > scheduling.batchTargetSeconds ? scheduling.batchTargetSeconds / seconds : scheduling.batchGrowthFactor;
+            batchItems = Math.max(1, Math.min(scheduling.maxBatchItems, Math.floor(batchItems * factor)));
+            batchTokens = Math.max(128, Math.min(scheduling.inputTokens, Math.floor(batchTokens * factor)));
+          }
         } catch (error) {
           if (run !== generation) return;
           state.failed++; state.message = error.message;
@@ -784,7 +825,7 @@
         updateProgress();
       }
     }
-    await Promise.all(Array.from({ length: Math.min(state.concurrency, Math.max(1, groups.length)) }, worker));
+    await Promise.all(Array.from({ length: Math.min(scheduling.readingOrder ? 1 : state.concurrency, Math.max(1, groups.length)) }, worker));
     if (run === generation) {
       state.running = false; clearActivity();
       state.finishedAt = Date.now();

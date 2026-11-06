@@ -21,24 +21,41 @@
     <fieldset><legend>翻訳の処理</legend>
       <label class="switch-row">複数の段落をまとめて翻訳<input name="batchTranslation" type="checkbox" role="switch"></label>
       <small>短い段落をまとめて送信し、APIの呼び出し回数を減らします。</small>
+      <label>1回にまとめる最大段落数<input name="maxBatchItems" type="number" min="1" max="256" required><small>既定32。表のセルも1段落として数えます。入力トークン上限も適用します。</small></label>
+      <label class="switch-row">本文を読み進める順に翻訳<input name="readingOrder" type="checkbox" role="switch"></label>
+      <small>表示位置から先の本文を順番に処理します。表や図版も本文中の順序を保ち、ページ内の送信は1つずつ完了させます。</small>
+      <label class="switch-row">成功と待ち時間に合わせてバッチサイズを調整<input name="progressiveBatching" type="checkbox" role="switch"></label>
+      <small>小さく開始し、成功時に段階的に拡大します。応答が目安より遅い場合は縮小します。オフでは最大段落数と入力上限を使います。</small>
+      <label class="switch-row">構造・サイズエラー時にバッチを縮小<input name="batchRecovery" type="checkbox" role="switch"></label>
+      <small>段落全体を保ったまま分けて再試行し、後続も小さくします。認証・接続エラーでは再送を増やしません。</small>
+      <details class="advanced"><summary>バッチサイズの調整</summary>
+        <label>開始時の段落数<input name="batchStartItems" type="number" min="1" max="256" required><small>既定4。最大段落数までに制限します。</small></label>
+        <label>開始時の入力予算<input name="batchStartTokens" type="number" min="128" max="24000" required><small>既定1200。入力上限までに制限します。長い1段落は分断せずに送信し、サーバー側の入力上限で分割します。</small></label>
+        <label>成功時の拡大倍率<input name="batchGrowthFactor" type="number" min="2" max="4" required><small>既定2。段落数と入力予算の両方に使います。</small></label>
+        <label>1回の応答時間の目安（秒）<input name="batchTargetSeconds" type="number" min="1" max="60" required><small>既定8。この時間を超えた場合は後続のバッチを縮小します。応答時間を保証する設定ではありません。</small></label>
+      </details>
       <label class="switch-row">長いページの解析中も操作できるようにする<input name="responsiveScan" type="checkbox" role="switch"></label>
       <small>短い間隔でブラウザへ制御を返します。解析中にも停止できます。</small>
       <label class="switch-row">画面内の段落を先に翻訳<input name="prioritizeVisible" type="checkbox" role="switch"></label>
       <small>同じ優先度の中で、画面内・近くの段落の順に処理します。</small>
       <label class="switch-row">本文をメニュー・サイドバーより先に翻訳<input name="prioritizeContent" type="checkbox" role="switch"></label>
-      <small>記事・本文、本文内の表や折りたたみ見出し、その他、メニュー・サイドバーの順に処理します。翻訳範囲は変わりません。</small>
+      <small>メニュー・サイドバーを本文の後に処理します。「読み進める順」がオフの場合は、本文内の種類による優先度も使います。翻訳範囲は変わりません。</small>
       <label class="switch-row">本文だけを翻訳<input name="mainContentOnly" type="checkbox" role="switch"></label>
       <small>main・role="main"、なければarticle内を対象にします。見つからないページでは全体を翻訳します。次の翻訳開始から反映します。</small>
     </fieldset>
     <fieldset><legend>実験的な機能</legend>
       <label class="switch-row">表示位置に合わせて未送信の段落を選び直す<input name="adaptiveScheduling" type="checkbox" role="switch"></label>
-      <small>既定オン。画面内と約1.5画面先までを優先し、見出しの境界も保ちます。遠い文章はその後に処理し、スクロールで通信を中止しません。</small>
+      <small>既定オン。大きくスクロールしたときに読み始める位置を選び直します。送信中の通信は中止しません。</small>
       <label class="switch-row">同じ処理中リクエストを共有<input name="shareInFlight" type="checkbox" role="switch"></label>
       <small>既定オン。本文・言語・Context・辞書・接続設定が一致する通信を全タブで共有します。一方の停止で他方は止めません。プライベートウィンドウは通常のタブと分けます。</small>
       <label class="switch-row">原文に現れる辞書項目だけを送信<input name="relevantGlossary" type="checkbox" role="switch"></label>
       <small>既定オン。大文字・小文字を区別して、今回の文章に含まれる原語だけを送ります。オフでは適用範囲・言語に合う全項目を送信します。</small>
       <label class="switch-row">同じ記事・表・メニューの段落をまとめる<input name="semanticBatching" type="checkbox" role="switch"></label>
       <small>既定オン。「複数の段落をまとめて翻訳」と併用し、同じコンポーネントの段落を入力上限までまとめます。オフで従来の小分けに戻ります。</small>
+      <label class="switch-row">同じ記事内の小節をさらにまとめる<input name="mergeSections" type="checkbox" role="switch"></label>
+      <small>見出しと段落を保持して、同じ記事の小節を1回の送信にまとめます。オフでは小節境界で分けます。</small>
+      <label class="switch-row">表・リスト内の完全一致する項目をまとめる<input name="deduplicateRepetitions" type="checkbox" role="switch"></label>
+      <small>同じ送信内で原文と構造が完全一致する項目を一度だけ翻訳し、元の各位置へ反映します。</small>
       <label class="switch-row">訳文をストリーミングで受信<input name="streamTranslation" type="checkbox" role="switch"></label>
       <small>既定オフ。選択翻訳は受信中から表示し、ページ本文は構造の検証後に反映します。対応APIで使ってください。初回受信時間と参考の生成速度も履歴に記録します。</small>
       <label class="switch-row">一時的なサーバーエラーを自動で再試行<input name="retryTransient" type="checkbox" role="switch"></label>

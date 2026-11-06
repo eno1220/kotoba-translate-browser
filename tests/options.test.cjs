@@ -64,3 +64,15 @@ test('connection test uses unsaved inputs without saving; API key visibility and
   }
   e.w.close();
 });
+
+test('batch controls save numeric tuning and independent switches, then restore saved values on discard', async t => {
+  const e = await options(); t.after(() => e.w.close());
+  assert.equal(e.field('maxBatchItems').value, '32');
+  const edits = { maxBatchItems: 12, batchStartItems: 2, batchStartTokens: 800, batchGrowthFactor: 3, batchTargetSeconds: 6,
+    readingOrder: false, progressiveBatching: false, batchRecovery: false, mergeSections: false, deduplicateRepetitions: false };
+  for (const [key, value] of Object.entries(edits)) e.edit(key, value);
+  await e.submit();
+  for (const [key, value] of Object.entries(edits)) assert.equal(e.settings()[key], value);
+  e.edit('maxBatchItems', 0); await e.submit(); assert.equal(e.writes(), 1);
+  e.$('discard').click(); await e.flush(); assert.equal(e.field('maxBatchItems').value, '12');
+});

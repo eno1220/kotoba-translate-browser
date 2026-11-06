@@ -27,7 +27,7 @@ function setup(html, translator = translateTree, preferences = {}) {
   w.browser = { runtime: {
     onMessage: { addListener: fn => listener = fn },
     sendMessage: async msg => {
-      if (msg.type === "contentPreferences") return { concurrency: 1, prioritizeContent: false, semanticBatching: false, adaptiveScheduling: false, ...preferences };
+      if (msg.type === "contentPreferences") return { concurrency: 1, prioritizeContent: false, semanticBatching: false, adaptiveScheduling: false, readingOrder: false, progressiveBatching: false, batchRecovery: false, maxBatchItems: 256, ...preferences };
       if (msg.type === "translate") {
         calls.push(msg);
         if (msg.parts) return { parts: msg.parts.map(text => `訳:${text}`) };
@@ -684,6 +684,139 @@ test('prose and link density prioritize a div-based article without excluding an
 
 function place(element, top) { element.getBoundingClientRect = () => ({ top, bottom: top + 30, left: 0, right: 100, width: 100, height: 30 }); }
 
+test('reading order keeps middle prose, tables and figures ahead of later prose despite distance and concurrency', async t => {
+  let release;
+  const html = '<nav><p>Menu.</p></nav><article><p id="first">First prose.</p><table><tr><td>Middle city.</td><td>Middle store.</td></tr></table><figure><figcaption>Middle caption.</figcaption></figure><p id="middle">Middle prose.</p><p id="last">Last prose.</p></article>';
+  const s = setup(html, tree => textOf(tree) === 'First prose.' ? new Promise(resolve => release = () => resolve(translateTree(tree))) : translateTree(tree),
+    { responsiveScan: false, readingOrder: true, progressiveBatching: true, batchStartItems: 2, maxBatchItems: 8, adaptiveScheduling: true, prioritizeContent: true, semanticBatching: true, batchTranslation: true, concurrency: 3 });
+  t.after(() => s.w.close());
+  s.w.document.querySelectorAll('p,td,figcaption').forEach(node => place(node, node.id === 'middle' ? 5000 : node.id === 'last' ? 3000 : 10));
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await new Promise(setImmediate);
+  assert.equal(s.calls.length, 1);
+  release(); await s.settle();
+  assert.deepEqual(s.calls.flatMap(call => Array.from(call.documents || [call.document], textOf)), ['First prose.', 'Middle city.', 'Middle store.', 'Middle caption.', 'Middle prose.', 'Last prose.', 'Menu.']);
+  await s.message({ type: 'restore' }); assert.equal(s.w.document.body.innerHTML, html.replace('<table>', '<table><tbody>').replace('</table>', '</tbody></table>'));
+});
+
+test('recovered errors shrink the next batch and successful smaller batches grow again', async t => {
+  const s = setup('<article>' + Array.from({ length: 40 }, (_, i) => `<p>Paragraph ${i}.</p>`).join('') + '</article>', translateTree,
+    { readingOrder: true, progressiveBatching: true, batchRecovery: true, maxBatchItems: 16, semanticBatching: true, batchTranslation: true });
+  t.after(() => s.w.close());
+  const send = s.w.browser.runtime.sendMessage;
+  s.w.browser.runtime.sendMessage = async msg => {
+    const response = await send(msg);
+    return msg.type === 'translate' && s.calls.length === 2 ? { ...response, batchFallback: true, batchLimit: 2 } : response;
+  };
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await s.settle();
+  assert.deepEqual(s.calls.slice(0, 5).map(call => call.documents.length), [4, 8, 2, 4, 8]);
+  assert.equal(s.calls.reduce((sum, call) => sum + (call.documents?.length || 1), 0), 40);
+});
+
+test('static scheduling still honors recovery limits and section merging switches', async t => {
+  const s = setup('<article><h2>Heading.</h2>' + '<p>Body paragraph.</p>'.repeat(20) + '<h2>Another heading.</h2><p>Another body.</p></article>', translateTree,
+    { adaptiveScheduling: false, readingOrder: false, progressiveBatching: false, batchRecovery: true, mergeSections: false, semanticBatching: true, batchTranslation: true });
+  t.after(() => s.w.close());
+  const send = s.w.browser.runtime.sendMessage;
+  s.w.browser.runtime.sendMessage = async msg => {
+    const result = await send(msg);
+    return msg.type === 'translate' && s.calls.length === 1 ? { ...result, batchFallback: true, batchLimit: 2 } : result;
+  };
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await s.settle();
+  assert.equal(s.calls[0].documents.length, 8);
+  assert.ok(s.calls.slice(1).every(call => (call.documents?.length || 1) <= 2));
+  assert.deepEqual(Array.from(s.calls.at(-1).documents, textOf), ['Another heading.', 'Another body.']);
+});
+
+test('slow batches reduce the following size to approach the configured wait time', async t => {
+  const s = setup('<article>' + '<p>A complete paragraph.</p>'.repeat(12) + '</article>', translateTree,
+    { readingOrder: true, progressiveBatching: true, batchTargetSeconds: 8, semanticBatching: true, batchTranslation: true });
+  t.after(() => s.w.close());
+  let now = Date.now(); s.w.Date.now = () => now;
+  const send = s.w.browser.runtime.sendMessage;
+  s.w.browser.runtime.sendMessage = async msg => { const result = await send(msg); if (msg.type === 'translate') now += 16000; return result; };
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await s.settle();
+  assert.deepEqual(s.calls.slice(0, 3).map(call => call.documents?.length || 1), [4, 2, 1]);
+});
+
+test('maximum paragraph count is a hard cap even for rows and disabled progressive sizing', async t => {
+  const s = setup('<article><table>' + '<tr><td>One.</td><td>Two.</td><td>Three.</td><td>Four.</td></tr>'.repeat(3) + '</table></article>', translateTree,
+    { readingOrder: true, progressiveBatching: false, maxBatchItems: 3, semanticBatching: true, batchTranslation: true });
+  t.after(() => s.w.close());
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await s.settle();
+  assert.ok(s.calls.every(call => (call.documents?.length || 1) <= 3));
+  assert.equal(s.calls.reduce((sum, call) => sum + (call.documents?.length || 1), 0), 12);
+});
+
+test('section merging and repetitive coalescing can be disabled independently', async t => {
+  const s = setup('<article><section><h2>Heading one.</h2><p>Body one.</p></section><section><h2>Heading two.</h2><p>Body two.</p></section><ul><li>Repeated.</li><li>Repeated.</li></ul></article>', translateTree,
+    { readingOrder: true, progressiveBatching: false, mergeSections: false, deduplicateRepetitions: false, semanticBatching: true, batchTranslation: true });
+  t.after(() => s.w.close());
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await s.settle();
+  assert.deepEqual(s.calls.map(call => Array.from(call.documents, textOf)), [['Heading one.', 'Body one.'], ['Heading two.', 'Body two.'], ['Repeated.', 'Repeated.']]);
+  assert.ok(s.calls.every(call => call.repetitive === false));
+});
+
+test('flex dashboard links keep Go to and their destination in a complete translation unit', async t => {
+  const html = '<article><p>Open the dashboard.</p><a href="/settings" style="display:flex"><span style="display:block">Go to </span><span style="display:block">Settings</span></a></article>';
+  const s = setup(html, translateTree, { readingOrder: true, semanticBatching: true, batchTranslation: true });
+  t.after(() => s.w.close());
+  const link = s.w.document.querySelector('a');
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await s.settle();
+  assert.deepEqual(s.calls.flatMap(call => Array.from(call.documents || [call.document], textOf)), ['Open the dashboard.', 'Go to Settings']);
+  assert.equal(s.w.document.querySelector('a'), link);
+  await s.message({ type: 'restore' }); assert.equal(s.w.document.body.innerHTML, html);
+});
+
+test('a visible reading window increases its batch size gradually up to the configured cap', async t => {
+  const html = '<article>' + Array.from({ length: 80 }, (_, i) => `<p>Paragraph ${i}. ${'A complete sentence. '.repeat(3)}</p>`).join('') + '</article>';
+  const s = setup(html, translateTree, { adaptiveScheduling: true, readingOrder: true, progressiveBatching: true, maxBatchItems: 32, prioritizeContent: true, semanticBatching: true, batchTranslation: true, inputTokens: 6000 });
+  t.after(() => s.w.close());
+  const paragraphs = [...s.w.document.querySelectorAll('p')];
+  paragraphs.forEach(node => place(node, 10));
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await s.settle();
+  assert.deepEqual(s.calls.map(call => call.documents.length), [4, 8, 16, 32, 20]);
+  assert.equal(s.calls.reduce((n, call) => n + call.documents.length, 0), 80);
+  await s.message({ type: 'restore' }); assert.equal(s.w.document.body.innerHTML, html);
+  s.w.close();
+});
+
+test('scrolling gives the new visible content a small first batch without cancelling the current batch', async t => {
+  let release;
+  const s = setup('<article>' + Array.from({ length: 36 }, (_, i) => `<p>Paragraph ${i}.</p>`).join('') + '</article>', tree => textOf(tree) === 'Paragraph 0.'
+    ? new Promise(resolve => release = () => resolve(translateTree(tree))) : translateTree(tree),
+    { responsiveScan: false, adaptiveScheduling: true, readingOrder: true, progressiveBatching: true, batchStartItems: 8, prioritizeVisible: true, prioritizeContent: true, semanticBatching: true, batchTranslation: true });
+  t.after(() => s.w.close());
+  const paragraphs = [...s.w.document.querySelectorAll('p')];
+  paragraphs.forEach((node, i) => place(node, i < 16 ? 10 : 20000));
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await new Promise(setImmediate);
+  assert.equal(s.calls[0].documents.length, 8);
+  paragraphs.forEach((node, i) => place(node, i < 16 ? -20000 : 10));
+  s.w.scrollY = 20000; s.w.document.dispatchEvent(new s.w.Event('scroll'));
+  assert.equal(s.calls.length, 1);
+  release(); await s.settle();
+  assert.equal(s.calls[1].documents.length, 8);
+  assert.equal(textOf(s.calls[1].documents[0]), 'Paragraph 16.');
+  assert.equal(s.calls[2].documents.length, 12);
+  s.w.close();
+});
+
+test('repetitive tables pack whole rows beyond 64 cells and retain each live link and original', async t => {
+  const html = '<article><p>Intro.</p><table>' + Array.from({ length: 90 }, (_, i) => `<tr><td>City.</td><td><a href="/store/${i}">Store.</a></td><td>Address.</td></tr>`).join('') + '</table></article>';
+  const s = setup(html, translateTree, { adaptiveScheduling: true, prioritizeContent: true, semanticBatching: true, batchTranslation: true, inputTokens: 128 });
+  t.after(() => s.w.close());
+  const originalHTML = s.w.document.body.innerHTML;
+  const links = [...s.w.document.querySelectorAll('a')];
+  let clicks = 0; links[0].addEventListener('click', event => { event.preventDefault(); clicks++; });
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); const state = await s.settle();
+  const batches = s.calls.filter(call => call.documents);
+  assert.deepEqual(batches.map(call => call.documents.length), [255, 15]);
+  assert.ok(batches.every(call => call.repetitive === true));
+  assert.equal(state.done, 271); assert.equal(state.failed, 0);
+  assert.deepEqual([...s.w.document.querySelectorAll('a')], links); links[0].click(); assert.equal(clicks, 1);
+  await s.message({ type: 'restore' }); assert.equal(s.w.document.body.innerHTML, originalHTML);
+  s.w.close();
+});
+
 test('adaptive scheduler prioritizes the nearby reading window and follows scroll without cancelling the active request', async () => {
   let release;
   const s = setup('<nav><p>Menu.</p></nav><article><p id="a">Reading now.</p><p id="b">Far article.</p><p id="c">Scroll destination.</p></article>', tree => textOf(tree) === 'Reading now.'
@@ -705,21 +838,32 @@ test('adaptive scheduler prioritizes the nearby reading window and follows scrol
   s.w.close();
 });
 
-test('nearby menu is processed before distant article text, with the remaining page still translated', async () => {
+test('nearby menus wait for distant article text when content priority is enabled', async () => {
   const s = setup('<nav><p>Visible menu.</p></nav><article><p>Distant article.</p></article>', translateTree,
     { adaptiveScheduling: true, prioritizeVisible: true, prioritizeContent: true });
   place(s.w.document.querySelector('nav p'), 0); place(s.w.document.querySelector('article p'), 20000);
   await s.message({ type: 'start', source: 'en', target: 'ja' }); await s.settle();
-  assert.deepEqual(s.calls.map(call => textOf(call.document)), ['Visible menu.', 'Distant article.']);
+  assert.deepEqual(s.calls.map(call => textOf(call.document)), ['Distant article.', 'Visible menu.']);
   s.w.close();
 });
 
-test('adaptive batches respect heading sections and keep heading with its first paragraph', async () => {
-  const s = setup('<article><h2>First heading.</h2><p>First paragraph.</p><h2>Second heading.</h2><p>Second paragraph.</p></article>', translateTree,
+test('visible article tables follow nearby prose before distant prose and visible menus', async t => {
+  const s = setup('<nav><p>Visible menu.</p></nav><article><p id="near">Reading now.</p><table><tr><td>Visible city.</td><td>Visible store.</td></tr></table><p id="far">Distant prose.</p></article>', translateTree,
+    { adaptiveScheduling: true, prioritizeVisible: true, prioritizeContent: true, semanticBatching: true, batchTranslation: true });
+  t.after(() => s.w.close());
+  s.w.document.querySelectorAll('p,td').forEach(node => place(node, node.id === 'far' ? 20000 : 10));
+  await s.message({ type: 'start', source: 'en', target: 'ja' }); await s.settle();
+  assert.deepEqual(s.calls.flatMap(call => Array.from(call.documents || [call.document], textOf)), ['Reading now.', 'Visible city.', 'Visible store.', 'Distant prose.', 'Visible menu.']);
+});
+
+test('adaptive batches combine peer sections within an article and keep separate articles apart', async () => {
+  const html = '<article><section><h2>First heading.</h2><p>First paragraph.</p></section><section><h2>Second heading.</h2><p>Second paragraph.</p></section></article><article><p>Another article.</p></article>';
+  const s = setup(html, translateTree,
     { adaptiveScheduling: true, prioritizeVisible: true, prioritizeContent: true, semanticBatching: true, batchTranslation: true });
   place(s.w.document.querySelector('h2'), -10);
   await s.message({ type: 'start', source: 'en', target: 'ja' }); await s.settle();
-  assert.deepEqual(s.calls.map(call => Array.from(call.documents, textOf)), [['First heading.', 'First paragraph.'], ['Second heading.', 'Second paragraph.']]);
+  assert.deepEqual(s.calls.map(call => Array.from(call.documents || [call.document], textOf)), [['First heading.', 'First paragraph.', 'Second heading.', 'Second paragraph.'], ['Another article.']]);
+  await s.message({ type: 'restore' }); assert.equal(s.w.document.body.innerHTML, html);
   s.w.close();
 });
 

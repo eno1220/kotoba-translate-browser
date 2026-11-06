@@ -12,6 +12,21 @@ test("feature switches are booleans and content preferences never expose connect
   const prefs = K.contentPreferences(K.settings({ apiKey: "secret", endpoint: "http://private.example" }));
   assert.equal(prefs.apiKey, undefined); assert.equal(prefs.endpoint, undefined);
   assert.equal(prefs.mainContentOnly, false); assert.equal(prefs.responsiveScan, true);
+  assert.equal(prefs.readingOrder, true); assert.equal(prefs.maxBatchItems, 32);
+});
+
+test('batch tuning validates limits and context describes the situation without instructions', () => {
+  for (const [key, min, max] of [['maxBatchItems', 1, 256], ['batchStartItems', 1, 256], ['batchStartTokens', 128, 24000], ['batchGrowthFactor', 2, 4], ['batchTargetSeconds', 1, 60]]) {
+    assert.equal(K.settings({ [key]: String(min) })[key], min);
+    for (const value of [min - 1, max + 1, min + 0.5]) assert.throws(() => K.settings({ [key]: value }));
+  }
+  for (const apiFormat of ['top-level', 'template']) {
+    const body = K.body(K.settings({ apiFormat }), '<p id="b0">Read.</p>', { source: 'en', target: 'ja', domain: 'https://example.com', html: true, batch: true, retry: true });
+    const context = apiFormat === 'template' ? body.chat_template_kwargs.context : body.context;
+    assert.match(context, /web page on https:\/\/example.com/); assert.match(context, /HTML fragment/);
+    assert.doesNotMatch(context, /preserve|never|return only|previous response|check every|without Markdown/i);
+    assert.deepEqual(body.messages, [{ role: 'user', content: '<p id="b0">Read.</p>' }]);
+  }
 });
 
 test("request formats, Bearer-independent body and endpoint composition", () => {

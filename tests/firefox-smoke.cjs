@@ -209,6 +209,12 @@ const parserWindow = new (require("jsdom").JSDOM)("").window;
         check((await browser.storage.local.get('settings')).settings.batchTranslation === false, 'popup did not save batch setting');
         await browser.tabs.remove(preview.id);
         await browser.tabs.update(tab.id,{active:true});
+        // Saving the popup switch clears the cache. The first run may already
+        // be finished, so populate history under stable settings explicitly.
+        for (let i=0; i<300; i++) { if (!(await send({type:'status'})).running) break; await wait(20); }
+        await send({type:'restore'});
+        clearCache();
+        await send({type:'start',source:'en',target:'ja'});
         let state;
         for (let i=0; i<300; i++) { state = await send({type:'status'}); if (!state.running) break; await wait(100); }
         check(state.done === state.total && state.failed === 0 && state.translated > 0, JSON.stringify(state));
@@ -314,6 +320,19 @@ const parserWindow = new (require("jsdom").JSDOM)("").window;
         check((await inspect('document.querySelector("#link").getAttribute("href")')) === '/docs', 'cached link lost');
         await send({type:'restore'});
         check((await inspect('document.querySelector("#paragraph").textContent')) === 'Read the documentation carefully.', 'cached original restore failed');
+        await browser.storage.local.set({ settings: { ...saved, cacheMinutes:0, batchTranslation:true, semanticBatching:true, adaptiveScheduling:true, progressiveBatching:false, maxBatchItems:256, inputTokens:6000 } });
+        await inspect('document.body.innerHTML = "<article><p>Table introduction.</p><table>" + Array.from({length:90}, (_,i) => "<tr><td>City.</td><td><a href=/store/"+i+">Store.</a></td><td>Address.</td></tr>").join("") + "</table></article>"; window.tableOriginal = document.body.innerHTML; window.tableLinks = [...document.querySelectorAll("a")]; window.tableClicks = 0; tableLinks[0].addEventListener("click", event => { event.preventDefault(); window.tableClicks++; });');
+        const beforeTable = await (await fetch(base+'/request-count')).json();
+        await send({type:'start',source:'en',target:'ja'});
+        let tableState;
+        for(let i=0;i<100;i++) { tableState=await send({type:'status'}); if(!tableState.running) break; await wait(30); }
+        check(!tableState.running && tableState.done === 271 && !tableState.failed, 'large table failed: '+JSON.stringify(tableState));
+        check((await (await fetch(base+'/request-count')).json()) - beforeTable <= 4, 'large table was fragmented');
+        check(await inspect('[...document.querySelectorAll("td")].every(node => node.textContent.startsWith("訳:")) && [...document.querySelectorAll("a")].every((node,i) => node === tableLinks[i])'), 'large table lost translations or links');
+        await inspect('tableLinks[0].click()');
+        check(await inspect('window.tableClicks === 1'), 'large table lost link listener');
+        await send({type:'restore'});
+        check(await inspect('document.body.innerHTML === window.tableOriginal'), 'large table original restore failed');
         await fetch(base + '/result', { method:'POST', body: JSON.stringify({ok:true,state,data}) });
       } catch(error) { await fetch(base + '/result', { method:'POST', body: JSON.stringify({ok:false,error:[error.message,error.stack].join(String.fromCharCode(10))}) }); }
     })();

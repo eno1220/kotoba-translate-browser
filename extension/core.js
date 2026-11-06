@@ -1,21 +1,23 @@
 /* Shared pure logic; also loaded directly by the small Node test suite. */
 globalThis.Kotoba = (() => {
   const MAX_TOKENS = 8096;
-  const CONTENT_PROTOCOL = 5;
+  const CONTENT_PROTOCOL = 6;
   const DICTIONARY_LIMITS = Object.freeze({ entries: 500, perScope: 100, domains: 20, term: 100, bytes: 6000 });
   const DEFAULTS = Object.freeze({
     endpoint: "http://127.0.0.1", port: "8000", path: "/v1/chat/completions",
     apiKey: "", model: "plamo-translate", apiFormat: "top-level",
     batchTranslation: true, concurrency: 1, inputTokens: 6000, contextTokens: 32768, timeoutSeconds: 180,
+    maxBatchItems: 32, batchStartItems: 4, batchStartTokens: 1200, batchGrowthFactor: 2, batchTargetSeconds: 8,
+    readingOrder: true, progressiveBatching: true, batchRecovery: true, mergeSections: true, deduplicateRepetitions: true,
     tokenizer: "bytes", tokenizePath: "/tokenize", source: "en", target: "ja", form: "", cacheMinutes: 30,
     responsiveScan: true, prioritizeVisible: true, prioritizeContent: true, semanticBatching: true, adaptiveScheduling: true, shareInFlight: true, relevantGlossary: true, streamTranslation: false, mainContentOnly: false,
     selectionButton: false, keyboardShortcuts: true, copyButton: true,
     focusOriginal: true, pageProgress: true, announceProgress: true, hoverEnabled: true, retryTransient: false
   });
-  const FEATURES = ["batchTranslation", "responsiveScan", "prioritizeVisible", "prioritizeContent", "semanticBatching", "adaptiveScheduling", "shareInFlight", "relevantGlossary", "streamTranslation", "mainContentOnly", "selectionButton", "keyboardShortcuts", "copyButton", "focusOriginal", "pageProgress", "announceProgress", "hoverEnabled", "retryTransient"];
+  const FEATURES = ["batchTranslation", "readingOrder", "progressiveBatching", "batchRecovery", "mergeSections", "deduplicateRepetitions", "responsiveScan", "prioritizeVisible", "prioritizeContent", "semanticBatching", "adaptiveScheduling", "shareInFlight", "relevantGlossary", "streamTranslation", "mainContentOnly", "selectionButton", "keyboardShortcuts", "copyButton", "focusOriginal", "pageProgress", "announceProgress", "hoverEnabled", "retryTransient"];
   // Only this allowlist may be sent to content scripts; never spread connection settings.
   function contentPreferences(s) {
-    return Object.fromEntries(["concurrency", "inputTokens", "tokenizer", ...FEATURES.filter(key => !["retryTransient", "streamTranslation", "shareInFlight", "relevantGlossary"].includes(key))].map(key => [key, s[key]]));
+    return Object.fromEntries(["concurrency", "inputTokens", "tokenizer", "maxBatchItems", "batchStartItems", "batchStartTokens", "batchGrowthFactor", "batchTargetSeconds", ...FEATURES.filter(key => !["retryTransient", "streamTranslation", "shareInFlight", "relevantGlossary"].includes(key))].map(key => [key, s[key]]));
   }
   const LANGUAGES = "ja en zh-hans zh-hant ko ar az be bg bn ca ceb de es et eu fa fr gu he hi hr hu hy id it jv ka kk km lt lv ml mr ms my ne nl pa pl ru si sk sl sr sw ta te th tl ur uz vi".split(" ");
   function settings(raw = {}) {
@@ -26,7 +28,7 @@ globalThis.Kotoba = (() => {
     for (const name of ["path", "tokenizePath"]) {
       if (!s[name].startsWith("/") || s[name].startsWith("//") || /[?#]/.test(s[name])) throw new Error("APIパスは / から始まるパスを指定してください。");
     }
-    for (const [key, min, max] of [["concurrency", 1, 8], ["inputTokens", 128, 24000], ["contextTokens", 8192, 32768], ["timeoutSeconds", 10, 1800], ["cacheMinutes", 0, 1440]]) {
+    for (const [key, min, max] of [["concurrency", 1, 8], ["inputTokens", 128, 24000], ["contextTokens", 8192, 32768], ["timeoutSeconds", 10, 1800], ["cacheMinutes", 0, 1440], ["maxBatchItems", 1, 256], ["batchStartItems", 1, 256], ["batchStartTokens", 128, 24000], ["batchGrowthFactor", 2, 4], ["batchTargetSeconds", 1, 60]]) {
       s[key] = Number(s[key]);
       if (!Number.isInteger(s[key]) || s[key] < min || s[key] > max) throw new Error(`${key} は ${min}〜${max} の整数で指定してください。`);
     }
@@ -87,12 +89,11 @@ globalThis.Kotoba = (() => {
     u.pathname = u.pathname.replace(/\/$/, "") + path;
     return u.href;
   }
-  function body(s, text, { source, target, domain, html = false, retry = false, batch = false, glossaryText = text, budget = false }) {
+  function body(s, text, { source, target, domain, html = false, batch = false, glossaryText = text, budget = false }) {
     languages(source, target);
-    let context = `This text is from a web page on ${domain}. Preserve complete sentences and natural website prose.`;
-    if (html) context += " The input is an HTML fragment. Preserve every tag and id exactly once, link labels with their links, and code/translate=\"no\" content unchanged, including empty protected elements. Reorder sibling inline elements for natural grammar while preserving nesting and matching closing tags. Escape literal &, < and > in text as &amp;, &lt; and &gt;; never turn translated names in angle brackets into tags. Return only translated HTML, without Markdown or explanations.";
-    if (batch) context += " It contains multiple independent paragraphs in p wrappers from one page component, in source order. Use neighboring paragraphs as context. Keep each wrapper and its id exactly once; never move content between paragraphs or outside wrappers.";
-    if (retry) context += " The previous response broke the HTML structure. Check every tag and id, including links.";
+    let context = `This text is from a web page on ${domain}.`;
+    if (html) context += " The input is an HTML fragment containing website text, links and formatting.";
+    if (batch) context += " It contains multiple independent paragraphs from the same page component, in reading order.";
     const options = { context, form: s.form, target_lang: target };
     const terms = glossary(s.dictionary, new URL(domain).hostname.toLowerCase().replace(/\.$/, ""), source, target)
       .filter(term => budget || !s.relevantGlossary || glossaryText.includes(term.source));
