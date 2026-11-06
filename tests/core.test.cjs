@@ -84,6 +84,18 @@ test("HTML entities decode as text while unknown entities and markup stay invali
   assert.deepEqual(K.parseDocument(K.serializeDocument(result), source), result);
 });
 
+test("bare ampersands in translated prose preserve text without weakening structure checks", () => {
+  const source = [{ text: "\n\t" }, { tag: "span", id: "k0", children: [{ text: "スタッフ・キャスト" }] }, { text: "\n" }];
+  const result = K.parseDocument('<span id="k0">Staff & Cast &amp; R&D &#38; &#x26;</span>', source);
+  assert.equal(K.documentText(result), "\n\tStaff & Cast & R&D & &\n");
+  assert.deepEqual(K.parseDocument(K.serializeDocument(result), source), result);
+  for (const invalid of [
+    '<span id="k0"><Tsukuyomi> & Cast</span>',
+    '<span id="k0">Staff & Cast',
+    '<span id="k0" onclick="bad & worse">Staff & Cast</span>'
+  ]) assert.throws(() => K.parseDocument(invalid, source));
+});
+
 test("fitting HTML skips per-node tokenization and split handles UTF-8 byte edges", async () => {
   const tree = Array.from({ length: 100 }, (_, i) => ({ tag: "span", id: `k${i}`, children: [{ text: "word" }] }));
   let calls = 0;

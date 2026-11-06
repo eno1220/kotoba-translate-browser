@@ -64,6 +64,10 @@
       <p><small>原文と訳文は拡張のメモリに最大約8MiB保持します。Firefox終了・拡張の再読み込みで消えます。プライベートウィンドウでは保存しません。設定の保存時にもキャッシュを削除します。</small></p>
       <button type="button" id="clear-cache">キャッシュを削除</button>
     </fieldset>
+    <fieldset><legend>エラー記録</legend>
+      <p><a href="errors.html">エラー記録を確認・JSON出力する</a></p>
+      <p><small>エラーの原文・応答・関連情報をローカルに保存します。キャッシュの保存期間・削除・設定保存とは独立し、Firefox再起動後も残ります。最大100件・4MiBで、超過時は古い記録から削除します。プライベートウィンドウと停止操作は記録しません。</small></p>
+    </fieldset>
     <details class="advanced"><summary>詳細設定</summary>
       <div class="row"><label>同時リクエスト<input name="concurrency" type="number" min="1" max="8" required><small>全タブ共通</small></label><label>タイムアウト（秒）<input name="timeoutSeconds" type="number" min="10" max="1800" required></label></div>
       <label>サーバーのコンテキスト長<input name="contextTokens" type="number" min="8192" max="32768" required><small>入力＋出力の合計。サーバーの設定と合わせてください。拡張からサーバー設定は変更しません。</small></label>

@@ -7,7 +7,53 @@ const METRIC_TOTALS = ["requests", "sharedRequests", "responseMilliseconds", "ou
 function measurements() { return { ...Object.fromEntries(METRIC_TOTALS.map(key => [key, 0])), tokensKnown: true }; }
 function documentURL(value) { const url = new URL(value); url.hash = ""; return url.href; }
 
-// Session-only, bounded paragraph cache. Never store credentials or page text on disk.
+// Persistent diagnostics are independent of the translation cache and settings.
+const ERROR_BYTES = 4 * 1024 * 1024, ERROR_ENTRIES = 100;
+let errorWrites = Promise.resolve();
+function errorOperation(action) {
+  const operation = errorWrites.then(action);
+  errorWrites = operation.catch(() => {});
+  return operation;
+}
+function errorHistory() {
+  return errorOperation(async () => {
+    const { translationErrors = [] } = await browser.storage.local.get("translationErrors");
+    return { entries: translationErrors, maxEntries: ERROR_ENTRIES, maxBytes: ERROR_BYTES };
+  });
+}
+function diagnosticRecorder(s, page, signal) {
+  const recorded = new WeakSet();
+  const secrets = [s.apiKey, s.apiKey.replace(/^Bearer\s+/i, "").trim()].filter(Boolean);
+  function clean(value) {
+    if (typeof value === "string") {
+      for (const secret of secrets) value = value.split(secret).join("[REDACTED]");
+      return value.length > 32000 ? value.slice(0, 32000) + "\n[省略: 32000文字を超過]" : value;
+    }
+    if (Array.isArray(value)) return value.map(clean);
+    if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, clean(item)]));
+    return value;
+  }
+  return async (error, stage, original, response, details = {}) => {
+    if (page.private || signal.aborted || recorded.has(error)) return;
+    recorded.add(error);
+    const entry = clean({ timestamp: Date.now(), version: browser.runtime.getManifest().version,
+      stage, origin: page.domain, source: page.source, target: page.target,
+      error: { name: error.name, message: error.message, code: error.code, stack: error.stack },
+      original, response: response === undefined || typeof response === "string" ? response : JSON.stringify(response), ...details,
+      endpoint: K.endpoint(s), maxTokens: K.MAX_TOKENS,
+      settings: Object.fromEntries(["model", "apiFormat", "inputTokens", "contextTokens", "timeoutSeconds", "tokenizer", "batchTranslation", "streamTranslation", "retryTransient", "form"].map(key => [key, s[key]])) });
+    try {
+      await errorOperation(async () => {
+        const { translationErrors = [] } = await browser.storage.local.get("translationErrors");
+        const entries = [entry, ...translationErrors].slice(0, ERROR_ENTRIES);
+        while (new TextEncoder().encode(JSON.stringify(entries)).length > ERROR_BYTES) entries.pop();
+        await browser.storage.local.set({ translationErrors: entries });
+      });
+    } catch (failure) { console.error("Kotoba: エラー記録を保存できませんでした。", failure); }
+  };
+}
+
+// Session-only, bounded paragraph cache; persistent error records are separate.
 const translationCache = new Map();
 const histories = new Map();
 const CACHE_BYTES = 8 * 1024 * 1024, CACHE_ENTRIES = 2000;
@@ -118,10 +164,11 @@ function abortTab(tabId, frameId) {
     if (job.tabId === tabId && (frameId === undefined || job.frameId === frameId)) job.controller.abort();
   }
 }
-async function post(s, url, data, signal, notify = () => {}, phase = "translating", onResponse = () => {}, onDelta) {
+async function post(s, url, data, signal, notify = () => {}, phase = "translating", onResponse = () => {}, onDelta, onFailure = async () => {}) {
   for (let attempt = 0; ; attempt++) {
     try { return await postOnce(s, url, data, signal, notify, phase, onResponse, onDelta); }
     catch (error) {
+      await onFailure(error, attempt + 1);
       if (!s.retryTransient || attempt >= 2 || !error.retryable || signal.aborted) throw error;
       notify("retrying");
       // Release the shared queue while waiting, and let Stop interrupt the delay.
@@ -147,6 +194,11 @@ async function postOnce(s, url, data, signal, notify, phase, onResponse, onDelta
       });
       if (!response.ok) {
         const error = new Error(`翻訳サーバ: HTTP ${response.status}。接続設定・モデル名・API形式を確認してください。`);
+        error.httpStatus = response.status;
+        if (response.text) {
+          try { error.response = await response.text(); }
+          catch { error.response = "[応答本文を読み取れませんでした]"; }
+        }
         error.retryable = [429, 502, 503, 504].includes(response.status);
         const header = response.headers?.get("Retry-After");
         if (header) {
@@ -155,8 +207,14 @@ async function postOnce(s, url, data, signal, notify, phase, onResponse, onDelta
         }
         throw error;
       }
-      const result = data.stream && response.headers.get("Content-Type")?.includes("text/event-stream")
-        ? await readCompletionStream(response, signal, onDelta, startedAt) : await response.json();
+      let result;
+      if (data.stream && response.headers.get("Content-Type")?.includes("text/event-stream")) {
+        result = await readCompletionStream(response, signal, onDelta, startedAt);
+      } else if (response.text) {
+        const raw = await response.text();
+        try { result = JSON.parse(raw); }
+        catch (error) { error.response = raw; throw error; }
+      } else result = await response.json();
       onResponse(Date.now() - startedAt);
       return result;
     } catch (error) {
@@ -176,7 +234,7 @@ async function readCompletionStream(response, signal, onDelta = () => {}, starte
     const raw = data.join("\n"); data = [];
     if (raw === "[DONE]") { done = true; return; }
     let value;
-    try { value = JSON.parse(raw); } catch { throw new Error("ストリーミング応答のJSONを解釈できません。"); }
+    try { value = JSON.parse(raw); } catch { throw Object.assign(new Error("ストリーミング応答のJSONを解釈できません。"), { response: { invalidEvent: raw } }); }
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("ストリーミング応答の形式が不正です。");
     if (value.error) throw new Error("翻訳サーバがストリーミングエラーを返しました。");
     if (value.usage) usage = value.usage;
@@ -219,6 +277,9 @@ async function readCompletionStream(response, signal, onDelta = () => {}, starte
     return { choices: [{ message: { content: output }, finish_reason: finishReason }], usage, timings,
       streamMetrics: { firstTokenMilliseconds: firstContentAt === undefined ? null : firstContentAt - startedAt,
         generationMilliseconds: contentEvents > 1 ? lastContentAt - firstContentAt : 0 } };
+  } catch (error) {
+    error.response = { partialOutput: output, pendingEvent: [...data, buffer].join("\n"), ...error.response };
+    throw error;
   } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
 }
 function counter(s, signal, notify) {
@@ -242,7 +303,7 @@ function counter(s, signal, notify) {
     return count;
   };
 }
-function completionRequest(s, payload, signal, notify = () => {}, onDelta = () => {}, privateContext = false) {
+function completionRequest(s, payload, signal, notify = () => {}, onDelta = () => {}, privateContext = false, onFailure = async () => {}) {
   if (signal.aborted) return Promise.reject(new Error("キャンセルしました。"));
   const url = K.endpoint(s);
   const key = s.shareInFlight ? JSON.stringify([cacheRevision, url, s.apiKey.replace(/^Bearer\s+/i, "").trim(), s.timeoutSeconds, s.retryTransient, privateContext, payload]) : null;
@@ -254,7 +315,7 @@ function completionRequest(s, payload, signal, notify = () => {}, onDelta = () =
   }
   const remove = () => { if (key && inFlightCompletions.get(key) === flight) inFlightCompletions.delete(key); };
   return new Promise((resolve, reject) => {
-    const listener = { notify, onDelta };
+    const listener = { notify, onDelta, onFailure };
     const detach = () => { flight.listeners.delete(listener); signal.removeEventListener("abort", abort); };
     const abort = () => {
       detach();
@@ -272,13 +333,23 @@ function completionRequest(s, payload, signal, notify = () => {}, onDelta = () =
       }, "translating", milliseconds => { flight.milliseconds = milliseconds; }, output => {
         flight.output = output;
         for (const item of flight.listeners) item.onDelta(output);
-      });
+      }, (error, attempt) => Promise.all([...flight.listeners].map(item => item.onFailure(error, attempt))));
       flight.promise.then(remove, remove);
     }
     flight.promise.then(result => { detach(); if (!signal.aborted) resolve({ result, milliseconds: flight.milliseconds, shared }); }, error => { detach(); reject(error); });
   });
 }
 async function generate(s, text, page, signal) {
+  try {
+    const result = await generateOnce(s, text, page, signal);
+    if (result.truncated) await page.record?.(new Error("生成上限に達しました。"), "generation-limit", text, result.text);
+    return result;
+  } catch (error) {
+    await page.record?.(error, "generation", text, error.response, { httpStatus: error.httpStatus });
+    throw error;
+  }
+}
+async function generateOnce(s, text, page, signal) {
   let lastUpdate = 0;
   const response = await completionRequest(s, K.body(s, text, page), signal, page.notify, output => {
     const now = Date.now();
@@ -287,8 +358,8 @@ async function generate(s, text, page, signal) {
       if (page.preview) page.preview(output);
       else page.notify?.("receiving", undefined, { receivedCharacters: output.length });
     }
-  }, page.private);
-  const result = response.result;
+  }, page.private, (error, attempt) => page.record?.(error, "request", text, error.response, { attempt, httpStatus: error.httpStatus }));
+  const result = response.result ?? {};
   if (page.metrics) {
     page.metrics.requests++;
     page.metrics.sharedRequests += response.shared ? 1 : 0;
@@ -309,10 +380,10 @@ async function generate(s, text, page, signal) {
     }
   }
   const choice = result.choices?.[0];
-  if (choice?.finish_reason === "length") { if (page.metrics) page.metrics.truncations++; return { truncated: true }; }
-  if (choice?.finish_reason && !["stop", "eos"].includes(choice.finish_reason)) throw new Error(`翻訳が完了しませんでした (${choice.finish_reason})。`);
+  if (choice?.finish_reason === "length") { if (page.metrics) page.metrics.truncations++; return { truncated: true, text: choice.message?.content }; }
+  if (choice?.finish_reason && !["stop", "eos"].includes(choice.finish_reason)) throw Object.assign(new Error(`翻訳が完了しませんでした (${choice.finish_reason})。`), { response: result });
   const output = choice?.message?.content;
-  if (typeof output !== "string" || !output.trim()) throw new Error("翻訳サーバが空または不正な応答を返しました。");
+  if (typeof output !== "string" || !output.trim()) throw Object.assign(new Error("翻訳サーバが空または不正な応答を返しました。"), { response: result });
   return { text: output.trim() };
 }
 async function translatePlain(s, text, page, signal, count, limit = s.inputTokens, depth = 0, advance = () => {}) {
@@ -355,7 +426,10 @@ async function translateDocument(s, document, page, signal, advance, limit = s.i
         break;
       }
       try { accepted = K.parseDocument(output.text, chunk); }
-      catch { continue; }
+      catch (error) {
+        await page.record?.(error, "paragraph-structure", K.serializeDocument(chunk), output.text, { attempt: attempt + 1 });
+        continue;
+      }
       advance(K.documentLength(chunk));
       break;
     }
@@ -369,7 +443,8 @@ async function translateDocument(s, document, page, signal, advance, limit = s.i
   const merged = K.mergeDocuments(translated);
   // Repeated wrappers from long-text chunks must form one coherent DOM tree.
   try { return K.parseDocument(K.serializeDocument(merged), document); }
-  catch {
+  catch (failure) {
+    await page.record?.(failure, "merged-structure", K.serializeDocument(document), K.serializeDocument(merged));
     const error = new Error("翻訳結果のリンク構造が一致しないため、原文を保持しました。");
     error.code = "structure"; throw error;
   }
@@ -412,7 +487,8 @@ async function translateDocuments(s, documents, page, signal, advance, deliver =
       const output = await generate(s, serializeBatch(batch), { ...page, html: true, batch: true, glossaryText: batch.map(glossarySource).join("\n") }, signal);
       if (!output.truncated) {
         let accepted;
-        try { accepted = parseBatch(output.text, batch); } catch { /* Retry whole paragraphs below. */ }
+        try { accepted = parseBatch(output.text, batch); }
+        catch (error) { await page.record?.(error, "batch-structure", serializeBatch(batch), output.text); }
         if (accepted) {
           accepted.forEach(accept);
           advance(batch.reduce((sum, document) => sum + K.documentLength(document), 0));
@@ -476,12 +552,14 @@ async function translate(message, sender) {
     }
   };
   const advance = amount => { completed += amount; notify(); };
+  let record;
   try {
     const revision = cacheRevision;
     const saved = await getSettings();
     const s = { ...saved, inputTokens: K.inputBudget(saved, { source: message.source, target: message.target, domain: pageURL.origin }) };
     const page = { source: message.source, target: message.target, domain: pageURL.origin, private: sender.tab.incognito === true, notify,
       metrics: measurements() };
+    record = page.record = diagnosticRecorder(s, page, job.controller.signal);
     if (!inputs) page.preview = preview => notify("receiving", undefined, { preview, receivedCharacters: preview.length });
     if (inputs) {
       const useCache = s.cacheMinutes > 0 && !sender.tab.incognito;
@@ -518,6 +596,9 @@ async function translate(message, sender) {
       return documents ? { documents: results, batchFallback: page.metrics.batchFallbacks > 0 } : results[0];
     }
     return { parts: [await translatePlain(s, message.parts[0], page, job.controller.signal, counter(s, job.controller.signal, notify), s.inputTokens, 0, advance)] };
+  } catch (error) {
+    await record?.(error, "translation", inputs ? inputs.map(K.serializeDocument).join("\n") : message.parts[0], error.response, { httpStatus: error.httpStatus });
+    throw error;
   } finally { jobs.delete(id); }
 }
 function staleContent() {
@@ -554,6 +635,10 @@ async function handle(message, sender) {
   }
   // Firefox also sets sender.tab for our own settings/history tabs.
   if (sender.tab && !sender.url?.startsWith(browser.runtime.getURL(""))) throw new Error("許可されていない操作です。");
+  if (message.type === "errorHistory") return errorHistory();
+  if (message.type === "clearErrors") {
+    await errorOperation(() => browser.storage.local.set({ translationErrors: [] })); return {};
+  }
   if (message.type === "cacheHistory") return cacheHistory();
   if (message.type === "testConnection") {
     const s = K.settings(message.settings);

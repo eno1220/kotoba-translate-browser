@@ -90,7 +90,7 @@ globalThis.Kotoba = (() => {
   function body(s, text, { source, target, domain, html = false, retry = false, batch = false, glossaryText = text, budget = false }) {
     languages(source, target);
     let context = `This text is from a web page on ${domain}. Preserve complete sentences and natural website prose.`;
-    if (html) context += " The input is an HTML fragment. Preserve every tag and id exactly once, link labels with their links, and code/translate=\"no\" content unchanged. Reorder sibling inline elements for natural grammar. Return only translated HTML, without Markdown or explanations.";
+    if (html) context += " The input is an HTML fragment. Preserve every tag and id exactly once, link labels with their links, and code/translate=\"no\" content unchanged, including empty protected elements. Reorder sibling inline elements for natural grammar while preserving nesting and matching closing tags. Escape literal &, < and > in text as &amp;, &lt; and &gt;; never turn translated names in angle brackets into tags. Return only translated HTML, without Markdown or explanations.";
     if (batch) context += " It contains multiple independent paragraphs in p wrappers from one page component, in source order. Use neighboring paragraphs as context. Keep each wrapper and its id exactly once; never move content between paragraphs or outside wrappers.";
     if (retry) context += " The previous response broke the HTML structure. Check every tag and id, including links.";
     const options = { context, form: s.form, target_lang: target };
@@ -128,18 +128,20 @@ globalThis.Kotoba = (() => {
       return `<${node.tag} id="${node.id}"${node.protected ? ' translate="no"' : ""}>${serializeDocument(node.children)}</${node.tag}>`;
     }).join("");
   }
-  // Decode only named HTML entities. Keep strict XML validation for tags and IDs;
+  // Escape bare ampersands in prose, and decode named HTML entities.
+  // Keep strict XML validation for tags and IDs;
   // the HTML parser never receives model-provided markup or creates live DOM.
   function normalizeEntities(text) {
     const entities = new Map();
-    return text.replace(/&[a-zA-Z][a-zA-Z0-9]+;/g, entity => {
-      if (/^&(amp|lt|gt|quot|apos);$/.test(entity)) return entity;
-      if (!entities.has(entity)) {
-        const decoded = new DOMParser().parseFromString(entity, "text/html").body.textContent;
-        entities.set(entity, decoded === entity ? entity : Array.from(decoded, char => `&#${char.codePointAt(0)};`).join(""));
-      }
-      return entities.get(entity);
-    });
+    return text.replace(/&(?!(?:#\d+|#x[\da-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);)/g, "&amp;")
+      .replace(/&[a-zA-Z][a-zA-Z0-9]+;/g, entity => {
+        if (/^&(amp|lt|gt|quot|apos);$/.test(entity)) return entity;
+        if (!entities.has(entity)) {
+          const decoded = new DOMParser().parseFromString(entity, "text/html").body.textContent;
+          entities.set(entity, decoded === entity ? entity : Array.from(decoded, char => `&#${char.codePointAt(0)};`).join(""));
+        }
+        return entities.get(entity);
+      });
   }
   function parseDocument(text, source) {
     const expected = new Map();

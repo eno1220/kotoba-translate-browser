@@ -2,7 +2,7 @@ const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const vm = require("node:vm");
 const { readFileSync } = require("node:fs");
-function background(responder, settings = {}) {
+function background(responder, settings = {}, storage = {}) {
   let listener, commandListener, settingsChanged, active = 0, maximum = 0, reads = 0;
   let now = Date.now();
   const calls = [];
@@ -10,11 +10,11 @@ function background(responder, settings = {}) {
   const clipboard = [];
   const event = { addListener() {} };
   const context = vm.createContext({
-    URL, TextEncoder, TextDecoder, AbortController, DOMException, setTimeout, clearTimeout, setInterval() {}, Date: class extends Date { static now() { return now; } }, DOMParser: new (require("jsdom").JSDOM)("").window.DOMParser,
+    console, URL, TextEncoder, TextDecoder, AbortController, DOMException, setTimeout, clearTimeout, setInterval() {}, Date: class extends Date { static now() { return now; } }, DOMParser: new (require("jsdom").JSDOM)("").window.DOMParser,
     navigator: { clipboard: { writeText: async text => clipboard.push(text) } },
     browser: {
-      runtime: { id: "test", getURL: path => `moz-extension://test/${path}`, onMessage: { addListener: fn => listener = fn } },
-      storage: { local: { get: async () => { reads++; return { settings }; } }, onChanged: { addListener: fn => settingsChanged = fn } },
+      runtime: { getManifest: () => ({ version: "0.1.3" }), id: "test", getURL: path => `moz-extension://test/${path}`, onMessage: { addListener: fn => listener = fn } },
+      storage: { local: { get: async key => { reads++; return key === "settings" ? { settings } : structuredClone(storage); }, set: async values => Object.assign(storage, structuredClone(values)) }, onChanged: { addListener: fn => settingsChanged = fn } },
       tabs: { onRemoved: event, onUpdated: event, query: async () => [], sendMessage: async (_tab, message) => { progress.push(message); return { protocol: 5 }; } },
       commands: { onCommand: { addListener: fn => commandListener = fn } }, contextMenus: { create() {}, onClicked: event }
     },
@@ -136,6 +136,15 @@ test("batch markers map reordered results back with paragraph-local link IDs and
   assert.equal(response.documents[1].document[0].text, "二番目©");
   assert.equal(b.progress.at(-1).completed, b.progress.at(-1).total);
   assert.equal(b.progress.at(-1).total, 21);
+});
+
+test("bare ampersands in batch output do not trigger paragraph retries", async () => {
+  const b = background(() => completion('<p id="b0"><span id="k0">Staff & Cast</span></p>\n<p id="b1"><span id="k0">Music &amp; Songs</span></p>'));
+  const documents = ["スタッフ・キャスト", "音楽"].map(text => [{ tag: "span", id: "k0", children: [{ text }] }]);
+  const response = await b.send([], { documents, source: "ja", target: "en" });
+  assert.equal(b.calls.length, 1);
+  assert.equal(response.documents[0].document[0].children[0].text, "Staff & Cast");
+  assert.equal(response.documents[1].document[0].children[0].text, "Music & Songs");
 });
 
 test("invalid or truncated batches fall back to whole paragraphs and retain structure errors", async () => {
@@ -536,4 +545,65 @@ test('late stream subscriber receives the existing prefix and survives the first
   controller.enqueue(new TextEncoder().encode(sse({ choices: [{ delta: { content: 'last.' }, finish_reason: 'stop' }] }) + sse({ choices: [], usage: { completion_tokens: 10 } }) + 'data: [DONE]\n\n'));
   controller.close();
   assert.equal((await second).parts[0], 'First last.');
+});
+
+test("persistent diagnostics retain failed inputs, responses and settings independently of cache and redact credentials", async () => {
+  const storage = {};
+  const b = background(() => new Response('server detail credential-123', { status: 500 }), { apiKey: 'credential-123', cacheMinutes: 0 }, storage);
+  assert.ok((await b.send(['Failed original credential-123'])).error);
+  const data = await b.extension({ type: 'errorHistory' });
+  assert.equal(data.entries.length, 1);
+  const entry = data.entries[0];
+  assert.equal(entry.stage, 'request');
+  assert.equal(entry.original, 'Failed original [REDACTED]');
+  assert.equal(entry.response, 'server detail [REDACTED]');
+  assert.equal(entry.httpStatus, 500);
+  assert.equal(entry.origin, 'https://example.org');
+  assert.equal(entry.settings.model, 'plamo-translate');
+  assert.equal(entry.maxTokens, 8096);
+  assert.ok(!JSON.stringify(data).includes('credential-123'));
+  assert.ok(!JSON.stringify(data).includes('private?q=secret'));
+  assert.ok((await b.content({ type: 'errorHistory' })).error);
+  assert.ok((await b.content({ type: 'clearErrors' })).error);
+  await b.control({ type: 'clearCache' }); b.configure({ cacheMinutes: 1 }); b.tick(86400000);
+  assert.equal((await b.control({ type: 'errorHistory' })).entries.length, 1);
+  const restarted = background(() => completion('訳文'), {}, storage);
+  assert.equal((await restarted.control({ type: 'errorHistory' })).entries.length, 1);
+  await restarted.extension({ type: 'clearErrors' });
+  assert.equal((await restarted.control({ type: 'errorHistory' })).entries.length, 0);
+});
+
+test("diagnostics record recovered structure and HTTP failures, skip private requests and remain bounded under concurrent writes", async () => {
+  const storage = {};
+  let requests = 0;
+  const b = background(() => ++requests === 1 ? completion('invalid markup') : completion('<p id="b0">First <a id="k0">link</a></p><p id="b1">Second <a id="k0">link</a></p>'), {}, storage);
+  await b.send([], { documents: batchDocuments });
+  assert.ok((await b.control({ type: 'errorHistory' })).entries.some(e => e.stage === 'batch-structure' && e.response === 'invalid markup'));
+  const privateBackground = background(() => ({ httpStatus: 500 }), {}, storage);
+  const count = storage.translationErrors.length;
+  await privateBackground.send(['private original'], {}, 1, { tab: { id: 1, incognito: true } });
+  assert.equal(storage.translationErrors.length, count);
+  requests = 0;
+  const retry = background(() => ++requests === 1 ? { httpStatus: 503, retryAfter: '0' } : completion('成功'), { retryTransient: true }, storage);
+  assert.equal((await retry.send(['retry original'])).parts[0], '成功');
+  assert.equal(storage.translationErrors[0].httpStatus, 503);
+  const failing = background(({ url }) => url.endsWith('/tokenize') ? { tokens: [1] } : { httpStatus: 500 }, { shareInFlight: false, tokenizer: 'llama' }, storage);
+  await Promise.all(Array.from({ length: 105 }, (_, i) => failing.send([`original ${i} ` + 'x'.repeat(40000)], {}, i + 1)));
+  assert.equal(storage.translationErrors.length, 100);
+  assert.ok(new TextEncoder().encode(JSON.stringify(storage.translationErrors)).length <= 4 * 1024 * 1024);
+  assert.ok(storage.translationErrors[0].original.endsWith('[省略: 32000文字を超過]'));
+});
+
+test("diagnostics preserve malformed JSON and stream output and evict by bytes without losing the newest error", async () => {
+  const storage = { translationErrors: Array.from({ length: 90 }, () => ({ original: '日'.repeat(20000) })) };
+  const b = background(() => new Response('{broken JSON', { headers: { 'Content-Type': 'application/json' } }), {}, storage);
+  assert.ok((await b.send(['Original'])).error);
+  assert.equal(storage.translationErrors[0].response, '{broken JSON');
+  assert.ok(storage.translationErrors.length < 90);
+  assert.ok(new TextEncoder().encode(JSON.stringify(storage.translationErrors)).length <= 4 * 1024 * 1024);
+  const streaming = background(() => new Response('data: {"choices":[{"delta":{"content":"途中の訳"}}]}\n\ndata: {broken\n\n', { headers: { 'Content-Type': 'text/event-stream' } }), { streamTranslation: true }, storage);
+  assert.ok((await streaming.send(['Stream original'])).error);
+  const response = JSON.parse(storage.translationErrors[0].response);
+  assert.equal(response.partialOutput, '途中の訳');
+  assert.equal(response.invalidEvent, '{broken');
 });
