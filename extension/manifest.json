@@ -1,10 +1,10 @@
 {
   "manifest_version": 2,
-  "name": "Kotoba",
-  "version": "0.1.5",
+  "name": "Kotoba-translate",
+  "version": "0.1.6",
   "description": "ローカル翻訳サーバでページと選択範囲を翻訳します。",
   "icons": {"48": "icons/kotoba.svg", "96": "icons/kotoba.svg"},
-  "browser_specific_settings": {"gecko": {"id": "kotoba-local@eno1220.local", "strict_min_version": "128.0"}},
+  "browser_specific_settings": {"gecko": {"strict_min_version": "128.0"}},
   "permissions": ["activeTab", "storage", "contextMenus", "clipboardWrite", "http://*/*", "https://*/*"],
   "commands": {
     "translate-page": { "suggested_key": { "default": "Alt+Shift+Y" }, "description": "ページ翻訳／停止" },

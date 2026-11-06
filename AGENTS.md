@@ -26,5 +26,3 @@
 - Webページやドキュメントの取得には `ax` を使い、初回に `ax agent-context` を読む。
 - 構文に基づくコード検索には `ast-grep` を使う。
 - 必要な確認だけ選んで実行する：`npm test`、`npm run lint`、`npm run test:firefox`。ZIP生成は `npm run build`。
-
-@/Users/eno1220/.codex/RTK.md
