@@ -16,13 +16,16 @@
       <details class="advanced"><summary>APIの詳細</summary>
         <label>APIパス<input name="path" required placeholder="/v1/chat/completions" spellcheck="false"></label>
         <label>API形式<select name="apiFormat"><option value="top-level">トップレベル</option><option value="template">chat_template_kwargs（MLX / llama.cpp / vLLM）</option></select><small>公式MLXモデルのserve.pyはchat_template_kwargsを選択。</small></label>
+        <label class="switch-row">翻訳前にサーバーの稼働を確認<input name="serverCheck" type="checkbox" role="switch"></label>
+        <small>既定オフ。ポップアップを開くと確認し、応答がない間は翻訳開始を無効にします。モデルをロードしないヘルスチェックAPIがある個人環境で有効にしてください。</small>
+        <label>ヘルスチェックのパス<input name="healthPath" required placeholder="/health" spellcheck="false"><small>同じ接続先へGETし、HTTP 2xxを稼働中と判定します。生成APIは使いません。パスはベースURLの後ろに連結します。</small></label>
       </details>
       <button type="button" id="test-connection">接続を確認</button>
       <p id="connection-status" role="status" aria-live="polite"></p>
       <small>入力中の設定でテスト翻訳します。保存はしません。</small>
     </fieldset>
     <fieldset><legend>翻訳</legend>
-      <div class="row"><label>原文<select name="source"></select></label><label>訳文<select name="target"></select></label></div>
+      <small>ページのHTMLの言語が日本語なら英語へ、それ以外は自動判定して日本語へ翻訳します。</small>
       <label>日本語の文体<select name="form"><option value="">指定なし</option><option value="plain">常体（だ・である）</option><option value="polite">敬体（です・ます）</option></select></label>
       <label class="switch-row">本文だけを翻訳<input name="mainContentOnly" type="checkbox" role="switch"></label>
       <small>本文が見つからないページでは全体を翻訳します。次の翻訳から反映。</small>
@@ -49,6 +52,9 @@
       <details class="help"><summary>保存内容と削除について</summary>
         <p><small>原文・訳文と履歴をメモリに最大約8MiB保存します。期限切れ・設定保存・Firefox終了・拡張の再読み込みで消えます。プライベートウィンドウでは保存しません。</small></p>
       </details>
+    </fieldset>
+    <fieldset><legend>エラー記録</legend>
+      <label>保存期間（分）<input name="errorMinutes" type="number" min="1" step="1" required><small>既定3600分。発生時刻から保存期間を過ぎた記録を削除します。</small></label>
     </fieldset>
     <details class="advanced"><summary>翻訳処理の調整</summary>
       <label class="switch-row">複数の段落をまとめて翻訳<input name="batchTranslation" type="checkbox" role="switch"></label>

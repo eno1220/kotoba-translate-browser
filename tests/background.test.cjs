@@ -5,24 +5,24 @@ const { readFileSync } = require("node:fs");
 function background(responder, settings = {}, storage = {}) {
   let listener, commandListener, menuListener, settingsChanged, active = 0, maximum = 0, reads = 0, pageState = {};
   let now = Date.now();
-  const calls = [];
+  const calls = [], intervals = [];
   const progress = [];
   const clipboard = [];
   const menus = [], pageMessages = [], badges = [];
   const event = { addListener() {} };
   const context = vm.createContext({
-    console, URL, TextEncoder, TextDecoder, AbortController, DOMException, setTimeout, clearTimeout, setInterval() {}, Date: class extends Date { static now() { return now; } }, DOMParser: new (require("jsdom").JSDOM)("").window.DOMParser,
+    console, URL, TextEncoder, TextDecoder, AbortController, DOMException, setTimeout, clearTimeout, setInterval: fn => intervals.push(fn), Date: class extends Date { static now() { return now; } }, DOMParser: new (require("jsdom").JSDOM)("").window.DOMParser,
     navigator: { clipboard: { writeText: async text => clipboard.push(text) } },
     browser: {
       runtime: { getManifest: () => ({ version: "0.1.3" }), id: "test", getURL: path => `moz-extension://test/${path}`, onMessage: { addListener: fn => listener = fn } },
-      storage: { local: { get: async key => { reads++; return key === "settings" ? { settings } : structuredClone(storage); }, set: async values => Object.assign(storage, structuredClone(values)) }, onChanged: { addListener: fn => settingsChanged = fn } },
+      storage: { local: { get: async key => { if (key === "settings") reads++; return key === "settings" ? { settings } : structuredClone(storage); }, set: async values => Object.assign(storage, structuredClone(values)) }, onChanged: { addListener: fn => settingsChanged = fn } },
       tabs: { onRemoved: event, onUpdated: event, query: async () => [], sendMessage: async (tabId, message, options) => { progress.push(message); pageMessages.push({ tabId, message, options }); return message.type === "status" ? pageState : { protocol: 6 }; } },
       browserAction: { setBadgeText: async value => badges.push(value), setTitle: async () => {} },
       commands: { onCommand: { addListener: fn => commandListener = fn } }, contextMenus: { create: value => menus.push(value), onClicked: { addListener: fn => menuListener = fn } }
     },
     fetch: async (url, options) => {
       active++; maximum = Math.max(maximum, active);
-      const call = { url, options, body: JSON.parse(options.body) }; calls.push(call);
+      const call = { url, options, body: options.body ? JSON.parse(options.body) : undefined }; calls.push(call);
       try {
         const result = await responder(call);
         if (result instanceof Response) return result;
@@ -39,6 +39,7 @@ function background(responder, settings = {}, storage = {}) {
     command: (name, tab = { id: 1, url: "https://example.org" }) => commandListener(name, tab),
     content: message => listener(message, { id: "test", tab: { id: 1 }, frameId: 0, url: "http://example.org" }),
     tick: milliseconds => now += milliseconds,
+    sweep: async () => { for (const fn of intervals) await fn(); },
     configure: values => { settings = { ...settings, ...values }; settingsChanged({ settings: { newValue: settings } }, "local"); },
     control: message => listener(message, { id: "test" }),
     extension: message => listener(message, { id: "test", tab: { id: 20 }, url: "moz-extension://test/options.html" }),
@@ -47,11 +48,12 @@ function background(responder, settings = {}, storage = {}) {
 }
 const completion = text => ({ choices: [{ message: { content: text }, finish_reason: "stop" }] });
 
-test("background accepts easy Japanese settings and translation requests", async () => {
+test("background accepts easy Japanese requests and ignores legacy default directions", async () => {
   for (const apiFormat of ["top-level", "template"]) {
     const b = background(() => completion("やさしい日本語です。"), { target: "ja(easy)", apiFormat });
     const preferences = await b.control({ type: "preferences" });
-    assert.equal(preferences.target, "ja(easy)");
+    assert.equal(preferences.target, undefined);
+    assert.equal(preferences.source, undefined);
     const result = await b.send(["日本語の文章です。"], { source: "ja", target: "ja(easy)" });
     assert.equal(result.error, undefined);
     assert.equal(result.parts[0], "やさしい日本語です。");
@@ -92,7 +94,7 @@ test("copy is allowed only when enabled and shortcuts respect their switch and r
   await b.content({ type: "copyText", text: "訳文" }); assert.deepEqual(b.clipboard, ["訳文"]);
   await b.command("translate-page", { id: 1, url: "about:config" }); assert.equal(b.progress.length, 0);
   await b.command("translate-page");
-  assert.equal(b.progress.at(-1).type, "start"); assert.equal(b.progress.at(-1).target, "ja");
+  assert.equal(b.progress.at(-1).type, "start"); assert.equal(b.progress.at(-1).target, undefined);
   await b.command("restore-page"); assert.equal(b.progress.at(-1).type, "restore");
   const prefs = await b.content({ type: "contentPreferences" });
   assert.equal(prefs.apiKey, undefined); assert.equal(prefs.keyboardShortcuts, true);
@@ -288,9 +290,9 @@ test('broken link markup reduces batches and completes their paragraphs in order
   }, { cacheMinutes: 0 });
   const documents = Array.from({ length: 8 }, (_, i) => [{ text: `Read ${i} ` }, { tag: 'a', id: 'k0', children: [{ text: 'the docs' }] }]);
   const result = await b.send([], { documents, requestId: 'broken-batch' });
-  assert.deepEqual(sizes, [8, 4, 2, 2, 2, 2]);
-  assert.equal(result.batchLimit, 2); assert.equal(result.batchFallback, true);
-  assert.deepEqual(Array.from(result.documents, item => item.document[0].text), Array.from({ length: 8 }, (_, i) => `読む ${i} `));
+  assert.deepEqual(sizes, [8, 0]); // Only the first (broken) paragraph is resent.
+  assert.equal(result.batchLimit, 4); assert.equal(result.batchFallback, true);
+  assert.deepEqual(Array.from(result.documents, item => item.document[0].text), Array.from({ length: 8 }, (_, i) => `${i ? 'Read' : '読む'} ${i} `));
   assert.deepEqual(b.progress.flatMap(value => value.results || []).map(value => value.index), [0, 1, 2, 3, 4, 5, 6, 7]);
   assert.equal(b.progress.at(-1).completed, b.progress.at(-1).total);
 });
@@ -747,7 +749,7 @@ test("diagnostics record recovered structure and HTTP failures, skip private req
 });
 
 test("diagnostics preserve malformed JSON and stream output and evict by bytes without losing the newest error", async () => {
-  const storage = { translationErrors: Array.from({ length: 90 }, () => ({ original: '日'.repeat(20000) })) };
+  const storage = { translationErrors: Array.from({ length: 90 }, () => ({ timestamp: Date.now(), original: '日'.repeat(20000) })) };
   const b = background(() => new Response('{broken JSON', { headers: { 'Content-Type': 'application/json' } }), {}, storage);
   assert.ok((await b.send(['Original'])).error);
   assert.equal(storage.translationErrors[0].response, '{broken JSON');
@@ -813,4 +815,103 @@ test('page API throughput divides tokens by elapsed time without counting concur
   assert.equal(row.outputTokens, 4841);
   assert.equal(row.tokensPerSecond.toFixed(1), '111.0');
   assert.equal(data.totals.tokensPerSecond, row.tokensPerSecond);
+});
+
+
+test("diagnostics expire after the configured minutes on reads, writes, settings changes and restart", async () => {
+  const storage = {};
+  const b = background(() => new Response('failed', { status: 500 }), { errorMinutes: 2 }, storage);
+  await b.send(['First failure']);
+  b.tick(60000);
+  await b.send(['Second failure']);
+  b.tick(60000);
+  const history = await b.control({ type: 'errorHistory' });
+  assert.equal(history.entries.length, 1);
+  assert.equal(history.entries[0].original, 'Second failure');
+  assert.equal(storage.translationErrors.length, 1);
+  b.tick(60000);
+  await b.send(['Third failure']);
+  assert.equal(storage.translationErrors.length, 1);
+  b.tick(60000);
+  b.configure({ errorMinutes: 1 });
+  await b.control({ type: 'errorHistory' });
+  assert.equal(storage.translationErrors.length, 0);
+  await b.send(['Failure before idle sweep']);
+  b.tick(60000);
+  await b.sweep();
+  assert.equal(storage.translationErrors.length, 0);
+  storage.translationErrors = [{ timestamp: Date.now() - 3600 * 60000, original: 'Old persisted failure' }];
+  const restarted = background(() => completion('unused'), {}, storage);
+  assert.equal((await restarted.control({ type: 'errorHistory' })).entries.length, 0);
+  assert.equal(storage.translationErrors.length, 0);
+});
+
+test('opt-in server check uses only authenticated GET on the configured health path', async () => {
+  const b = background(() => assert.fail('disabled check must not use the network'));
+  assert.equal((await b.control({ type: 'serverStatus' })).available, true);
+  assert.equal(b.calls.length, 0);
+  const checked = background(call => {
+    assert.equal(call.url, 'http://127.0.0.1:8765/service/healthz');
+    assert.equal(call.options.method, 'GET');
+    assert.equal(call.body, undefined);
+    assert.equal(call.options.headers.Authorization, 'Bearer local-key');
+    assert.equal(call.options.redirect, 'error');
+    assert.equal(call.options.credentials, 'omit');
+    return new Response('', { status: 200 });
+  }, { serverCheck: true, endpoint: 'http://127.0.0.1/service', port: '8765', healthPath: '/healthz', apiKey: 'Bearer local-key' });
+  assert.equal((await checked.control({ type: 'serverStatus' })).available, true);
+  assert.ok((await checked.content({ type: 'serverStatus' })).error);
+  const prefs = await checked.content({ type: 'contentPreferences' });
+  assert.equal(prefs.healthPath, undefined); assert.equal(prefs.serverCheck, undefined);
+  assert.equal(checked.calls.length, 1);
+});
+
+test('unavailable health checks block starts, but stop and restore remain usable', async () => {
+  for (const responder of [() => { throw new TypeError('offline'); }, () => new Response('', { status: 503 }), () => new Response('', { status: 401 }), () => new Response('', { status: 404 })]) {
+    const b = background(responder, { serverCheck: true });
+    const status = await b.control({ type: 'serverStatus' });
+    assert.equal(status.available, false); assert.ok(status.message);
+    const response = await b.control({ type: 'page', tabId: 1, action: 'start' });
+    assert.ok(response.error); assert.equal(b.pageMessages.length, 0);
+    await b.control({ type: 'page', tabId: 1, action: 'stop' });
+    await b.control({ type: 'page', tabId: 1, action: 'restore' });
+    assert.equal(b.pageMessages.at(-1).message.type, 'restore');
+    const count = b.calls.length;
+    b.pageState({ running: true }); await b.menu({ menuItemId: 'kotoba-page' });
+    assert.equal(b.pageMessages.at(-1).message.type, 'stop'); assert.equal(b.calls.length, count);
+    b.pageState({ running: false }); await b.menu({ menuItemId: 'kotoba-page' });
+    assert.equal(b.badges.at(-1).text, '!');
+  }
+});
+
+test('partial batch recovery retains valid neighbours and retries a failed paragraph as a whole', async () => {
+  for (const batchRecovery of [true, false]) {
+    const documents = [
+      [{ text: 'Before.' }],
+      [{ text: 'Read ' }, { tag: 'a', id: 'k0', children: [{ text: 'the docs' }] }, { text: ' today.' }],
+      [{ text: 'After.' }]
+    ];
+    const b = background(({ body }) => {
+      const input = body.messages[0].content;
+      if (input.includes('<p id="b')) return completion('<p id="b2">後。</p><p id="b1">読む</a>今日。</p><p id="b0">前。</p>');
+      assert.equal(input, 'Read <a id="k0">the docs</a> today.');
+      return completion('壊れたまま');
+    }, { batchRecovery, cacheMinutes: 0 });
+    const result = await b.send([], { documents, requestId: 'partial' });
+    assert.equal(b.calls.length, 3);
+    assert.equal(result.documents[0].document[0].text, '前。');
+    assert.equal(result.documents[1].errorCode, 'structure');
+    assert.equal(result.documents[2].document[0].text, '後。');
+    assert.deepEqual(b.progress.flatMap(value => value.results || []).map(value => value.index), [0, 1, 2]);
+  }
+});
+
+test('a stalled health request times out without invoking the model or logging a translation failure', async () => {
+  const b = background(({ options }) => new Promise((resolve, reject) => {
+    options.signal.addEventListener('abort', () => reject(new DOMException('timeout', 'AbortError')), { once: true });
+  }), { serverCheck: true });
+  const result = await b.control({ type: 'serverStatus' });
+  assert.equal(result.available, false);
+  assert.equal(b.calls.length, 1); assert.equal(b.calls[0].options.signal.aborted, true);
+  assert.equal((await b.control({ type: 'errorHistory' })).entries.length, 0);
 });

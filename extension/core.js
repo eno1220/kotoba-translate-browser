@@ -5,11 +5,11 @@ globalThis.Kotoba = (() => {
   const DICTIONARY_LIMITS = Object.freeze({ entries: 500, perScope: 100, domains: 20, term: 100, bytes: 6000 });
   const DEFAULTS = Object.freeze({
     endpoint: "http://127.0.0.1", port: "8000", path: "/v1/chat/completions",
-    apiKey: "", model: "plamo-translate", apiFormat: "top-level",
+    apiKey: "", model: "plamo-translate", apiFormat: "top-level", serverCheck: false, healthPath: "/health",
     batchTranslation: true, concurrency: 1, inputTokens: 6000, contextTokens: 32768, timeoutSeconds: 180,
     maxBatchItems: 32, batchStartItems: 4, batchStartTokens: 1200, batchGrowthFactor: 2, batchTargetSeconds: 8,
     readingOrder: true, progressiveBatching: true, batchRecovery: true, mergeSections: true, deduplicateRepetitions: true,
-    tokenizer: "bytes", tokenizePath: "/tokenize", source: "en", target: "ja", form: "", cacheMinutes: 30,
+    tokenizer: "bytes", tokenizePath: "/tokenize", form: "", cacheMinutes: 30, errorMinutes: 3600,
     responsiveScan: true, prioritizeVisible: true, prioritizeContent: true, semanticBatching: true, adaptiveScheduling: true, shareInFlight: true, relevantGlossary: true, streamTranslation: false, mainContentOnly: false,
     selectionButton: false, keyboardShortcuts: true, copyButton: true,
     focusOriginal: true, pageProgress: true, announceProgress: true, hoverEnabled: true, retryTransient: false
@@ -22,20 +22,20 @@ globalThis.Kotoba = (() => {
   const LANGUAGES = "ja ja(easy) en zh-hans zh-hant ko ar az be bg bn ca ceb de es et eu fa fr gu he hi hr hu hy id it jv ka kk km lt lv ml mr ms my ne nl pa pl ru si sk sl sr sw ta te th tl ur uz vi".split(" ");
   function settings(raw = {}) {
     const s = { ...DEFAULTS, ...raw };
+    delete s.source; delete s.target;
     const url = new URL(s.endpoint);
     if (!/^https?:$/.test(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error("接続先は認証情報・クエリを含まない http(s) URL を指定してください。");
     if (s.port !== "" && (!/^\d+$/.test(String(s.port)) || +s.port < 1 || +s.port > 65535)) throw new Error("ポートは1〜65535で指定してください。");
-    for (const name of ["path", "tokenizePath"]) {
+    for (const name of ["path", "tokenizePath", "healthPath"]) {
       if (!s[name].startsWith("/") || s[name].startsWith("//") || /[?#]/.test(s[name])) throw new Error("APIパスは / から始まるパスを指定してください。");
     }
-    for (const [key, min, max] of [["concurrency", 1, 8], ["inputTokens", 128, 24000], ["contextTokens", 8192, 32768], ["timeoutSeconds", 10, 1800], ["cacheMinutes", 0, 1440], ["maxBatchItems", 1, 256], ["batchStartItems", 1, 256], ["batchStartTokens", 128, 24000], ["batchGrowthFactor", 2, 4], ["batchTargetSeconds", 1, 60]]) {
+    for (const [key, min, max] of [["concurrency", 1, 8], ["inputTokens", 128, 24000], ["contextTokens", 8192, 32768], ["timeoutSeconds", 10, 1800], ["cacheMinutes", 0, 1440], ["errorMinutes", 1, Number.MAX_SAFE_INTEGER], ["maxBatchItems", 1, 256], ["batchStartItems", 1, 256], ["batchStartTokens", 128, 24000], ["batchGrowthFactor", 2, 4], ["batchTargetSeconds", 1, 60]]) {
       s[key] = Number(s[key]);
       if (!Number.isInteger(s[key]) || s[key] < min || s[key] > max) throw new Error(`${key} は ${min}〜${max} の整数で指定してください。`);
     }
     if (!["top-level", "template"].includes(s.apiFormat) || !["bytes", "llama", "vllm"].includes(s.tokenizer)) throw new Error("API形式またはtokenizer設定が不正です。");
     if (!s.model.trim() || /[\r\n]/.test(s.apiKey)) throw new Error("モデル名またはAPIキーを確認してください。");
-    for (const key of FEATURES) if (typeof s[key] !== "boolean") throw new Error(`${key} の設定が不正です。`);
-    languages(s.source, s.target);
+    for (const key of [...FEATURES, "serverCheck"]) if (typeof s[key] !== "boolean") throw new Error(`${key} の設定が不正です。`);
     if (!["", "plain", "polite"].includes(s.form)) throw new Error("文体が不正です。");
     s.dictionary = dictionary(s.dictionary);
     return s;

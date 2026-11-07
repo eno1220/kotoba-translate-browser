@@ -11,6 +11,8 @@ function setup(t) {
   const w = dom.window, calls = [], timers = new Map();
   w.TextEncoder = TextEncoder;
   let nextTimer = 0, hidden = false, responder = () => state;
+  let server = { enabled: false, available: true }, serverChecks = 0, now = Date.now();
+  w.Date.now = () => now;
   const state = { running: false, done: 0, total: 0, source: "en", target: "ja", percent: 0, translated: 0 };
   Object.defineProperty(w.document, "hidden", { get: () => hidden });
   w.setTimeout = (fn, delay) => { timers.set(++nextTimer, { fn, delay }); return nextTimer; };
@@ -19,11 +21,13 @@ function setup(t) {
     tabs: { query: async () => [{ id: 1, url: "https://example.org/article" }] },
     runtime: { sendMessage: async message => {
       if (message.type === "preferences") return { source: "en", target: "ja", batchTranslation: true };
+      if (message.type === "serverStatus") { serverChecks++; return typeof server === 'function' ? server() : server; }
       calls.push(message.action); return responder(message);
     } }
   };
   w.eval(read("core.js")); w.eval(read("popup.js"));
   return { w, calls, timers, state,
+    server: value => server = value, serverChecks: () => serverChecks, advance: ms => now += ms,
     respond: fn => responder = fn,
     visibility: value => { hidden = value; w.document.dispatchEvent(new w.Event("visibilitychange")); },
     tick: () => { const [id, timer] = timers.entries().next().value; timers.delete(id); timer.fn(); },
@@ -71,4 +75,33 @@ test("a delayed status cannot overwrite a manual action or unlock other actions 
   assert.equal(s.calls.at(-1), "stop");
   assert.equal(s.get("restore").disabled, false);
   assert.equal(s.get("source").disabled, false);
+});
+
+test('server availability disables starts, recovers on refresh and never disables stop or restore', async t => {
+  const s = setup(t);
+  let finish;
+  s.server(() => new Promise(resolve => finish = resolve));
+  await settle();
+  assert.equal(s.get('start').disabled, true);
+  assert.equal(s.get('selection').disabled, true);
+  finish({ enabled: true, available: false, message: 'APIサーバーに接続できません' }); await settle();
+  assert.equal(s.get('start').disabled, true);
+  assert.match(s.get('server-status').textContent, /接続できません/);
+  assert.equal(s.get('server-status').hidden, false);
+  s.state.translated = 2;
+  s.tick(); await settle();
+  assert.equal(s.get('restore').disabled, false);
+  s.advance(6000); s.server({ enabled: true, available: true });
+  s.tick(); await settle();
+  assert.equal(s.get('start').disabled, false);
+  assert.equal(s.get('selection').disabled, false);
+  s.state.running = true; s.advance(6000);
+  s.server({ enabled: true, available: false, message: 'offline' });
+  s.tick(); await settle();
+  assert.equal(s.get('start').disabled, false);
+  assert.equal(s.get('start-label').textContent, '翻訳を停止');
+  s.respond(message => message.action === 'stop' ? { ...s.state, running: false } : s.state);
+  s.get('start').click(); await settle();
+  assert.equal(s.calls.at(-1), 'stop');
+  assert.equal(s.get('start').disabled, true);
 });

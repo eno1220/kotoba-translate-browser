@@ -6,8 +6,8 @@ const K = globalThis.Kotoba;
 
 test("easy Japanese is accepted and sent unchanged in both API formats", () => {
   for (const apiFormat of ["top-level", "template"]) {
-    const s = K.settings({ apiFormat, target: "ja(easy)" });
-    const body = K.body(s, "日本語の文章です。", { source: "ja", target: s.target, domain: "https://example.com" });
+    const s = K.settings({ apiFormat });
+    const body = K.body(s, "日本語の文章です。", { source: "ja", target: "ja(easy)", domain: "https://example.com" });
     const options = apiFormat === "template" ? body.chat_template_kwargs : body;
     assert.equal(options.source_lang, "ja");
     assert.equal(options.target_lang, "ja(easy)");
@@ -184,4 +184,15 @@ test('only source-present glossary terms are sent, without reducing the reserved
   assert.deepEqual(K.body(s, 'Open File.', page).glossary.map(term => term.source), ['File']);
   assert.deepEqual(K.body({ ...s, relevantGlossary: false }, 'Open File.', page).glossary.map(term => term.source), ['File', 'Absent', 'file']);
   assert.equal(K.inputBudget(s, page), K.inputBudget({ ...s, relevantGlossary: false }, page));
+});
+
+test('server check defaults off and validates its switch and same-server path', () => {
+  assert.equal(K.settings().serverCheck, false);
+  assert.equal(K.settings().healthPath, '/health');
+  assert.throws(() => K.settings({ serverCheck: 'true' }));
+  for (const healthPath of ['https://other.example/health', '//other.example/health', '/health?model=x', '/health#x']) {
+    assert.throws(() => K.settings({ healthPath }));
+  }
+  const s = K.settings({ endpoint: 'http://localhost/service', port: '8765', healthPath: '/healthz' });
+  assert.equal(K.endpoint(s, s.healthPath), 'http://localhost:8765/service/healthz');
 });

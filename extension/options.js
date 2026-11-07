@@ -2,15 +2,7 @@
 const form = document.getElementById("settings");
 const status = document.getElementById("status");
 const save = document.getElementById("save"), discard = document.getElementById("discard");
-const displayNames = new Intl.DisplayNames(["ja"], { type: "language" });
 let baseline, loaded = false, saving = false;
-for (const key of ["source", "target"]) {
-  for (const code of [...(key === "source" ? ["auto"] : []), ...Kotoba.LANGUAGES]) {
-    const option = document.createElement("option"); option.value = code;
-    option.textContent = code === "auto" ? "自動判定" : code === "ja(easy)" ? "やさしい日本語" : displayNames.of(code);
-    form.elements.namedItem(key).append(option);
-  }
-}
 // Read disabled fields too, so changing the tokenizer never loses its custom path.
 function values() {
   return Object.fromEntries(Object.keys(Kotoba.DEFAULTS).flatMap(key => {

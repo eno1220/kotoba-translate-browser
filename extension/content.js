@@ -588,6 +588,7 @@
   async function translatePage(source, target) {
     currentPage();
     if (state.running) return pageState();
+    source ||= state.source || pageDirection().source; target ||= state.target || pageDirection().target;
     if (appliedDirection && appliedDirection !== `${source}:${target}`) restore();
     state.source = source; state.target = target;
     const run = ++generation;
@@ -1021,8 +1022,8 @@
     await readPreferences();
     if (beforePreferences !== generation) return;
     clearLauncher();
-    if (!state.source) state.source = message.defaults?.source || message.source || "en";
-    if (!state.target) state.target = message.defaults?.target || message.target || "ja";
+    if (!state.source) state.source = message.source || pageDirection().source;
+    if (!state.target) state.target = message.target || pageDirection().target;
     if (message.source) state.source = message.source;
     if (message.target) state.target = message.target;
     if (state.running) stop();
@@ -1113,7 +1114,11 @@
     node.tabIndex = -1; node.focus({ preventScroll: true });
     await run();
   }
-  function pageState() { return { ...state, translated: records.size }; }
+  function pageDirection() {
+    const japanese = /^ja(?:-|$)/i.test(document.documentElement.lang.trim());
+    return japanese ? { source: "ja", target: "en" } : { source: "auto", target: "ja" };
+  }
+  function pageState() { return { ...state, source: state.source || pageDirection().source, target: state.target || pageDirection().target, translated: records.size }; }
   browser.runtime.onMessage.addListener(async message => {
     currentPage();
     try {

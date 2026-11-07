@@ -6,7 +6,7 @@
     <nav class="page-nav" aria-label="拡張機能"><a href="options.html">設定</a><a href="dictionary.html">辞書</a><a href="history.html">履歴</a><a href="errors.html" aria-current="page">エラー記録</a></nav>
   </header>
   <p>翻訳に失敗した箇所と、再試行前の問題を新しい順に表示します。原文やサーバーの応答を含むため、JSONを共有する前に内容を確認してください。</p>
-  <p><small>キャッシュとは独立して最大100件・4MiBを保存し、超過時は古い記録から削除します。各文字列は32000文字までです。APIキーは除去し、プライベートウィンドウと停止操作は記録しません。</small></p>
+  <p><small>キャッシュとは独立して最大100件・4MiBを保存し、超過時は古い記録から削除します。保存期間は設定で変更できます（既定3600分）。各文字列は32000文字までです。APIキーは除去し、プライベートウィンドウと停止操作は記録しません。</small></p>
   <div class="history-actions"><button id="refresh" type="button">更新</button><button id="export" type="button" disabled="">JSONを保存</button><button id="clear" type="button" disabled="">エラー記録を全件削除</button></div>
   <p id="status" role="status" aria-live="polite">読み込んでいます…</p>
   <div id="entries"></div>

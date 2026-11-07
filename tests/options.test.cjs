@@ -90,3 +90,22 @@ test('invalid inputs reveal their collapsed settings sections', async t => {
   field.checkValidity();
   assert.ok(sections.every(section => section.open));
 });
+
+
+test('settings remove legacy default directions and save diagnostic retention in minutes', async t => {
+  const e = await options({ source: 'de', target: 'fr' }); t.after(() => e.w.close());
+  assert.equal(e.field('source'), null); assert.equal(e.field('target'), null);
+  assert.equal(e.field('errorMinutes').value, '3600');
+  e.edit('errorMinutes', 60); await e.submit();
+  assert.equal(e.settings().errorMinutes, 60);
+  assert.equal(e.settings().source, undefined); assert.equal(e.settings().target, undefined);
+  e.edit('errorMinutes', 0); await e.submit();
+  assert.equal(e.writes(), 1);
+});
+
+test('optional server check saves its custom health path and switch', async t => {
+  const e = await options(); t.after(() => e.w.close());
+  assert.equal(e.field('serverCheck').checked, false);
+  e.edit('serverCheck', true); e.edit('healthPath', '/ready'); await e.submit();
+  assert.equal(e.settings().serverCheck, true); assert.equal(e.settings().healthPath, '/ready');
+});

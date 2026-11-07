@@ -965,3 +965,23 @@ test('adjacent figures share their gallery context without moving their caption 
   assert.deepEqual([...s.w.document.querySelectorAll('figcaption')], captions);
   s.w.close();
 });
+
+
+test("HTML language determines the initial direction for page and selection translation", async () => {
+  for (const [lang, source, target] of [['ja', 'ja', 'en'], [' JA-jp ', 'ja', 'en'], ['en', 'auto', 'ja'], ['fr', 'auto', 'ja'], ['', 'auto', 'ja']]) {
+    for (const type of ['start', 'selection']) {
+      const s = setup(`<html lang="${lang}"><body><p>${source === 'ja' ? '日本語の文章です。' : 'A sentence to translate.'}</p></body></html>`);
+      try {
+        const initial = await s.message({ type: 'status' });
+        assert.equal(initial.source, source); assert.equal(initial.target, target);
+        if (type === 'selection') {
+          const range = s.w.document.createRange(); range.selectNodeContents(s.w.document.querySelector('p'));
+          s.w.getSelection().addRange(range);
+        }
+        await s.message({ type });
+        if (type === 'start') await s.settle(); else await new Promise(setImmediate);
+        assert.equal(s.calls[0].source, source); assert.equal(s.calls[0].target, target);
+      } finally { s.w.close(); }
+    }
+  }
+});

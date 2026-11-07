@@ -7,7 +7,7 @@ const METRIC_TOTALS = ["requests", "sharedRequests", "responseMilliseconds", "ou
 function measurements() { return { ...Object.fromEntries(METRIC_TOTALS.map(key => [key, 0])), tokensKnown: true }; }
 function documentURL(value) { const url = new URL(value); url.hash = ""; return url.href; }
 
-// Persistent diagnostics are independent of the translation cache and settings.
+// Persistent diagnostics have their own retention period, separate from the cache.
 const ERROR_BYTES = 4 * 1024 * 1024, ERROR_ENTRIES = 100;
 let errorWrites = Promise.resolve();
 function errorOperation(action) {
@@ -18,7 +18,10 @@ function errorOperation(action) {
 function errorHistory() {
   return errorOperation(async () => {
     const { translationErrors = [] } = await browser.storage.local.get("translationErrors");
-    return { entries: translationErrors, maxEntries: ERROR_ENTRIES, maxBytes: ERROR_BYTES };
+    const s = await getSettings();
+    const entries = translationErrors.filter(entry => entry.timestamp > Date.now() - s.errorMinutes * 60000);
+    if (entries.length !== translationErrors.length) await browser.storage.local.set({ translationErrors: entries });
+    return { entries, maxEntries: ERROR_ENTRIES, maxBytes: ERROR_BYTES };
   });
 }
 function diagnosticRecorder(s, page, signal) {
@@ -45,7 +48,8 @@ function diagnosticRecorder(s, page, signal) {
     try {
       await errorOperation(async () => {
         const { translationErrors = [] } = await browser.storage.local.get("translationErrors");
-        const entries = [entry, ...translationErrors].slice(0, ERROR_ENTRIES);
+        const current = await getSettings();
+        const entries = [entry, ...translationErrors].filter(item => item.timestamp > Date.now() - current.errorMinutes * 60000).slice(0, ERROR_ENTRIES);
         while (new TextEncoder().encode(JSON.stringify(entries)).length > ERROR_BYTES) entries.pop();
         await browser.storage.local.set({ translationErrors: entries });
       });
@@ -168,6 +172,30 @@ function waitToRetry(milliseconds, signal) {
     signal.addEventListener("abort", abort, { once: true });
     if (signal.aborted) abort();
   });
+}
+// This opt-in probe never calls inference or tokenization endpoints.
+async function serverStatus() {
+  const s = await getSettings();
+  if (!s.serverCheck) return { enabled: false, available: true };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3000);
+  try {
+    const response = await fetch(K.endpoint(s, s.healthPath), {
+      method: "GET", redirect: "error", credentials: "omit", cache: "no-store",
+      headers: s.apiKey ? { Authorization: `Bearer ${s.apiKey.replace(/^Bearer\s+/i, "").trim()}` } : {},
+      signal: controller.signal
+    });
+    // Only the status is needed; do not keep a response stream open.
+    await response.body?.cancel();
+    return { enabled: true, available: response.ok,
+      ...(!response.ok ? { message: `APIサーバーを利用できません（HTTP ${response.status}）。起動状態・確認パス・認証を確認してください。` } : {}) };
+  } catch {
+    return { enabled: true, available: false, message: "APIサーバーに接続できません。サーバーを起動し、接続設定を確認してください。" };
+  } finally { clearTimeout(timer); }
+}
+async function requireServer() {
+  const status = await serverStatus();
+  if (!status.available) throw new Error(status.message);
 }
 function abortTab(tabId, frameId) {
   for (const job of jobs.values()) {
@@ -463,19 +491,23 @@ function serializeBatch(documents) {
   return documents.map((document, i) => `<p id="b${i}">${K.serializeDocument(document)}</p>`).join("\n");
 }
 function parseBatch(text, documents) {
-  const parsed = new DOMParser().parseFromString(`<batch>${K.normalizeEntities(text)}</batch>`, "application/xml");
-  if (parsed.querySelector("parsererror")) throw new Error("Invalid batch XML");
+  // Validate the paragraph envelope separately. A broken inline tag in one
+  // paragraph must not discard valid translations in all its neighbours.
   const result = new Array(documents.length);
-  for (const node of parsed.documentElement.childNodes) {
-    if (node.nodeType === 3 && !node.data.trim()) continue;
-    const id = node.nodeType === 1 && node.getAttribute("id");
-    if (node.nodeName !== "p" || !/^b\d+$/.test(id) || node.attributes.length !== 1) throw new Error("Invalid batch marker");
+  const seen = new Set();
+  let end = 0, failure;
+  for (const match of text.matchAll(/<p\s+id=(["'])(b\d+)\1\s*>([\s\S]*?)<\/p\s*>/g)) {
+    if (text.slice(end, match.index).trim()) throw new Error("Invalid batch marker");
+    end = match.index + match[0].length;
+    const id = match[2];
     const index = Number(id.slice(1));
-    if (id !== `b${index}` || index >= documents.length || result[index]) throw new Error("Duplicate or unknown batch marker");
-    result[index] = { document: K.parseDocument(node.innerHTML, documents[index]) };
+    if (id !== `b${index}` || index >= documents.length || seen.has(index)) throw new Error("Duplicate or unknown batch marker");
+    seen.add(index);
+    try { result[index] = { document: K.parseDocument(match[3], documents[index]) }; }
+    catch (error) { failure ||= error; }
   }
-  if (result.filter(Boolean).length !== documents.length) throw new Error("Missing batch marker");
-  return result;
+  if (text.slice(end).trim() || seen.size !== documents.length) throw new Error("Missing or invalid batch marker");
+  return { result, failure };
 }
 async function translateDocuments(s, documents, page, signal, advance, deliver = () => {}, repetitive = false) {
   if (repetitive && s.batchTranslation && s.deduplicateRepetitions) {
@@ -533,12 +565,34 @@ async function translateDocuments(s, documents, page, signal, advance, deliver =
         // structure. Retain batching while shrinking this candidate.
         await shrink(batch); return;
       } else {
-        let accepted;
-        try { accepted = parseBatch(output.text, batch); }
+        let accepted, failure;
+        try {
+          ({ result: accepted, failure } = parseBatch(output.text, batch));
+          if (failure) await page.record?.(failure, "batch-structure", serializeBatch(batch), output.text);
+        }
         catch (error) { await page.record?.(error, "batch-structure", serializeBatch(batch), output.text); }
-        if (accepted) {
+        if (accepted && !failure) {
           accepted.forEach(accept);
           advance(batch.reduce((sum, document) => sum + K.documentLength(document), 0));
+          return;
+        }
+        if (accepted?.some(Boolean)) {
+          if (page.metrics) page.metrics.batchFallbacks++;
+          if (s.batchRecovery) {
+            batchLimit = Math.max(1, Math.min(batchLimit, Math.floor(batch.length / 2)));
+            page.batchLimit = Math.min(page.batchLimit || s.maxBatchItems, batchLimit);
+          } else batchAllowed = false;
+          // Deliver and recover in source order. Retry only complete failed
+          // paragraphs, retaining the same validation and original fallback.
+          for (let i = 0; i < batch.length;) {
+            if (accepted[i]) {
+              accept(accepted[i]); advance(K.documentLength(batch[i])); i++;
+            } else {
+              const start = i;
+              while (i < batch.length && !accepted[i]) i++;
+              await flush(batch.slice(start, i));
+            }
+          }
           return;
         }
       }
@@ -693,6 +747,7 @@ async function handle(message, sender) {
   // Firefox also sets sender.tab for our own settings/history tabs.
   if (sender.tab && !sender.url?.startsWith(browser.runtime.getURL(""))) throw new Error("許可されていない操作です。");
   if (message.type === "errorHistory") return errorHistory();
+  if (message.type === "serverStatus") return serverStatus();
   if (message.type === "clearErrors") {
     await errorOperation(() => browser.storage.local.set({ translationErrors: [] })); return {};
   }
@@ -702,16 +757,17 @@ async function handle(message, sender) {
     const signal = new AbortController().signal, startedAt = Date.now();
     const probe = { ...s, retryTransient: false, timeoutSeconds: Math.min(s.timeoutSeconds, 15) };
     await counter(probe, signal)("Hello.");
-    const result = await generate(probe, "Hello.", { source: s.source, target: s.target, domain: new URL(K.endpoint(s)).origin }, signal);
+    const result = await generate(probe, "Hello.", { source: "en", target: "ja", domain: new URL(K.endpoint(s)).origin }, signal);
     if (result.truncated) throw new Error("接続できましたが、テスト翻訳が生成上限に達しました。");
     return { milliseconds: Date.now() - startedAt };
   }
   if (message.type === "clearCache") { clearCache(); return {}; }
   if (message.type === "preferences") {
     const s = await getSettings();
-    return { source: s.source, target: s.target, ...K.contentPreferences(s) };
+    return K.contentPreferences(s);
   }
   if (message.type === "page") {
+    if (["start", "selection"].includes(message.action)) await requireServer();
     await ensureContent(message.tabId);
     return browser.tabs.sendMessage(message.tabId, { type: message.action, source: message.source, target: message.target, hoverEnabled: message.hoverEnabled }, { frameId: 0 });
   }
@@ -722,6 +778,7 @@ browser.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && changes.settings) {
     settingsPromise = null;
     clearCache();
+    errorHistory().catch(() => {});
     refreshContentPreferences().catch(() => {});
   }
 });
@@ -748,12 +805,13 @@ browser.tabs.onUpdated.addListener((tabId, change, tab) => {
 browser.contextMenus.create({ id: "kotoba-selection", title: "選択したテキストを翻訳", contexts: ["selection"], documentUrlPatterns: ["http://*/*", "https://*/*"] });
 browser.contextMenus.create({ id: "kotoba-page", title: "ページ翻訳／停止", contexts: ["page"], documentUrlPatterns: ["http://*/*", "https://*/*"] });
 browser.contextMenus.create({ id: "kotoba-restore", title: "原文に戻す", contexts: ["page"], documentUrlPatterns: ["http://*/*", "https://*/*"] });
-async function pageAction(command, tab, s) {
+async function pageAction(command, tab) {
   await ensureContent(tab.id);
   const state = await browser.tabs.sendMessage(tab.id, { type: "status" }, { frameId: 0 });
   const type = command === "translate-page" ? state.running ? "stop" : "start"
     : command === "translate-selection" ? "selection" : "restore";
-  const result = await browser.tabs.sendMessage(tab.id, { type, source: state.source || s.source, target: state.target || s.target }, { frameId: 0 });
+  if (["start", "selection"].includes(type)) await requireServer();
+  const result = await browser.tabs.sendMessage(tab.id, { type, source: state.source, target: state.target }, { frameId: 0 });
   if (result?.error) throw new Error(result.error);
   await browser.browserAction.setBadgeText({ tabId: tab.id, text: "" });
   await browser.browserAction.setTitle({ tabId: tab.id, title: "Kotoba 翻訳" });
@@ -763,11 +821,12 @@ browser.contextMenus.onClicked.addListener(async (info, tab) => {
   try {
     const s = await getSettings();
     if (info.menuItemId !== "kotoba-selection") {
-      await pageAction(info.menuItemId === "kotoba-page" ? "translate-page" : "restore-page", tab, s);
+      await pageAction(info.menuItemId === "kotoba-page" ? "translate-page" : "restore-page", tab);
       return;
     }
     await ensureContent(tab.id, info.frameId || 0);
-    const result = await browser.tabs.sendMessage(tab.id, { type: "selection", text: info.selectionText, defaults: { source: s.source, target: s.target }, concurrency: s.concurrency }, { frameId: info.frameId || 0 });
+    await requireServer();
+    const result = await browser.tabs.sendMessage(tab.id, { type: "selection", text: info.selectionText, concurrency: s.concurrency }, { frameId: info.frameId || 0 });
     if (result?.error) throw new Error(result.error);
     await browser.browserAction.setBadgeText({ tabId: tab.id, text: "" });
     await browser.browserAction.setTitle({ tabId: tab.id, title: "Kotoba 翻訳" });
@@ -782,7 +841,7 @@ browser.commands.onCommand.addListener(async (command, tab) => {
     if (!["translate-page", "translate-selection", "restore-page"].includes(command)) return;
     const s = await getSettings();
     if (!s.keyboardShortcuts || !tab?.id || !/^https?:/.test(tab.url || "")) return;
-    await pageAction(command, tab, s);
+    await pageAction(command, tab);
   } catch (error) {
     if (tab?.id) {
       await browser.browserAction.setBadgeText({ tabId: tab.id, text: "!" });
@@ -790,3 +849,7 @@ browser.commands.onCommand.addListener(async (command, tab) => {
     }
   }
 });
+
+// Sweep persisted records on startup and while the background page is idle.
+errorHistory().catch(() => {});
+setInterval(() => errorHistory().catch(() => {}), 60000);

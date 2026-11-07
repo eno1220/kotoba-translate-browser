@@ -19,6 +19,23 @@ function error(value) {
   }
 }
 let running = false, busy = false;
+let serverAvailable = false, nextServerCheck = 0;
+async function checkServer() {
+  if (Date.now() < nextServerCheck) return;
+  const field = $("server-status");
+  try {
+    const result = await browser.runtime.sendMessage({ type: "serverStatus" });
+    if (result.error) throw new Error(result.error);
+    serverAvailable = result.available;
+    field.hidden = !result.enabled;
+    field.classList.toggle("error", !serverAvailable);
+    field.textContent = serverAvailable ? "APIサーバーに接続できます" : result.message;
+  } catch (e) {
+    serverAvailable = false; field.hidden = false; field.classList.add("error"); field.textContent = e.message;
+  }
+  nextServerCheck = Date.now() + 5000;
+  controls();
+}
 async function page(action) {
   const result = await browser.runtime.sendMessage({ type: "page", tabId, action, source: $("source").value, target: $("target").value, hoverEnabled: $("hover").checked });
   if (result.error) { const e = new Error(result.error); e.code = result.errorCode; throw e; }
@@ -48,8 +65,8 @@ function render(state) {
   controls();
 }
 function controls() {
-  $("start").disabled = !ready || busy;
-  $("selection").disabled = !ready || busy;
+  $("start").disabled = !ready || busy || !running && !serverAvailable;
+  $("selection").disabled = !ready || busy || !serverAvailable;
   $("restore").disabled = !ready || busy || !lastState?.translated && !running;
   $("source").disabled = !ready || busy || running; $("target").disabled = !ready || busy || running;
   $("swap").disabled = !ready || busy || running || $("source").value === "auto";
@@ -63,12 +80,13 @@ async function refresh() {
   if (polling || closed || document.hidden || busy || !ready) return;
   polling = true;
   const version = revision;
-  try { const state = await page("status"); if (version === revision) render(state); }
+  try { const [state] = await Promise.all([page("status"), checkServer()]); if (version === revision) render(state); }
   catch (e) { if (version === revision) error(e); }
   finally { polling = false; scheduleRefresh(); }
 }
 async function perform(action) {
   if (!ready || busy) return;
+  if (["start", "selection"].includes(action) && !serverAvailable) return;
   busy = true; revision++; clearTimeout(timer); controls();
   try {
     const state = await page(action);
@@ -83,10 +101,10 @@ async function init() {
     if (prefs.error) throw new Error(prefs.error);
     $("batch-translation").checked = prefs.batchTranslation;
     $("main-content-only").checked = prefs.mainContentOnly;
-    $("source").value = prefs.source; $("target").value = prefs.target;
     if (!/^https?:\/\//.test(tab.url || "")) throw new Error("通常のWebページで開いてください。Firefoxの内部ページやPDFでは利用できません。");
-    const state = await page("status");
-    $("source").value = state.source || prefs.source; $("target").value = state.target || prefs.target;
+    $("server-status").hidden = false; $("server-status").textContent = "APIサーバーを確認しています…";
+    const [state] = await Promise.all([page("status"), checkServer()]);
+    $("source").value = state.source; $("target").value = state.target;
     ready = true; render(state); scheduleRefresh();
   } catch (e) { error(e); controls(); }
 }
