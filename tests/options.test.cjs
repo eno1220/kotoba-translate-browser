@@ -109,3 +109,17 @@ test('optional server check saves its custom health path and switch', async t =>
   e.edit('serverCheck', true); e.edit('healthPath', '/ready'); await e.submit();
   assert.equal(e.settings().serverCheck, true); assert.equal(e.settings().healthPath, '/ready');
 });
+
+
+test('cache capacity loads its default, saves MiB as an integer and validates bounds', async () => {
+  const e = await options();
+  assert.equal(e.field('cacheMiB').value, '8');
+  e.edit('cacheMiB', '32'); await e.submit();
+  assert.equal(e.settings().cacheMiB, 32);
+  for (const value of ['0', '1025', '1.5']) {
+    e.edit('cacheMiB', value); await e.submit();
+    assert.equal(e.writes(), 1);
+    assert.match(e.$('status').textContent, /cacheMiB/);
+  }
+  e.w.close();
+});

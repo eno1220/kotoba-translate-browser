@@ -4,6 +4,7 @@ const vm = require("node:vm");
 const { readFileSync } = require("node:fs");
 function background(responder, settings = {}, storage = {}) {
   let listener, commandListener, menuListener, settingsChanged, active = 0, maximum = 0, reads = 0, pageState = {};
+  let removed, updated;
   let now = Date.now();
   const calls = [], intervals = [];
   const progress = [];
@@ -16,7 +17,7 @@ function background(responder, settings = {}, storage = {}) {
     browser: {
       runtime: { getManifest: () => ({ version: "0.1.3" }), id: "test", getURL: path => `moz-extension://test/${path}`, onMessage: { addListener: fn => listener = fn } },
       storage: { local: { get: async key => { if (key === "settings") reads++; return key === "settings" ? { settings } : structuredClone(storage); }, set: async values => Object.assign(storage, structuredClone(values)) }, onChanged: { addListener: fn => settingsChanged = fn } },
-      tabs: { onRemoved: event, onUpdated: event, query: async () => [], sendMessage: async (tabId, message, options) => { progress.push(message); pageMessages.push({ tabId, message, options }); return message.type === "status" ? pageState : { protocol: 6 }; } },
+      tabs: { onRemoved: { addListener: fn => removed = fn }, onUpdated: { addListener: fn => updated = fn }, query: async () => [], sendMessage: async (tabId, message, options) => { progress.push(message); pageMessages.push({ tabId, message, options }); return message.type === "status" ? pageState : { protocol: 6 }; } },
       browserAction: { setBadgeText: async value => badges.push(value), setTitle: async value => titles.push(value), setIcon: async value => icons.push(value) },
       commands: { onCommand: { addListener: fn => commandListener = fn } }, contextMenus: { create: value => menus.push(value), onClicked: { addListener: fn => menuListener = fn } }
     },
@@ -38,6 +39,8 @@ function background(responder, settings = {}, storage = {}) {
     menu: (info, tab = { id: 1, url: "https://example.org" }) => menuListener(info, tab),
     command: (name, tab = { id: 1, url: "https://example.org" }) => commandListener(name, tab),
     content: message => listener(message, { id: "test", tab: { id: 1 }, frameId: 0, url: "http://example.org" }),
+    closeTab: tabId => removed(tabId),
+    navigate: (tabId, url, extra = {}) => updated(tabId, { url }, { id: tabId, url, ...extra }),
     tick: milliseconds => now += milliseconds,
     sweep: async () => { for (const fn of intervals) await fn(); },
     configure: values => { settings = { ...settings, ...values }; settingsChanged({ settings: { newValue: settings } }, "local"); },
@@ -335,6 +338,7 @@ test("page cache reuses validated paragraphs across tabs and mixed batches witho
   assert.equal(hit.documents[0].document[0].text, "最初 sentence.");
   assert.equal(b.calls.length, 2);
   assert.equal(b.progress.at(-1).completed, b.progress.at(-1).total);
+  b.closeTab(1); b.closeTab(2);
   b.tick(11 * 60000);
   await b.send([], { document });
   assert.equal(b.calls.length, 3);
@@ -516,6 +520,7 @@ test('cache history groups a page run, measures API speed, and shrinks with live
   await b.send([], { document: first, sessionId: 'cache-hit' });
   assert.equal((await b.control({ type: 'cacheHistory' })).rows.length, 1);
   assert.equal(b.calls.length, 2);
+  b.closeTab(1);
   b.tick(59801);
   data = await b.control({ type: 'cacheHistory' });
   assert.equal(data.rows[0].paragraphs, 1);
@@ -969,4 +974,52 @@ test('health checks share a minute of success and back off repeated failures up 
   assert.equal(b.calls.length, count);
   b.tick(59999); await b.sweep(); assert.equal(b.calls.length, count);
   b.tick(1); await b.sweep(); assert.equal(b.calls.length, count + 1);
+});
+
+
+test('open and discarded tabs keep expired translations until the last URL owner leaves', async () => {
+  const b = background(() => completion('訳文'));
+  const document = [{ text: 'Keep this page.' }];
+  await b.send([], { document });
+  await b.send([], { type: 'restoreCachedPage' }, 2);
+  b.tick(31 * 60000); await b.sweep();
+  assert.equal((await b.control({ type: 'cacheHistory' })).rows.length, 1);
+  // Discarding does not navigate away; fragments also refer to the same document.
+  await b.navigate(2, 'https://example.org/private?q=secret#section', { discarded: true });
+  await b.navigate(1, 'about:blank');
+  assert.equal((await b.control({ type: 'cacheHistory' })).rows.length, 1);
+  b.closeTab(2);
+  assert.equal((await b.control({ type: 'cacheHistory' })).bytes, 0);
+  await b.send([], { type: 'restoreCachedPage' }, 3);
+  await b.send([], { document }, 3);
+  assert.equal(b.calls.length, 2);
+});
+
+test('leaving a page retains only the remainder of its original TTL and private tabs do not pin it', async () => {
+  const b = background(() => completion('訳文'));
+  await b.send([], { document: [{ text: 'Original deadline.' }] });
+  b.tick(20 * 60000);
+  await b.send([], { type: 'restoreCachedPage' }, 2, { tab: { id: 2, incognito: true } });
+  b.closeTab(1);
+  assert.equal((await b.control({ type: 'cacheHistory' })).rows.length, 1);
+  b.tick(10 * 60000); await b.sweep();
+  assert.equal((await b.control({ type: 'cacheHistory' })).rows.length, 0);
+});
+
+test('configured byte limit evicts inactive pages first and bounds open pages too', async () => {
+  const b = background(() => completion('訳'.repeat(180000)), { cacheMiB: 1 });
+  const add = (id) => b.send([], { document: [{ text: `Page ${id}.` }] }, id, { url: `https://example.org/${id}` });
+  await add(1); await add(2);
+  b.closeTab(2);
+  await add(3);
+  let data = await b.control({ type: 'cacheHistory' });
+  assert.deepEqual(Array.from(data.rows, row => row.url).sort(), ['https://example.org/1', 'https://example.org/3']);
+  assert.equal(data.maxBytes, 1024 * 1024); assert.ok(data.bytes <= data.maxBytes);
+  await add(4);
+  data = await b.control({ type: 'cacheHistory' });
+  assert.deepEqual(Array.from(data.rows, row => row.url).sort(), ['https://example.org/3', 'https://example.org/4']);
+  assert.ok(data.bytes <= data.maxBytes);
+  const oversized = background(() => completion('訳'.repeat(600000)), { cacheMiB: 1 });
+  await oversized.send([], { document: [{ text: 'Oversized.' }] });
+  assert.equal((await oversized.control({ type: 'cacheHistory' })).bytes, 0);
 });

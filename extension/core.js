@@ -9,7 +9,7 @@ globalThis.Kotoba = (() => {
     batchTranslation: true, concurrency: 1, inputTokens: 6000, contextTokens: 32768, timeoutSeconds: 180,
     maxBatchItems: 32, batchStartItems: 4, batchStartTokens: 1200, batchGrowthFactor: 2, batchTargetSeconds: 8,
     readingOrder: true, progressiveBatching: true, batchRecovery: true, mergeSections: true, deduplicateRepetitions: true,
-    tokenizer: "bytes", tokenizePath: "/tokenize", form: "", cacheMinutes: 30, errorMinutes: 3600,
+    tokenizer: "bytes", tokenizePath: "/tokenize", form: "", cacheMinutes: 30, cacheMiB: 8, errorMinutes: 3600,
     responsiveScan: true, prioritizeVisible: true, prioritizeContent: true, semanticBatching: true, adaptiveScheduling: true, shareInFlight: true, relevantGlossary: true, streamTranslation: false, mainContentOnly: false,
     selectionButton: false, keyboardShortcuts: true, copyButton: true,
     focusOriginal: true, pageProgress: true, announceProgress: true, hoverEnabled: true, retryTransient: false
@@ -29,7 +29,7 @@ globalThis.Kotoba = (() => {
     for (const name of ["path", "tokenizePath", "healthPath"]) {
       if (!s[name].startsWith("/") || s[name].startsWith("//") || /[?#]/.test(s[name])) throw new Error("APIパスは / から始まるパスを指定してください。");
     }
-    for (const [key, min, max] of [["concurrency", 1, 8], ["inputTokens", 128, 24000], ["contextTokens", 8192, 32768], ["timeoutSeconds", 10, 1800], ["cacheMinutes", 0, 1440], ["errorMinutes", 1, Number.MAX_SAFE_INTEGER], ["maxBatchItems", 1, 256], ["batchStartItems", 1, 256], ["batchStartTokens", 128, 24000], ["batchGrowthFactor", 2, 4], ["batchTargetSeconds", 1, 60]]) {
+    for (const [key, min, max] of [["concurrency", 1, 8], ["inputTokens", 128, 24000], ["contextTokens", 8192, 32768], ["timeoutSeconds", 10, 1800], ["cacheMinutes", 0, 1440], ["cacheMiB", 1, 1024], ["errorMinutes", 1, Number.MAX_SAFE_INTEGER], ["maxBatchItems", 1, 256], ["batchStartItems", 1, 256], ["batchStartTokens", 128, 24000], ["batchGrowthFactor", 2, 4], ["batchTargetSeconds", 1, 60]]) {
       s[key] = Number(s[key]);
       if (!Number.isInteger(s[key]) || s[key] < min || s[key] > max) throw new Error(`${key} は ${min}〜${max} の整数で指定してください。`);
     }

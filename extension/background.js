@@ -60,7 +60,31 @@ function diagnosticRecorder(s, page, signal) {
 // Session-only, bounded paragraph cache; persistent error records are separate.
 const translationCache = new Map();
 const histories = new Map();
-const CACHE_BYTES = 8 * 1024 * 1024, CACHE_ENTRIES = 2000;
+// Track current URLs, including background/discarded tabs, without retaining documents.
+const cacheTabs = new Map(), openCacheURLs = new Map();
+let cacheLimitBytes = K.DEFAULTS.cacheMiB * 1024 * 1024;
+function trackCacheTab(tabId, value, privateTab = false) {
+  pruneCache(); // A newly opened tab must not revive an already expired entry.
+  const previous = cacheTabs.get(tabId);
+  const url = !privateTab && /^https?:/.test(value || "") ? documentURL(value) : undefined;
+  if (previous === url) return;
+  if (previous) {
+    const count = openCacheURLs.get(previous) - 1;
+    if (count) openCacheURLs.set(previous, count); else openCacheURLs.delete(previous);
+    cacheTabs.delete(tabId);
+  }
+  if (url) { cacheTabs.set(tabId, url); openCacheURLs.set(url, (openCacheURLs.get(url) || 0) + 1); }
+  pruneCache();
+}
+function expiredCache(entry, now = Date.now()) { return entry.expiresAt <= now && !openCacheURLs.has(entry.url); }
+function trimCache(incoming = 0) {
+  // Map order is LRU. Prefer evicting pages without an open tab, then bound all data.
+  for (const [key, entry] of translationCache) {
+    if (cacheBytes + incoming <= cacheLimitBytes) return;
+    if (!openCacheURLs.has(entry.url)) removeCached(key);
+  }
+  while (translationCache.size && cacheBytes + incoming > cacheLimitBytes) removeCached(translationCache.keys().next().value);
+}
 let cacheBytes = 0, cacheRevision = 0;
 const signatures = new WeakMap();
 function clearCache() { translationCache.clear(); histories.clear(); cacheBytes = 0; cacheRevision++; }
@@ -71,7 +95,7 @@ function removeCached(key) {
 }
 function pruneCache() {
   const now = Date.now();
-  for (const [key, entry] of translationCache) if (entry.expiresAt <= now) removeCached(key);
+  for (const [key, entry] of translationCache) if (expiredCache(entry, now)) removeCached(key);
 }
 setInterval(pruneCache, 60000);
 function cacheSignature(s) {
@@ -82,7 +106,7 @@ function cacheKey(url, source, target, input) { return JSON.stringify([url, sour
 function cachedParagraph(s, url, source, target, document) {
   const input = JSON.stringify(document), key = cacheKey(url, source, target, input);
   const entry = translationCache.get(key);
-  if (entry?.expiresAt <= Date.now()) { removeCached(key); return null; }
+  if (entry && expiredCache(entry)) { removeCached(key); return null; }
   if (!entry || entry.signature !== cacheSignature(s)) return null;
   // Validate cached output against the current paragraph as well as the original response.
   const result = K.parseDocument(K.serializeDocument(entry.document), document);
@@ -93,10 +117,10 @@ function cacheParagraph(s, url, source, target, original, document, history) {
   const input = JSON.stringify(original), key = cacheKey(url, source, target, input);
   const signature = cacheSignature(s);
   const size = 2 * (key.length + input.length + JSON.stringify(document).length + signature.length + url.length + source.length + target.length);
-  if (size > CACHE_BYTES) return;
+  if (size > cacheLimitBytes) return;
   if (translationCache.has(key)) removeCached(key);
-  if (cacheBytes + size > CACHE_BYTES || translationCache.size >= CACHE_ENTRIES) pruneCache();
-  while (cacheBytes + size > CACHE_BYTES || translationCache.size >= CACHE_ENTRIES) removeCached(translationCache.keys().next().value);
+  pruneCache();
+  trimCache(size);
   translationCache.set(key, { url, source, target, input, document, signature, expiresAt: Date.now() + s.cacheMinutes * 60000, size,
     characters: K.documentLength(original), history });
   if (history) { history.cached++; histories.set(history.key, history); }
@@ -130,10 +154,11 @@ function cacheHistory() {
   }
   return { rows: [...rows.values()].sort((a, b) => b.finishedAt - a.finishedAt),
     totals: { pages: totals.pages, paragraphs: totals.paragraphs, characters: totals.characters, milliseconds: totals.milliseconds, ...historyMetrics(totals, totals.milliseconds) },
-    bytes: cacheBytes, maxBytes: CACHE_BYTES };
+    bytes: cacheBytes, maxBytes: cacheLimitBytes };
 }
 async function restoreCachedPage(sender) {
   if (!sender.tab || sender.frameId !== 0) return {};
+  trackCacheTab(sender.tab.id, sender.url, sender.tab.incognito);
   const revision = cacheRevision;
   const s = await getSettings();
   // The optional selection launcher needs listeners even before a manual translation.
@@ -162,6 +187,7 @@ async function getSettings() {
   const pending = settingsPromise, value = await pending;
   // Ignore a storage read that completed after an options change.
   if (pending !== settingsPromise) return getSettings();
+  cacheLimitBytes = value.cacheMiB * 1024 * 1024;
   if (queue.limit !== value.concurrency) queue.setLimit(value.concurrency);
   return value;
 }
@@ -696,6 +722,7 @@ async function translate(message, sender) {
     if (inputs) {
       const useCache = s.cacheMinutes > 0 && !sender.tab.incognito;
       const url = documentURL(sender.url);
+      if (sender.frameId === 0) trackCacheTab(sender.tab.id, sender.url, sender.tab.incognito);
       const results = inputs.map(input => {
         const hit = useCache && cachedParagraph(saved, url, page.source, page.target, input);
         if (hit) advance(K.documentLength(input));
@@ -783,7 +810,7 @@ async function handle(message, sender) {
   if (message.type === "clearErrors") {
     await errorOperation(() => browser.storage.local.set({ translationErrors: [] })); return {};
   }
-  if (message.type === "cacheHistory") return cacheHistory();
+  if (message.type === "cacheHistory") { await getSettings(); return cacheHistory(); }
   if (message.type === "testConnection") {
     const s = K.settings(message.settings);
     const signal = new AbortController().signal, startedAt = Date.now();
@@ -825,11 +852,12 @@ async function refreshContentPreferences() {
     } catch { /* Most tabs have no content script until requested. */ }
   }));
 }
-browser.tabs.onRemoved.addListener(tabId => abortTab(tabId));
+browser.tabs.onRemoved.addListener(tabId => { abortTab(tabId); trackCacheTab(tabId); });
 browser.tabs.onUpdated.addListener((tabId, change, tab) => {
   // Firefox also emits updates for history.replaceState and fragment navigation.
   // Full document unloads cancel through content.js's pagehide handler.
   if (!change.url) return;
+  trackCacheTab(tabId, change.url, tab?.incognito);
   const next = documentURL(change.url);
   for (const job of jobs.values()) if (job.tabId === tabId && job.pageURL !== next) job.controller.abort();
   // Also handles same-document back/forward navigation on sites using History API.

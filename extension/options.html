@@ -47,10 +47,11 @@
       </details>
     </fieldset>
     <fieldset><legend>キャッシュ</legend>
-      <label>保存期間（分）<input name="cacheMinutes" type="number" min="0" max="1440" required><small>0で無効。再訪時に一致する段落の訳文を復元します。</small></label>
+      <label>保存期限（翻訳時刻から・分）<input name="cacheMinutes" type="number" min="0" max="1440" required><small>翻訳時刻からの期限。0で無効。開いているタブのページは期限を過ぎても保持します。</small></label>
+      <label>容量上限（MiB）<input name="cacheMiB" type="number" min="1" max="1024" step="1" required><small>全タブ共通、既定8MiB。開いていないページから優先して整理します。上限を超える場合は開いているページも対象です。</small></label>
       <button type="button" id="clear-cache">キャッシュと履歴を削除</button>
       <details class="help"><summary>保存内容と削除について</summary>
-        <p><small>原文・訳文と履歴をメモリに最大約8MiB保存します。期限切れ・設定保存・Firefox終了・拡張の再読み込みで消えます。プライベートウィンドウでは保存しません。</small></p>
+        <p><small>原文・訳文と履歴をメモリに保存します。最後のタブを閉じるか別のURLへ移ると、翻訳時刻から期限を過ぎた分を削除します。容量は文字列サイズの概算で、Firefox全体のメモリ使用量ではありません。設定保存・Firefox終了・拡張の再読み込みでも消えます。プライベートウィンドウでは保存しません。</small></p>
       </details>
     </fieldset>
     <fieldset><legend>エラー記録</legend>
