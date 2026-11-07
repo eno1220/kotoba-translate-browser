@@ -174,9 +174,37 @@ function waitToRetry(milliseconds, signal) {
   });
 }
 // This opt-in probe never calls inference or tokenization endpoints.
-async function serverStatus() {
+let healthCheck, healthSettings, healthResult, healthCheckedAt = 0, healthFailures = 0;
+async function serverStatus(force = false) {
   const s = await getSettings();
-  if (!s.serverCheck) return { enabled: false, available: true };
+  if (healthSettings === s) {
+    if (healthCheck) return healthCheck;
+    // Explicit actions bypass backoff, but share a very recent result to avoid
+    // checking twice between the popup/menu and the selection panel.
+    if (healthResult && Date.now() < (force ? healthCheckedAt + 5000 : healthResult.nextCheckAt)) return healthResult;
+  } else healthFailures = 0;
+  healthSettings = s;
+  const pending = (async () => {
+    const status = s.serverCheck ? await probeServer(s) : { enabled: false, available: true };
+    if (s !== await getSettings()) return serverStatus(force);
+    healthFailures = status.available ? 0 : healthFailures + 1;
+    const interval = status.available ? 60000 : Math.min(300000, 30000 * 2 ** Math.min(healthFailures - 1, 4));
+    status.nextCheckAt = Date.now() + interval;
+    const changed = !healthResult || healthResult.available !== status.available || healthResult.enabled !== status.enabled || healthResult.message !== status.message;
+    healthResult = status; healthCheckedAt = Date.now();
+    if (changed) {
+      await browser.browserAction.setIcon({ path: status.available ? "icons/kotoba.svg" : "icons/kotoba-offline.svg" });
+      await browser.browserAction.setTitle({ title: status.available ? "Kotoba 翻訳" : `Kotoba: ${status.message}` });
+      const tabs = await browser.tabs.query({ url: ["http://*/*", "https://*/*"] });
+      await Promise.all(tabs.map(tab => browser.tabs.sendMessage(tab.id, { type: "serverAvailability", available: status.available }).catch(() => {})));
+    }
+    return status;
+  })();
+  healthCheck = pending;
+  try { return await pending; }
+  finally { if (healthCheck === pending) healthCheck = null; }
+}
+async function probeServer(s) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 3000);
   try {
@@ -194,8 +222,10 @@ async function serverStatus() {
   } finally { clearTimeout(timer); }
 }
 async function requireServer() {
-  const status = await serverStatus();
-  if (!status.available) throw new Error(status.message);
+  const status = await serverStatus(true);
+  if (!status.available) {
+    const error = new Error(status.message); error.code = "server_unavailable"; throw error;
+  }
 }
 function abortTab(tabId, frameId) {
   for (const job of jobs.values()) {
@@ -738,6 +768,8 @@ async function handle(message, sender) {
     const s = await getSettings();
     return K.contentPreferences(s);
   }
+  // Expose only availability, never connection settings or credentials.
+  if (message.type === "selectionAvailability" && sender.tab) return serverStatus(message.force === true);
   if (message.type === "copyText" && sender.tab) {
     if (!(await getSettings()).copyButton) throw new Error("コピーボタンは設定で無効になっています。");
     if (typeof message.text !== "string" || message.text.length > 2000000) throw new Error("コピーする文章が不正です。");
@@ -747,7 +779,7 @@ async function handle(message, sender) {
   // Firefox also sets sender.tab for our own settings/history tabs.
   if (sender.tab && !sender.url?.startsWith(browser.runtime.getURL(""))) throw new Error("許可されていない操作です。");
   if (message.type === "errorHistory") return errorHistory();
-  if (message.type === "serverStatus") return serverStatus();
+  if (message.type === "serverStatus") return serverStatus(message.force === true);
   if (message.type === "clearErrors") {
     await errorOperation(() => browser.storage.local.set({ translationErrors: [] })); return {};
   }
@@ -780,6 +812,7 @@ browser.storage.onChanged.addListener((changes, area) => {
     clearCache();
     errorHistory().catch(() => {});
     refreshContentPreferences().catch(() => {});
+    serverStatus(true).catch(() => {});
   }
 });
 async function refreshContentPreferences() {
@@ -831,6 +864,10 @@ browser.contextMenus.onClicked.addListener(async (info, tab) => {
     await browser.browserAction.setBadgeText({ tabId: tab.id, text: "" });
     await browser.browserAction.setTitle({ tabId: tab.id, title: "Kotoba 翻訳" });
   } catch (error) {
+    if (error.code === "server_unavailable") {
+      await browser.tabs.sendMessage(tab.id, { type: "serverUnavailable", message: error.message }, { frameId: info.frameId || 0 }).catch(() => {});
+      return;
+    }
     // Firefox's restricted pages reject injection. Keep a visible indication.
     await browser.browserAction.setBadgeText({ tabId: tab.id, text: "!" });
     await browser.browserAction.setTitle({ tabId: tab.id, title: `Kotoba: ${error.message}` });
@@ -844,6 +881,10 @@ browser.commands.onCommand.addListener(async (command, tab) => {
     await pageAction(command, tab);
   } catch (error) {
     if (tab?.id) {
+      if (error.code === "server_unavailable") {
+        await browser.tabs.sendMessage(tab.id, { type: "serverUnavailable", message: error.message }, { frameId: 0 }).catch(() => {});
+        return;
+      }
       await browser.browserAction.setBadgeText({ tabId: tab.id, text: "!" });
       await browser.browserAction.setTitle({ tabId: tab.id, title: `Kotoba: ${error.message}` });
     }
@@ -853,3 +894,5 @@ browser.commands.onCommand.addListener(async (command, tab) => {
 // Sweep persisted records on startup and while the background page is idle.
 errorHistory().catch(() => {});
 setInterval(() => errorHistory().catch(() => {}), 60000);
+serverStatus().catch(() => {});
+setInterval(() => serverStatus().catch(() => {}), 30000);

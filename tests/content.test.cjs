@@ -23,11 +23,13 @@ function setup(html, translator = translateTree, preferences = {}) {
   };
   const calls = [];
   const copied = [];
+  let availability = { enabled: false, available: true };
   let listener;
   w.browser = { runtime: {
     onMessage: { addListener: fn => listener = fn },
     sendMessage: async msg => {
       if (msg.type === "contentPreferences") return { concurrency: 1, prioritizeContent: false, semanticBatching: false, adaptiveScheduling: false, readingOrder: false, progressiveBatching: false, batchRecovery: false, maxBatchItems: 256, ...preferences };
+      if (msg.type === "selectionAvailability") return typeof availability === "function" ? availability(msg) : availability;
       if (msg.type === "translate") {
         calls.push(msg);
         if (msg.parts) return { parts: msg.parts.map(text => `訳:${text}`) };
@@ -49,7 +51,7 @@ function setup(html, translator = translateTree, preferences = {}) {
     }
     throw new Error("translation did not finish");
   }
-  return { dom, w, calls, copied, message, settle, get shadow() { return shadow; } };
+  return { dom, w, calls, copied, message, settle, availability: value => availability = value, get shadow() { return shadow; } };
 }
 
 test("easy Japanese translates Japanese page text and is available for selection translation", async () => {
@@ -984,4 +986,52 @@ test("HTML language determines the initial direction for page and selection tran
       } finally { s.w.close(); }
     }
   }
+});
+
+test('offline checks suppress selection launchers and show only an error notice on explicit translation', async t => {
+  const s = setup('<p>Selected prose.</p>', translateTree, { selectionButton: true });
+  t.after(() => s.w.close());
+  s.w.Range.prototype.getBoundingClientRect = () => ({ top: 20, bottom: 40, left: 10, right: 110, width: 100, height: 20 });
+  const range = s.w.document.createRange(); range.selectNodeContents(s.w.document.querySelector('p'));
+  s.w.getSelection().addRange(range);
+  const select = async () => {
+    s.w.document.dispatchEvent(new s.w.Event('selectionchange'));
+    await new Promise(resolve => setTimeout(resolve, 240));
+  };
+  s.availability({ enabled: true, available: false, message: 'APIサーバーに接続できません。サーバーを起動してください。' });
+  await select();
+  assert.equal(s.shadow?.querySelector('.launcher') || null, null);
+  assert.equal(s.shadow?.querySelector('.panel') || null, null);
+  await s.message({ type: 'selection' }); await new Promise(setImmediate);
+  assert.equal(s.calls.length, 0);
+  assert.match(s.shadow.querySelector('[role="alert"]').textContent, /サーバーを起動/);
+  assert.equal(s.shadow.querySelector('h2').textContent, '翻訳できません');
+  assert.equal(s.shadow.querySelector('.languages'), null);
+  s.shadow.querySelector('[aria-label="閉じる"]').click();
+  s.availability({ enabled: true, available: true }); await select();
+  assert.ok(s.shadow.querySelector('.launcher'));
+  await s.message({ type: 'serverAvailability', available: false });
+  assert.equal(s.shadow.querySelector('.launcher'), null);
+  assert.equal(s.shadow.querySelector('.panel'), null);
+  // The server can go down after the launcher was displayed.
+  await select();
+  const launcher = s.shadow.querySelector('.launcher'); assert.ok(launcher);
+  s.availability({ enabled: true, available: false, message: 'サーバーを起動してください' });
+  launcher.click(); await new Promise(setImmediate);
+  assert.equal(s.calls.length, 0); assert.equal(s.shadow.querySelector('.languages'), null);
+});
+
+test('a delayed health check cannot display a launcher after the selection was cleared', async t => {
+  const s = setup('<p>Selected prose.</p>', translateTree, { selectionButton: true });
+  t.after(() => s.w.close());
+  s.w.Range.prototype.getBoundingClientRect = () => ({ top: 20, bottom: 40, left: 10, right: 110, width: 100, height: 20 });
+  let finish;
+  s.availability(() => new Promise(resolve => finish = resolve));
+  const range = s.w.document.createRange(); range.selectNodeContents(s.w.document.querySelector('p'));
+  s.w.getSelection().addRange(range);
+  s.w.document.dispatchEvent(new s.w.Event('selectionchange'));
+  await new Promise(resolve => setTimeout(resolve, 240));
+  s.w.getSelection().removeAllRanges(); s.w.document.dispatchEvent(new s.w.Event('selectionchange'));
+  finish({ enabled: true, available: true }); await new Promise(setImmediate);
+  assert.equal(s.shadow?.querySelector('.launcher') || null, null);
 });

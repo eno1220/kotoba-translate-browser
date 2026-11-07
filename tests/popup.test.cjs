@@ -91,11 +91,13 @@ test('server availability disables starts, recovers on refresh and never disable
   s.state.translated = 2;
   s.tick(); await settle();
   assert.equal(s.get('restore').disabled, false);
-  s.advance(6000); s.server({ enabled: true, available: true });
+  s.advance(60000); s.server({ enabled: true, available: true });
   s.tick(); await settle();
   assert.equal(s.get('start').disabled, false);
   assert.equal(s.get('selection').disabled, false);
-  s.state.running = true; s.advance(6000);
+  assert.equal(s.get('server-status').hidden, true);
+  assert.equal(s.get('server-status').textContent, '');
+  s.state.running = true; s.advance(60000);
   s.server({ enabled: true, available: false, message: 'offline' });
   s.tick(); await settle();
   assert.equal(s.get('start').disabled, false);
@@ -104,4 +106,25 @@ test('server availability disables starts, recovers on refresh and never disable
   s.get('start').click(); await settle();
   assert.equal(s.calls.at(-1), 'stop');
   assert.equal(s.get('start').disabled, true);
+});
+
+test('offline popup follows the server deadline and lets the user explicitly recheck', async t => {
+  const s = setup(t);
+  s.server({ enabled: true, available: false, message: 'サーバーを起動してください', nextCheckAt: s.w.Date.now() + 300000 });
+  await settle();
+  assert.equal(s.get('recheck-server').hidden, false);
+  const count = s.serverChecks();
+  for (let i = 0; i < 6; i++) {
+    s.advance(5000); s.tick(); await settle();
+  }
+  assert.equal(s.serverChecks(), count);
+  let finish;
+  s.server(() => new Promise(resolve => finish = resolve));
+  s.get('recheck-server').click(); await settle();
+  assert.equal(s.get('recheck-server').disabled, true);
+  finish({ enabled: true, available: true, nextCheckAt: s.w.Date.now() + 60000 }); await settle();
+  assert.equal(s.serverChecks(), count + 1);
+  assert.equal(s.get('recheck-server').hidden, true);
+  assert.equal(s.get('server-status').hidden, true);
+  assert.equal(s.get('start').disabled, false);
 });

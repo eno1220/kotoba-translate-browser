@@ -982,12 +982,21 @@
     }, 0);
   });
 
-  function clearLauncher() { clearTimeout(launcherTimer); launcher?.remove(); launcher = null; }
+  function serverUnavailable(message) {
+    clearLauncher();
+    const node = box("翻訳できません");
+    const notice = document.createElement("p"); notice.className = "error"; notice.setAttribute("role", "alert");
+    notice.textContent = message || "APIサーバーに接続できません。サーバーを起動してください。";
+    node.append(notice);
+  }
+  let launcherRevision = 0;
+  function clearLauncher() { launcherRevision++; clearTimeout(launcherTimer); launcher?.remove(); launcher = null; }
   let selecting = false;
   function scheduleLauncher() {
     clearLauncher();
     if (!preferences.selectionButton || selecting || panelKind === "selection") return;
-    launcherTimer = setTimeout(() => {
+    const revision = launcherRevision;
+    launcherTimer = setTimeout(async () => {
       if (!preferences.selectionButton || selecting || panelKind === "selection") return;
       const selected = getSelection();
       if (!selected || selected.isCollapsed || !selected.rangeCount || !selected.toString().trim()) return;
@@ -999,7 +1008,12 @@
       }
       const anchor = range.getBoundingClientRect?.();
       if (!anchor || !anchor.width || anchor.bottom <= 0 || anchor.top >= innerHeight) return;
-      const text = selected.toString(); ui();
+      const text = selected.toString();
+      let status;
+      try { status = await browser.runtime.sendMessage({ type: "selectionAvailability" }); }
+      catch { return; }
+      if (status.error || status.available === false || revision !== launcherRevision || !preferences.selectionButton || selecting || panelKind === "selection" || getSelection()?.toString() !== text) return;
+      ui();
       launcher = button("翻訳", () => {
         clearLauncher(); selection({ text, anchor }).catch(error => box("選択範囲を翻訳").append(document.createTextNode(error.message)));
       });
@@ -1022,6 +1036,11 @@
     await readPreferences();
     if (beforePreferences !== generation) return;
     clearLauncher();
+    const status = await browser.runtime.sendMessage({ type: "selectionAvailability", force: true });
+    if (beforePreferences !== generation) return;
+    if (status.error || status.available === false) {
+      serverUnavailable(status.message || status.error); return;
+    }
     if (!state.source) state.source = message.source || pageDirection().source;
     if (!state.target) state.target = message.target || pageDirection().target;
     if (message.source) state.source = message.source;
@@ -1134,6 +1153,8 @@
       }
       if (message.type === "status") return pageState();
       if (message.type === "preferencesChanged") { applyPreferences(message.preferences); return { ok: true }; }
+      if (message.type === "serverAvailability") { if (!message.available) clearLauncher(); return { ok: true }; }
+      if (message.type === "serverUnavailable") { serverUnavailable(message.message); return { ok: true }; }
       if (message.type === "restoreCache") {
         await readPreferences();
         // A pending cache lookup must never override a manual action or a new URL.

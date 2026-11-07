@@ -8,7 +8,7 @@ function background(responder, settings = {}, storage = {}) {
   const calls = [], intervals = [];
   const progress = [];
   const clipboard = [];
-  const menus = [], pageMessages = [], badges = [];
+  const menus = [], pageMessages = [], badges = [], icons = [], titles = [];
   const event = { addListener() {} };
   const context = vm.createContext({
     console, URL, TextEncoder, TextDecoder, AbortController, DOMException, setTimeout, clearTimeout, setInterval: fn => intervals.push(fn), Date: class extends Date { static now() { return now; } }, DOMParser: new (require("jsdom").JSDOM)("").window.DOMParser,
@@ -17,7 +17,7 @@ function background(responder, settings = {}, storage = {}) {
       runtime: { getManifest: () => ({ version: "0.1.3" }), id: "test", getURL: path => `moz-extension://test/${path}`, onMessage: { addListener: fn => listener = fn } },
       storage: { local: { get: async key => { if (key === "settings") reads++; return key === "settings" ? { settings } : structuredClone(storage); }, set: async values => Object.assign(storage, structuredClone(values)) }, onChanged: { addListener: fn => settingsChanged = fn } },
       tabs: { onRemoved: event, onUpdated: event, query: async () => [], sendMessage: async (tabId, message, options) => { progress.push(message); pageMessages.push({ tabId, message, options }); return message.type === "status" ? pageState : { protocol: 6 }; } },
-      browserAction: { setBadgeText: async value => badges.push(value), setTitle: async () => {} },
+      browserAction: { setBadgeText: async value => badges.push(value), setTitle: async value => titles.push(value), setIcon: async value => icons.push(value) },
       commands: { onCommand: { addListener: fn => commandListener = fn } }, contextMenus: { create: value => menus.push(value), onClicked: { addListener: fn => menuListener = fn } }
     },
     fetch: async (url, options) => {
@@ -33,7 +33,7 @@ function background(responder, settings = {}, storage = {}) {
   });
   for (const file of ["core.js", "background.js"]) vm.runInContext(readFileSync(require.resolve(`../extension/${file}`), "utf8"), context);
   return {
-    calls, progress, clipboard, menus, pageMessages, badges, max: () => maximum, reads: () => reads,
+    calls, progress, clipboard, menus, pageMessages, badges, icons, titles, max: () => maximum, reads: () => reads,
     pageState: value => pageState = value,
     menu: (info, tab = { id: 1, url: "https://example.org" }) => menuListener(info, tab),
     command: (name, tab = { id: 1, url: "https://example.org" }) => commandListener(name, tab),
@@ -880,7 +880,7 @@ test('unavailable health checks block starts, but stop and restore remain usable
     b.pageState({ running: true }); await b.menu({ menuItemId: 'kotoba-page' });
     assert.equal(b.pageMessages.at(-1).message.type, 'stop'); assert.equal(b.calls.length, count);
     b.pageState({ running: false }); await b.menu({ menuItemId: 'kotoba-page' });
-    assert.equal(b.badges.at(-1).text, '!');
+    assert.equal(b.pageMessages.at(-1).message.type, 'serverUnavailable');
   }
 });
 
@@ -914,4 +914,59 @@ test('a stalled health request times out without invoking the model or logging a
   assert.equal(result.available, false);
   assert.equal(b.calls.length, 1); assert.equal(b.calls[0].options.signal.aborted, true);
   assert.equal((await b.control({ type: 'errorHistory' })).entries.length, 0);
+});
+
+test('health monitoring grays the toolbar icon, restores it after recovery and makes no requests when disabled', async () => {
+  let online = false;
+  const b = background(() => new Response('', { status: online ? 200 : 503 }), { serverCheck: true });
+  assert.equal((await b.content({ type: 'selectionAvailability' })).available, false);
+  assert.equal(b.icons.at(-1).path, 'icons/kotoba-offline.svg');
+  assert.match(b.titles.at(-1).title, /APIサーバーを利用できません/);
+  const count = b.calls.length;
+  await b.content({ type: 'selectionAvailability' });
+  assert.equal(b.calls.length, count);
+  await b.menu({ menuItemId: 'kotoba-selection', frameId: 4, selectionText: 'Selected prose.' });
+  assert.equal(b.pageMessages.at(-1).message.type, 'serverUnavailable');
+  assert.equal(b.pageMessages.at(-1).options.frameId, 4);
+  assert.equal(b.pageMessages.some(({ message }) => message.type === 'selection'), false);
+  online = true; b.tick(30000); await b.sweep();
+  assert.equal(b.icons.at(-1).path, 'icons/kotoba.svg');
+  assert.equal((await b.content({ type: 'selectionAvailability' })).available, true);
+  online = false; b.tick(60000); await b.sweep();
+  assert.equal(b.icons.at(-1).path, 'icons/kotoba-offline.svg');
+  b.configure({ serverCheck: false });
+  assert.equal((await b.control({ type: 'serverStatus' })).available, true);
+  assert.equal(b.icons.at(-1).path, 'icons/kotoba.svg');
+  const beforeDisabled = b.calls.length;
+  b.tick(5000); await b.sweep();
+  assert.equal(b.calls.length, beforeDisabled);
+});
+
+test('health checks share a minute of success and back off repeated failures up to five minutes', async () => {
+  let online = true;
+  const b = background(() => new Response('', { status: online ? 200 : 503 }), { serverCheck: true });
+  await b.control({ type: 'serverStatus' });
+  assert.equal(b.calls.length, 1);
+  for (let i = 0; i < 11; i++) {
+    b.tick(5000); await b.content({ type: 'selectionAvailability' }); await b.sweep();
+  }
+  assert.equal(b.calls.length, 1);
+  online = false; b.tick(5000); await b.sweep();
+  assert.equal(b.calls.length, 2);
+  for (const delay of [30000, 60000, 120000, 240000, 300000]) {
+    const count = b.calls.length;
+    b.tick(delay - 1); await b.control({ type: 'serverStatus' });
+    assert.equal(b.calls.length, count);
+    b.tick(1); await b.sweep(); assert.equal(b.calls.length, count + 1);
+  }
+  // Explicit reopening/rechecking skips backoff and shares the result with
+  // the subsequent menu and selection-panel checks.
+  online = true; b.tick(5000);
+  assert.equal((await b.control({ type: 'serverStatus', force: true })).available, true);
+  const count = b.calls.length;
+  await b.content({ type: 'selectionAvailability', force: true });
+  await b.control({ type: 'page', tabId: 1, action: 'selection' });
+  assert.equal(b.calls.length, count);
+  b.tick(59999); await b.sweep(); assert.equal(b.calls.length, count);
+  b.tick(1); await b.sweep(); assert.equal(b.calls.length, count + 1);
 });

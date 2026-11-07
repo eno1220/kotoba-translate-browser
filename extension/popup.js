@@ -19,23 +19,31 @@ function error(value) {
   }
 }
 let running = false, busy = false;
-let serverAvailable = false, nextServerCheck = 0;
-async function checkServer() {
-  if (Date.now() < nextServerCheck) return;
+let serverAvailable = false, nextServerCheck = 0, checkingServer = false;
+async function checkServer(force = false) {
+  if (checkingServer || !force && Date.now() < nextServerCheck) return;
+  checkingServer = true;
   const field = $("server-status");
+  $("recheck-server").disabled = true;
+  $("recheck-server").textContent = "確認中…";
   try {
-    const result = await browser.runtime.sendMessage({ type: "serverStatus" });
+    const result = await browser.runtime.sendMessage({ type: "serverStatus", force });
     if (result.error) throw new Error(result.error);
     serverAvailable = result.available;
-    field.hidden = !result.enabled;
+    field.hidden = !result.enabled || serverAvailable;
     field.classList.toggle("error", !serverAvailable);
-    field.textContent = serverAvailable ? "APIサーバーに接続できます" : result.message;
+    field.textContent = serverAvailable ? "" : result.message;
+    $("recheck-server").hidden = !result.enabled || serverAvailable;
+    nextServerCheck = result.nextCheckAt || Date.now() + 60000;
   } catch (e) {
     serverAvailable = false; field.hidden = false; field.classList.add("error"); field.textContent = e.message;
+    $("recheck-server").hidden = false;
+    nextServerCheck = Date.now() + 30000;
   }
-  nextServerCheck = Date.now() + 5000;
+  checkingServer = false; $("recheck-server").disabled = false; $("recheck-server").textContent = "再確認";
   controls();
 }
+$("recheck-server").addEventListener("click", () => checkServer(true));
 async function page(action) {
   const result = await browser.runtime.sendMessage({ type: "page", tabId, action, source: $("source").value, target: $("target").value, hoverEnabled: $("hover").checked });
   if (result.error) { const e = new Error(result.error); e.code = result.errorCode; throw e; }
@@ -103,7 +111,7 @@ async function init() {
     $("main-content-only").checked = prefs.mainContentOnly;
     if (!/^https?:\/\//.test(tab.url || "")) throw new Error("通常のWebページで開いてください。Firefoxの内部ページやPDFでは利用できません。");
     $("server-status").hidden = false; $("server-status").textContent = "APIサーバーを確認しています…";
-    const [state] = await Promise.all([page("status"), checkServer()]);
+    const [state] = await Promise.all([page("status"), checkServer(true)]);
     $("source").value = state.source; $("target").value = state.target;
     ready = true; render(state); scheduleRefresh();
   } catch (e) { error(e); controls(); }
