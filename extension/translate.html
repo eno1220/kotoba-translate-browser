@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="ja">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>文章翻訳 — Kotoba</title><link rel="icon" href="icons/kotoba.svg" type="image/svg+xml"><link rel="stylesheet" href="ui.css"><link rel="stylesheet" href="translate.css"><script src="core.js" defer></script><script src="translate.js" defer></script></head>
+<body class="translator"><main>
+  <header class="page-header">
+    <h1 class="brand"><img src="icons/kotoba.svg" width="30" height="30" alt="">文章翻訳</h1>
+    <nav class="page-nav" aria-label="拡張機能"><a href="translate.html" aria-current="page">文章翻訳</a><a href="options.html">設定</a><a href="dictionary.html">辞書</a><a href="history.html">履歴</a><a href="errors.html">エラー記録</a></nav>
+  </header>
+  <form id="translation-form" aria-label="文章翻訳">
+    <div class="translation-workspace">
+      <section class="text-pane source-pane" aria-label="原文">
+        <div class="pane-header"><label class="sr-only" for="source">原文の言語</label><select id="source"></select><button type="button" id="clear" class="quiet" disabled>クリア</button></div>
+        <label class="sr-only" for="source-text">翻訳する文章</label>
+        <textarea id="source-text" dir="auto" placeholder="翻訳する文章を入力、または貼り付け" maxlength="2000000" autofocus spellcheck="false" aria-describedby="input-count"></textarea>
+        <div class="pane-footer"><span id="input-count">0文字</span><span id="shortcut">Ctrl + Enter で翻訳</span></div>
+      </section>
+      <button type="button" id="swap" class="swap-languages" aria-label="原文と訳文の言語を入れ替える" title="原文と訳文の言語を入れ替える" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h16m-4-4 4 4-4 4M20 16H4m4-4-4 4 4 4"/></svg></button>
+      <section class="text-pane result-pane" aria-label="訳文">
+        <div class="pane-header"><label class="sr-only" for="target">訳文の言語</label><select id="target"></select><button type="button" id="copy" class="quiet" disabled>コピー</button></div>
+        <label class="sr-only" for="result-text">翻訳結果</label>
+        <textarea id="result-text" dir="auto" placeholder="翻訳結果" readonly aria-busy="false"></textarea>
+        <div class="pane-footer"><span id="result-count"></span></div>
+      </section>
+    </div>
+    <div class="translation-actions">
+      <div class="translation-feedback"><p id="status" role="status" aria-live="polite" aria-atomic="true"></p><progress id="progress" max="100" aria-label="原文の処理進捗" hidden></progress></div>
+      <button type="button" id="stop" hidden>停止</button><button type="submit" id="translate" class="primary" disabled>翻訳する</button>
+    </div>
+  </form>
+</main></body></html>

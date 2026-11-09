@@ -150,3 +150,8 @@ button.danger { color:#b42318; }
   .history #summary { margin-inline-start:0; flex-basis:100%; }
   .help .row > label { flex-basis:140px; }
 }
+
+.header-actions { display:flex; align-items:center; gap:8px; }
+.text-translation-link { display:inline-flex; align-items:center; gap:5px; min-height:32px; padding:5px 8px; border-radius:6px; font-size:12px; font-weight:550; text-decoration:none; white-space:nowrap; }
+.text-translation-link:hover { background:#f0f8ff; }
+.text-translation-link svg { flex:none; width:16px; height:16px; fill:none; stroke:currentColor; stroke-width:1.7; stroke-linecap:round; stroke-linejoin:round; }

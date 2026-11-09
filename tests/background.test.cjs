@@ -15,7 +15,7 @@ function background(responder, settings = {}, storage = {}) {
     console, URL, TextEncoder, TextDecoder, AbortController, DOMException, setTimeout, clearTimeout, setInterval: fn => intervals.push(fn), Date: class extends Date { static now() { return now; } }, DOMParser: new (require("jsdom").JSDOM)("").window.DOMParser,
     navigator: { clipboard: { writeText: async text => clipboard.push(text) } },
     browser: {
-      runtime: { getManifest: () => ({ version: "0.1.3" }), id: "test", getURL: path => `moz-extension://test/${path}`, onMessage: { addListener: fn => listener = fn } },
+      runtime: { sendMessage: async message => progress.push(message), getManifest: () => ({ version: "0.1.3" }), id: "test", getURL: path => `moz-extension://test/${path}`, onMessage: { addListener: fn => listener = fn } },
       storage: { local: { get: async key => { if (key === "settings") reads++; return key === "settings" ? { settings } : structuredClone(storage); }, set: async values => Object.assign(storage, structuredClone(values)) }, onChanged: { addListener: fn => settingsChanged = fn } },
       tabs: { onRemoved: { addListener: fn => removed = fn }, onUpdated: { addListener: fn => updated = fn }, query: async () => [], sendMessage: async (tabId, message, options) => { progress.push(message); pageMessages.push({ tabId, message, options }); return message.type === "status" ? pageState : { protocol: 6 }; } },
       browserAction: { setBadgeText: async value => badges.push(value), setTitle: async value => titles.push(value), setIcon: async value => icons.push(value) },
@@ -45,7 +45,7 @@ function background(responder, settings = {}, storage = {}) {
     sweep: async () => { for (const fn of intervals) await fn(); },
     configure: values => { settings = { ...settings, ...values }; settingsChanged({ settings: { newValue: settings } }, "local"); },
     control: message => listener(message, { id: "test" }),
-    extension: message => listener(message, { id: "test", tab: { id: 20 }, url: "moz-extension://test/options.html" }),
+    extension: (message, page = "options.html", tabId = 20) => listener(message, { id: "test", tab: { id: tabId }, frameId: 0, url: `moz-extension://test/${page}` }),
     send: (parts, overrides = {}, tabId = 1, sender = {}) => listener({ type: "translate", protocol: 6, parts, source: "en", target: "ja", ...overrides }, { id: "test", tab: { id: tabId }, frameId: 0, url: "https://example.org/private?q=secret", ...sender })
   };
 }
@@ -1022,4 +1022,27 @@ test('configured byte limit evicts inactive pages first and bounds open pages to
   const oversized = background(() => completion('訳'.repeat(600000)), { cacheMiB: 1 });
   await oversized.send([], { document: [{ text: 'Oversized.' }] });
   assert.equal((await oversized.control({ type: 'cacheHistory' })).bytes, 0);
+});
+
+
+test("text translation is restricted to its extension page and reuses splitting, glossary and queue", async () => {
+  const b = background(async () => { await new Promise(resolve => setTimeout(resolve, 3)); return completion("訳文"); }, {
+    inputTokens: 128, dictionary: [{ domain: "", sourceLang: "auto", targetLang: "ja", source: "Hello", target: "こんにちは" }]
+  });
+  const message = { type: "translateText", text: "Hello. ".repeat(40), source: "auto", target: "ja", requestId: "text-test" };
+  assert.ok((await b.content(message)).error);
+  assert.ok((await b.extension(message)).error);
+  assert.ok((await b.extension({ ...message, text: 12 }, "translate.html")).error);
+  const results = await Promise.all([b.extension(message, "translate.html"), b.extension(message, "translate.html", 21)]);
+  assert.ok(results.every(result => result.parts?.[0].includes("訳文")));
+  assert.ok(b.calls.length > 1);
+  assert.equal(b.max(), 1);
+  for (const call of b.calls) {
+    assert.equal(call.body.max_tokens, 8096);
+    assert.match(call.body.context, /moz-extension:\/\/test/);
+    assert.equal(call.body.source_lang, undefined);
+    assert.equal(call.body.glossary[0].target, "こんにちは");
+  }
+  assert.ok(b.progress.some(item => item.tabId === 20 && item.requestId === "text-test"));
+  assert.equal((await b.control({ type: "cacheHistory" })).rows.length, 0);
 });

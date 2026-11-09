@@ -146,6 +146,54 @@ const parserWindow = new (require("jsdom").JSDOM)("").window;
         check(!realState.running && realState.done === realState.total && realState.translated > 0 && !realState.message.includes('不正または大きすぎ'),JSON.stringify({metadata,state:realState}));
         await fetch(base+'/result',{method:'POST',body:JSON.stringify({ok:true,realPage:true,state:realState,metadata})});
         return;` : ''}
+        // Discard the background's startup read after installing fixture settings.
+        settingsPromise = null;
+        const textTab = await browser.tabs.create({url:browser.runtime.getURL('translate.html'),active:true});
+        let textView;
+        for(let i=0;i<100;i++) {
+          textView = browser.extension.getViews().find(view => view.location.pathname === '/translate.html');
+          if(textView?.document.querySelector('#source')?.options.length > 0) break;
+          await wait(50);
+        }
+        const textField = id => textView.document.getElementById(id);
+        textField('source').value = 'en';
+        textField('source').dispatchEvent(new textView.Event('change'));
+        textField('source-text').value = 'Hello from the translation page.\\n\\nA second paragraph.';
+        textField('source-text').dispatchEvent(new textView.Event('input'));
+        await wait(50);
+        check(!textField('translate').disabled, 'text translation did not initialize');
+        textField('translate').click();
+        for(let i=0;i<100 && textField('copy').disabled;i++) await wait(50);
+        check(textField('result-text').value.startsWith('訳:Hello') && !textField('copy').disabled, 'text translation failed: '+textField('status').textContent);
+        check(textField('result-text').lang === 'ja', 'text result language missing');
+        check(textView.document.documentElement.scrollWidth <= textView.innerWidth, 'text page overflows');
+        await fetch(base+'/screenshot',{method:'POST',body:JSON.stringify({name:'translate',image:await browser.tabs.captureTab(textTab.id,{format:'png'})})});
+        // Headless Firefox keeps a fixed content viewport after windows.update.
+        // A same-origin frame exercises the real narrow viewport and media query.
+        const narrow = textView.document.createElement('iframe');
+        narrow.title = '狭い画面の文章翻訳';
+        narrow.style.cssText = 'display:block;width:480px;height:1100px;border:0;margin:auto';
+        narrow.src = browser.runtime.getURL('translate.html');
+        textView.document.querySelector('main').hidden = true;
+        await new Promise(resolve => { narrow.onload = resolve; textView.document.body.append(narrow); });
+        await wait(100);
+        const narrowView = narrow.contentWindow, narrowField = id => narrowView.document.getElementById(id);
+        narrowField('source').value = 'en';
+        narrowField('source-text').value = textField('source-text').value;
+        narrowField('source-text').dispatchEvent(new narrowView.Event('input'));
+        narrowField('result-text').value = textField('result-text').value;
+        check(narrowView.innerWidth === 480, 'narrow frame viewport is incorrect');
+        check(narrowView.document.documentElement.scrollWidth <= narrowView.innerWidth, 'narrow text page overflows');
+        const sourceBounds = narrowField('source-text').getBoundingClientRect(), resultBounds = narrowField('result-text').getBoundingClientRect();
+        check(resultBounds.top > sourceBounds.bottom, 'narrow text panes did not stack');
+        await fetch(base+'/screenshot',{method:'POST',body:JSON.stringify({name:'translate-narrow',image:await browser.tabs.captureTab(textTab.id,{format:'png'})})});
+        narrow.remove(); textView.document.querySelector('main').hidden = false;
+        textField('swap').click();
+        check(textField('source').value === 'ja' && textField('target').value === 'en' && textField('source-text').value.startsWith('訳:'), 'text swap lost the result');
+        textField('translate').click();
+        textField('stop').click(); await wait(150);
+        check(textField('copy').disabled && textField('status').textContent.includes('停止'), 'text stop accepted a late result');
+        await browser.tabs.remove(textTab.id);
         const dictionaryTab = await browser.tabs.create({url:browser.runtime.getURL('dictionary.html')+'?domain=127.0.0.1',active:true});
         let dictionaryView;
         for(let i=0;i<100;i++) {
@@ -344,7 +392,7 @@ const parserWindow = new (require("jsdom").JSDOM)("").window;
   let timeout;
   try {
     const response = await Promise.race([result, new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error("Firefox smoke timed out\n" + logs)), 45000); })]);
-    assert.ok(response.ok, response.error + (process.env.KOTOBA_PAGE_URL ? JSON.stringify(response.events) : ""));
+    assert.ok(response.ok, response.error + JSON.stringify(response.events));
     assert.equal(maximum, 1);
     if (response.articleFixture) {
       if (!process.env.KOTOBA_BASELINE) assert.ok(requests.length < 40, JSON.stringify({ requests: requests.length, samples: requests.slice(0, 25).map(request => ({ length: request.body.messages[0].content.length, items: (request.body.messages[0].content.match(/<p id="b/g) || []).length, first: request.body.messages[0].content.slice(0, 45) })) }));
@@ -361,7 +409,7 @@ const parserWindow = new (require("jsdom").JSDOM)("").window;
     assert.ok(requests.some(r => r.body.glossary?.[0]?.target === "ファイル" && r.body.use_glossary === true));
     assert.ok(requests.some(r => r.body.messages[0].content.includes('earlier posts') && r.body.messages[0].content.includes('assembly on Linux x86_64')));
     assert.ok(requests.every(r => !r.body.messages[0].content.includes('(opens in a new window)')));
-    assert.ok(requests.every(r => r.body.max_tokens === 8096 && r.body.context.includes(`web page on http://127.0.0.1:${port}`) && r.authorization === "Bearer smoke-key"));
+    assert.ok(requests.every(r => r.body.max_tokens === 8096 && (r.body.context.includes(`web page on http://127.0.0.1:${port}`) || r.body.context.includes('web page on moz-extension://')) && r.authorization === "Bearer smoke-key"));
     console.log(`Firefox smoke passed: ${response.state.total} blocks, ${requests.length} API requests, peak concurrency ${maximum}.`);
   } finally {
     clearTimeout(timeout); child.kill("SIGTERM");

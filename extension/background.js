@@ -677,7 +677,7 @@ async function translateDocuments(s, documents, page, signal, advance, deliver =
   if (batch.length) await flush(batch);
   return results;
 }
-async function translate(message, sender) {
+async function translate(message, sender, textPage = false) {
   if (!sender.tab) throw new Error("翻訳対象が不正です。");
   if (message.protocol !== K.CONTENT_PROTOCOL) throw staleContent();
   const document = message.document;
@@ -695,7 +695,8 @@ async function translate(message, sender) {
     if (message.parts[0].length > 2000000) throw new Error("選択範囲が200万文字を超えています。");
   }
   const pageURL = new URL(sender.url);
-  if (!/^https?:$/.test(pageURL.protocol)) throw new Error("このページでは翻訳できません。");
+  if (!textPage && !/^https?:$/.test(pageURL.protocol)) throw new Error("このページでは翻訳できません。");
+  const domain = textPage ? browser.runtime.getURL("").replace(/\/$/, "") : pageURL.origin;
   K.languages(message.source, message.target);
   const job = { tabId: sender.tab.id, frameId: sender.frameId, pageURL: documentURL(sender.tab.url || sender.url), controller: new AbortController(), startedAt: Date.now() };
   const id = Symbol(); jobs.set(id, job);
@@ -705,8 +706,10 @@ async function translate(message, sender) {
   const notify = (next = phase, result, activity) => {
     phase = next;
     if (typeof message.requestId === "string" && message.requestId.length < 100 && !job.controller.signal.aborted) {
-      browser.tabs.sendMessage(job.tabId, { type: "translationProgress", requestId: message.requestId, completed, total, phase,
-        ...(result ? { results: [result] } : {}), ...activity }, { frameId: job.frameId }).catch(() => {});
+      const progress = { type: "translationProgress", requestId: message.requestId, completed, total, phase,
+        ...(result ? { results: [result] } : {}), ...activity };
+      if (textPage) browser.runtime.sendMessage({ ...progress, tabId: job.tabId }).catch(() => {});
+      else browser.tabs.sendMessage(job.tabId, progress, { frameId: job.frameId }).catch(() => {});
     }
   };
   const advance = amount => { completed += amount; notify(); };
@@ -714,8 +717,8 @@ async function translate(message, sender) {
   try {
     const revision = cacheRevision;
     const saved = await getSettings();
-    const s = { ...saved, inputTokens: K.inputBudget(saved, { source: message.source, target: message.target, domain: pageURL.origin }) };
-    const page = { source: message.source, target: message.target, domain: pageURL.origin, private: sender.tab.incognito === true, notify,
+    const s = { ...saved, inputTokens: K.inputBudget(saved, { source: message.source, target: message.target, domain }) };
+    const page = { source: message.source, target: message.target, domain, private: sender.tab.incognito === true, notify,
       metrics: measurements() };
     record = page.record = diagnosticRecorder(s, page, job.controller.signal);
     if (!inputs) page.preview = preview => notify("receiving", undefined, { preview, receivedCharacters: preview.length });
@@ -805,6 +808,10 @@ async function handle(message, sender) {
   }
   // Firefox also sets sender.tab for our own settings/history tabs.
   if (sender.tab && !sender.url?.startsWith(browser.runtime.getURL(""))) throw new Error("許可されていない操作です。");
+  if (message.type === "translateText") {
+    if (!sender.tab || sender.url !== browser.runtime.getURL("translate.html")) throw new Error("翻訳ページから操作してください。");
+    return translate({ protocol: K.CONTENT_PROTOCOL, parts: [message.text], source: message.source, target: message.target, requestId: message.requestId }, sender, true);
+  }
   if (message.type === "errorHistory") return errorHistory();
   if (message.type === "serverStatus") return serverStatus(message.force === true);
   if (message.type === "clearErrors") {
